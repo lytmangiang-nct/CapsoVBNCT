@@ -2574,10 +2574,32 @@ export async function moveFilesToDeletedFolderOnGoogleDrive(params: {
         };
       }
 
-      const finalMovedIds =
-        movedIds.length > 0 || alreadyInDeletedIds.length > 0 || alreadyMissingIds.length > 0
-          ? movedIds
-          : uniqueFileIds;
+      // Chỉ chấp nhận thành công khi Apps Script xác nhận TỪNG fileId.
+      // Không suy diễn thành công từ result: 'success' hoặc thiếu danh sách.
+      const acknowledgedIds = new Set([...movedIds, ...alreadyInDeletedIds]);
+      const unexpectedIds = [...acknowledgedIds].filter((id) => !uniqueFileIds.includes(id));
+      const unconfirmedIds = uniqueFileIds.filter((id) => !acknowledgedIds.has(id));
+      if (unexpectedIds.length > 0 || unconfirmedIds.length > 0 || alreadyMissingIds.length > 0 || failedFiles.length > 0) {
+        const reason = unexpectedIds.length > 0
+          ? 'Apps Script trả về fileId không thuộc yêu cầu.'
+          : alreadyMissingIds.length > 0
+          ? 'Có tệp bị thiếu, không thể xác nhận đã chuyển.'
+          : 'Apps Script chưa xác nhận đầy đủ từng fileId.';
+        return {
+          ok: false,
+          partial: acknowledgedIds.size > 0,
+          attempted: true,
+          targetFolderId,
+          folderPath,
+          movedIds,
+          alreadyInDeletedIds,
+          alreadyMissingIds,
+          failedFiles: uniqueFileIds.filter((id) => !acknowledgedIds.has(id)).map((fileId) => ({ fileId, error: reason })),
+          fileResults,
+          error: reason,
+        };
+      }
+      const finalMovedIds = movedIds;
 
       return {
         ok: true,
@@ -3155,10 +3177,32 @@ export async function restoreFilesFromDeletedFolderOnGoogleDrive(params: {
         };
       }
 
-      const finalRestoredIds =
-        restoredIds.length > 0 || alreadyInTargetIds.length > 0 || alreadyMissingIds.length > 0
-          ? restoredIds
-          : uniqueFileIds;
+      // Chỉ chấp nhận thành công khi Apps Script xác nhận TỪNG fileId.
+      // Không suy diễn thành công từ result: 'success' hoặc thiếu danh sách.
+      const acknowledgedIds = new Set([...restoredIds, ...alreadyInTargetIds]);
+      const unexpectedIds = [...acknowledgedIds].filter((id) => !uniqueFileIds.includes(id));
+      const unconfirmedIds = uniqueFileIds.filter((id) => !acknowledgedIds.has(id));
+      if (unexpectedIds.length > 0 || unconfirmedIds.length > 0 || alreadyMissingIds.length > 0 || failedFiles.length > 0) {
+        const reason = unexpectedIds.length > 0
+          ? 'Apps Script trả về fileId không thuộc yêu cầu.'
+          : alreadyMissingIds.length > 0
+          ? 'Có tệp bị thiếu, không thể xác nhận đã chuyển.'
+          : 'Apps Script chưa xác nhận đầy đủ từng fileId.';
+        return {
+          ok: false,
+          partial: acknowledgedIds.size > 0,
+          attempted: true,
+          targetFolderId,
+          folderPath,
+          restoredIds,
+          alreadyInTargetIds,
+          alreadyMissingIds,
+          failedFiles: uniqueFileIds.filter((id) => !acknowledgedIds.has(id)).map((fileId) => ({ fileId, error: reason })),
+          fileResults,
+          error: reason,
+        };
+      }
+      const finalRestoredIds = restoredIds;
 
       return {
         ok: true,
