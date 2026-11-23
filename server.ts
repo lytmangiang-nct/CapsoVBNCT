@@ -1,0 +1,14043 @@
+import express, { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import { fileURLToPath } from 'url';
+import ExcelJS from 'exceljs';
+import crypto from 'crypto';
+import zlib from 'zlib';
+import multer from 'multer';
+import type {
+  ArchiveImportCommitRowResult,
+  ArchiveImportEditableRow,
+  AttachmentGroup,
+  BookPermission,
+  ClosingAmendmentChange,
+  ClosingAmendmentRecord,
+  DateComparisonStatus,
+  DocumentAttachment,
+  DocumentAuditAction,
+  DocumentHistoryEntry,
+  DocumentRecord,
+  DocumentTask,
+  DocumentTaskStatus,
+  DriveReconciliationHistoryEntry,
+  DriveReconciliationItemResult,
+  DriveUploadStatus,
+  DriveVerificationState,
+  ExcelDeleteSyncStatus,
+  ExtractedDateSource,
+  HistoryCleanupScope,
+  LegacySnapshotSummary,
+  PdfContentSearchMatch,
+  PdfPageContent,
+  PreIssueCheckResult,
+  ReconciliationItem,
+  ReconciliationReport,
+  SystemSettings,
+  DocumentTypeConfig,
+  SignerConfig,
+  User,
+  StatisticsData,
+  PreviewNumberResponse,
+  AuditLog,
+  GoogleDriveConfig,
+  PdfAnalyzeResponse,
+  PersistenceStatus,
+  RegistryBook,
+  NumberRequest,
+  StartSequenceSeriesConfig,
+  StorageConnectionState,
+  StorageMode,
+  StorageTestResult,
+  SystemAuditLog,
+  WordTemplate,
+  YearEndClosingSnapshot,
+} from './src/types.js';
+import {
+  appendConflictSuffix,
+  buildStandardDriveFileName,
+  extractGoogleDriveFolderId,
+  getDocumentFilterYear,
+  getSupportedAttachmentExtension,
+  getWordFileExtension,
+  isValidCalendarDateDdMmYyyy,
+  normalizeCompareText,
+  normalizeDateOnlyDdMmYyyy,
+  normalizeDocNumberForCompare,
+  removeVietnameseDiacritics,
+  sanitizeCustomDriveFileName,
+} from './src/utils/fileNaming.js';
+import {
+  ALL_BOOK_PERMISSIONS,
+  CHI_BO_BOOK_ID,
+  DEFAULT_BOOK_ID,
+  NHA_TRUONG_BOOK_ID,
+  getDocBookId,
+  getUserBookPermissions,
+  hasBookPermission,
+  isSystemAdmin,
+  isTypeEnabledInBook,
+  normalizeBookCode,
+  sanitizeBookPermissionsMap,
+} from './src/utils/permissions.js';
+import {
+  getEffectiveAttachments,
+  getOfficialAttachment,
+  syncRootDriveFieldsFromAttachments,
+} from './src/utils/attachments.js';
+import {
+  type AppsScriptAuthErrorCode,
+  AppsScriptAuthError,
+  type DriveFolderCacheEntry,
+  type DriveUploadResult,
+  type ResolvedGoogleDriveConfig,
+  UNKNOWN_DRIVE_YEAR_FOLDER,
+  checkGoogleDriveFileStatus,
+  downloadDriveFileBuffer,
+  getMaxWordFileSizeBytes,
+  getMaxWordFileSizeMB,
+  moveFilesToDeletedFolderOnGoogleDrive,
+  parseAndValidateAppsScriptUrl,
+  parseServiceAccountJson,
+  postToGoogleAppsScript,
+  resolveEffectiveDriveConfig,
+  restoreFilesFromDeletedFolderOnGoogleDrive,
+  sanitizeDriveConfigForClient,
+  scrubSecretsFromText,
+  testGoogleDriveConnection,
+  uploadFileToGoogleDrive,
+  uploadWordToGoogleDrive,
+  validatePdfFileBuffer,
+  validateWordFileBuffer,
+  verifyOrLocateDocumentOnGoogleDrive,
+} from './server/googleDrive.js';
+import {
+  PdfUrlFetchError,
+  analyzePdfBuffer,
+  extractPdfPageContentsForIndex,
+  fetchPdfFromUrl,
+  getServerPdfWorkerDiagnostics,
+} from './server/pdfExtractor.js';
+import {
+  fillDocxTemplate,
+  inspectDocxTemplate,
+  SUPPORTED_WORD_PLACEHOLDERS,
+} from './server/wordTemplates.js';
+import {
+  answerDocumentQuestion,
+  buildArchiveTemplateWorkbookBuffer,
+  buildClosingSummaryAndDocs,
+  buildYearEndHandoverWorkbookBuffer,
+  computeArchiveRowFingerprint,
+  inferArchiveTypeCode,
+  parseArchiveExcelBuffer,
+  parseHistoricalOutgoingSequenceNumber,
+  previewArchiveImportRows,
+} from './server/advancedFeatures.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.set('etag', false);
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[UnhandledRejection]:', sanitizeErrorForLog(reason));
+});
+
+// Security headers & lightweight gzip compression for large JSON API responses (> 2 KB)
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
+app.use('/api', (req, res, next) => {
+  if (req.path === '/events') return next();
+  const acceptEncoding = String(req.headers['accept-encoding'] || '');
+  if (!/\bgzip\b/i.test(acceptEncoding)) return next();
+
+  const originalJson = res.json.bind(res);
+  (res as any).json = function compressedJson(body: any) {
+    if (res.headersSent || res.getHeader('Content-Encoding')) {
+      return originalJson(body);
+    }
+    try {
+      const jsonStr = JSON.stringify(body);
+      if (!jsonStr || Buffer.byteLength(jsonStr, 'utf8') < 2048) {
+        return originalJson(body);
+      }
+      const rawBuf = Buffer.from(jsonStr, 'utf8');
+      const compressed = zlib.gzipSync(rawBuf, { level: 6 });
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Vary', 'Accept-Encoding');
+      res.setHeader('Content-Length', String(compressed.length));
+      return res.send(compressed);
+    } catch {
+      return originalJson(body);
+    }
+  };
+  next();
+});
+
+app.use('/api', async (req, res, next) => {
+  if (req.path !== '/events') {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
+  if (
+    req.path === '/events' ||
+    req.path === '/health' ||
+    req.path === '/auth/login' ||
+    req.path === '/auth/logout' ||
+    req.path === '/auth/me' ||
+    req.path.startsWith('/storage/')
+  ) {
+    return next();
+  }
+  try {
+    const forceFresh =
+      req.path.startsWith('/settings/start-sequence') ||
+      req.path.startsWith('/documents/preview');
+    const isFastReadBurst =
+      req.method === 'GET' &&
+      (req.path === '/bootstrap' ||
+        req.path === '/settings' ||
+        req.path === '/books' ||
+        req.path === '/documents');
+    await ensureLatestDb({ maxAgeMs: forceFresh ? 0 : isFastReadBurst ? 250 : 500 });
+    next();
+  } catch (err: any) {
+    console.error('[Primary Storage Error]:', sanitizeErrorForLog(err));
+    const statusCode = err?.statusCode || 503;
+    const code = err?.code || 'PRIMARY_STORAGE_UNAVAILABLE';
+    return res.status(statusCode).json({
+      code,
+      error: err?.message || 'Không thể đọc dữ liệu mới nhất từ nguồn lưu trữ chính.',
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
+});
+
+const extraCorsOrigins = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (extraCorsOrigins.includes(origin)) return callback(null, true);
+      try {
+        const url = new URL(origin);
+        const host = url.hostname.toLowerCase();
+        if (
+          host === 'localhost' ||
+          host === '127.0.0.1' ||
+          host.endsWith('.vercel.app') ||
+          host.endsWith('.run.app') ||
+          host.endsWith('.aistudio.google.com')
+        ) {
+          return callback(null, true);
+        }
+        if (process.env.APP_URL) {
+          const appHost = new URL(process.env.APP_URL).hostname.toLowerCase();
+          if (host === appHost) return callback(null, true);
+        }
+      } catch {
+        // ignore malformed origin
+      }
+      return callback(null, true);
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+// Guard if serverless runtime already pre-parsed req.body before Express middleware runs
+app.use((req: any, _res, next) => {
+  if (req.body !== undefined && req.readableEnded) {
+    req._body = true;
+  }
+  next();
+});
+app.use(express.json({ limit: '15mb' }));
+
+// --- Database File Setup ---
+const BUNDLED_DATA_DIR = path.resolve(__dirname, 'data');
+const BUNDLED_DB_FILE = path.resolve(BUNDLED_DATA_DIR, 'db.json');
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : IS_SERVERLESS
+  ? path.join(os.tmpdir(), 'nct-registry-data')
+  : BUNDLED_DATA_DIR;
+const DB_FILE = path.resolve(DATA_DIR, 'db.json');
+
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+interface DatabaseSchema {
+  meta?: {
+    revision: string;
+    updatedAt: string;
+    schemaVersion?: number;
+  };
+  settings: SystemSettings;
+  documentTypes: DocumentTypeConfig[];
+  signers: SignerConfig[];
+  users: Array<User & { passwordHash: string }>;
+  documents: DocumentRecord[];
+  books: RegistryBook[];
+  numberRequests: NumberRequest[];
+  idempotencyKeys: Record<string, string>; // key -> documentId
+  systemAuditLogs: SystemAuditLog[];
+  documentHistoryLogs?: DocumentHistoryEntry[];
+  revokedSessions?: Record<string, number>; // sid -> expiresAt ms
+  wordTemplates?: WordTemplate[];
+  documentTasks?: DocumentTask[];
+  closingSnapshots?: YearEndClosingSnapshot[];
+  archiveImportedFingerprints?: Record<string, string>;
+  driveFolderCache?: Record<string, DriveFolderCacheEntry>;
+  driveReconcileHistory?: DriveReconciliationHistoryEntry[];
+}
+
+// Initial Seed Data
+const DEFAULT_SETTINGS: SystemSettings = {
+  unitName: 'Đoàn Trường THPT Nguyễn Chí Thanh',
+  unitCode: 'ĐTN',
+  numberMode: 'separate', // 'separate' or 'shared'
+  numberFormat: '{so}-{loai}/{don_vi}',
+  customStartSequences: {},
+  googleSheetsConfig: {
+    enabled: false,
+    webhookUrl: '',
+    lastSyncTime: '',
+  },
+  googleDriveConfig: {
+    enabled: false,
+    authMode: 'apps_script',
+    folderUrl: '',
+    folderId: '',
+    folderName: '',
+    folderByUnit: {},
+    appsScriptUrl: '',
+    serviceAccountJson: '',
+    serviceAccountEmail: '',
+  },
+};
+
+const DEFAULT_DOC_TYPES: DocumentTypeConfig[] = [
+  { id: 'KH', code: 'KH', name: 'Kế hoạch', color: 'blue', isActive: true },
+  { id: 'QĐ', code: 'QĐ', name: 'Quyết định', color: 'red', isActive: true },
+  { id: 'BC', code: 'BC', name: 'Báo cáo', color: 'emerald', isActive: true },
+  { id: 'ĐN', code: 'ĐN', name: 'Đề nghị', color: 'purple', isActive: true },
+  { id: 'ND', code: 'ND', name: 'Nội dung', color: 'teal', isActive: true },
+  { id: 'TB', code: 'TB', name: 'Thông báo', color: 'amber', isActive: true },
+];
+
+const DEFAULT_TYPE_COLORS: Record<string, string> = {
+  KH: 'blue',
+  BC: 'emerald',
+  ĐN: 'purple',
+  DN: 'purple',
+  ND: 'teal',
+  TB: 'amber',
+  QĐ: 'red',
+  QD: 'red',
+  TTR: 'indigo',
+  CV: 'cyan',
+  BB: 'pink',
+  HD: 'cyan',
+  QC: 'orange',
+  CTR: 'emerald',
+};
+
+const DEFAULT_SIGNERS: SignerConfig[] = [
+  { id: 'sig-1', name: 'Nguyễn Văn Minh', role: 'Bí thư Đoàn trường' },
+  { id: 'sig-2', name: 'Trần Thị Thu Thảo', role: 'Phó Bí thư Đoàn trường' },
+  { id: 'sig-3', name: 'Lê Hoàng Nam', role: 'Ủy viên BTV Đoàn trường' },
+];
+
+function hashPassword(pass: string): string {
+  return crypto.createHash('sha256').update(pass + 'salt_nct_2026').digest('hex');
+}
+
+const DEFAULT_USERS: Array<User & { passwordHash: string }> = [
+  {
+    id: 'user-admin',
+    username: 'admin',
+    fullName: 'Quản trị viên Đoàn Trường',
+    role: 'admin',
+    isActive: true,
+    createdAt: new Date().toISOString(),
+    passwordHash: hashPassword('admin@123'),
+  },
+];
+
+let db: DatabaseSchema;
+
+function stripDiacriticsBasic(input: string): string {
+  return (input || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .toUpperCase()
+    .trim();
+}
+
+function resolveCanonicalTypeCode(rawCode: string, documentTypes: DocumentTypeConfig[]): string {
+  const clean = String(rawCode || '').trim().toUpperCase();
+  if (!clean) return '';
+  if (clean === 'SHARED') return 'SHARED';
+
+  const exact = documentTypes.find((t) => String(t.code || '').trim().toUpperCase() === clean);
+  if (exact) {
+    return exact.code.trim().toUpperCase();
+  }
+
+  const strippedClean = stripDiacriticsBasic(clean);
+  const fuzzyMatches = documentTypes.filter(
+    (t) => stripDiacriticsBasic(String(t.code || '')) === strippedClean
+  );
+  if (fuzzyMatches.length === 1) {
+    return fuzzyMatches[0].code.trim().toUpperCase();
+  }
+
+  return clean;
+}
+
+function normalizeCustomStartSequencesMap(
+  rawMap: any,
+  bookCode: string,
+  bookId: string,
+  documentTypes: DocumentTypeConfig[],
+  diagnostics?: { scopeLabel: string; warnings: string[] }
+): Record<string, number> {
+  if (!rawMap || typeof rawMap !== 'object') return {};
+  const result: Record<string, number> = {};
+  const upperBookCode = String(bookCode || '').trim().toUpperCase();
+  const cleanBookId = String(bookId || '').trim();
+
+  for (const [rawKey, rawVal] of Object.entries(rawMap)) {
+    const seqNum = typeof rawVal === 'number' ? rawVal : parseInt(String(rawVal), 10);
+    if (!Number.isFinite(seqNum) || seqNum < 1) {
+      diagnostics?.warnings.push(
+        `Mốc cũ "${rawKey} = ${String(rawVal)}" tại ${diagnostics.scopeLabel} không hợp lệ (số bắt đầu phải từ 1 trở lên). Vui lòng đối chiếu sổ giấy và cài lại.`
+      );
+      continue;
+    }
+
+    let keyStr = String(rawKey || '').trim();
+    if (!keyStr) continue;
+
+    // Strip optional composite prefix: `${bookCode}:`, `${bookId}:`, or `${bookCode}_`
+    if (keyStr.includes(':')) {
+      const parts = keyStr.split(':').filter(Boolean);
+      if (parts.length === 3) {
+        const prefix = parts[0].trim();
+        if (
+          prefix.toUpperCase() !== upperBookCode &&
+          prefix !== cleanBookId &&
+          upperBookCode
+        ) {
+          diagnostics?.warnings.push(
+            `Mốc cũ "${rawKey} = ${seqNum}" tại ${diagnostics.scopeLabel} mang mã sổ khác (${prefix}); chưa tự gán vào ${bookCode}. Vui lòng đối chiếu sổ giấy.`
+          );
+          continue;
+        }
+        keyStr = `${parts[1]}_${parts[2]}`;
+      }
+    } else if (upperBookCode && keyStr.toUpperCase().startsWith(`${upperBookCode}_`)) {
+      keyStr = keyStr.slice(upperBookCode.length + 1);
+    }
+
+    const match = keyStr.match(/^(\d{4})[_\-:](.+)$/);
+    if (!match) {
+      diagnostics?.warnings.push(
+        `Mốc cũ "${rawKey} = ${seqNum}" tại ${diagnostics.scopeLabel} thiếu năm áp dụng nên chưa đủ cơ sở gán dãy số. Vui lòng kiểm tra sổ giấy và cài lại đúng năm.`
+      );
+      continue;
+    }
+    const yearNum = parseInt(match[1], 10);
+    if (!Number.isFinite(yearNum) || yearNum < 2000 || yearNum > 2100) {
+      diagnostics?.warnings.push(
+        `Mốc cũ "${rawKey} = ${seqNum}" tại ${diagnostics.scopeLabel} có năm không hợp lệ (${match[1]}).`
+      );
+      continue;
+    }
+    const canonicalType = resolveCanonicalTypeCode(match[2], documentTypes);
+    if (!canonicalType) {
+      diagnostics?.warnings.push(
+        `Mốc cũ "${rawKey} = ${seqNum}" tại ${diagnostics.scopeLabel} thiếu mã loại văn bản.`
+      );
+      continue;
+    }
+
+    if (
+      canonicalType !== 'SHARED' &&
+      !documentTypes.some((t) => t.code.trim().toUpperCase() === canonicalType)
+    ) {
+      diagnostics?.warnings.push(
+        `Mốc cũ "${rawKey} = ${seqNum}" tại ${diagnostics.scopeLabel} dùng mã loại "${canonicalType}" chưa có trong danh mục hiện hành; vui lòng đối chiếu với sổ giấy.`
+      );
+    }
+
+    const normalizedKey = `${yearNum}_${canonicalType}`;
+    const existing = result[normalizedKey];
+    result[normalizedKey] = existing ? Math.max(existing, Math.floor(seqNum)) : Math.floor(seqNum);
+  }
+
+  return result;
+}
+
+function createDefaultBookFromSettings(settings: SystemSettings, signers: SignerConfig[]): RegistryBook {
+  const unitName = settings.unitName || 'Đoàn Trường THPT Nguyễn Chí Thanh';
+  return {
+    id: DEFAULT_BOOK_ID,
+    code: 'DOAN_TRUONG',
+    name: 'Đoàn trường',
+    unitName,
+    unitCode: settings.unitCode || 'ĐTN',
+    isShared: true,
+    numberMode: settings.numberMode || 'separate',
+    numberFormat: settings.numberFormat || '{so}-{loai}/{don_vi}',
+    customStartSequences: { ...(settings.customStartSequences || {}) },
+    signers: (signers || []).map((s) => ({ ...s })),
+    isActive: true,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function createPrebuiltBooks(): RegistryBook[] {
+  const now = new Date().toISOString();
+  return [
+    {
+      id: CHI_BO_BOOK_ID,
+      code: 'CHI_BO',
+      name: 'Chi bộ',
+      unitName: 'Chi bộ Trường THPT Nguyễn Chí Thanh',
+      unitCode: 'CB',
+      isShared: false,
+      numberMode: 'separate',
+      numberFormat: '{so}-{loai}/{don_vi}',
+      customStartSequences: {},
+      signers: [
+        { id: 'sig-cb-1', name: 'Bí thư Chi bộ', role: 'Bí thư Chi bộ' },
+        { id: 'sig-cb-2', name: 'Phó Bí thư Chi bộ', role: 'Phó Bí thư Chi bộ' },
+      ],
+      isActive: true,
+      createdAt: now,
+    },
+    {
+      id: NHA_TRUONG_BOOK_ID,
+      code: 'NHA_TRUONG',
+      name: 'Nhà trường',
+      unitName: 'Trường THPT Nguyễn Chí Thanh',
+      unitCode: 'THPTNCT',
+      isShared: true,
+      numberMode: 'separate',
+      numberFormat: '{so}-{loai}/{don_vi}',
+      customStartSequences: {},
+      signers: [
+        { id: 'sig-nt-1', name: 'Hiệu trưởng', role: 'Hiệu trưởng' },
+        { id: 'sig-nt-2', name: 'Phó Hiệu trưởng', role: 'Phó Hiệu trưởng' },
+      ],
+      isActive: true,
+      createdAt: now,
+    },
+  ];
+}
+
+let currentReconciliationWarnings: string[] = [];
+
+export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): DatabaseSchema {
+  const reconciliationWarnings: string[] = [];
+  const settings: SystemSettings = {
+    ...DEFAULT_SETTINGS,
+    ...(loaded.settings || {}),
+    googleSheetsConfig: {
+      enabled: false,
+      webhookUrl: '',
+      lastSyncTime: '',
+      ...(loaded.settings?.googleSheetsConfig || {}),
+    },
+    googleDriveConfig: {
+      enabled: false,
+      authMode: 'apps_script',
+      folderUrl: '',
+      folderId: '',
+      folderName: '',
+      folderByUnit: {},
+      appsScriptUrl: '',
+      serviceAccountJson: '',
+      serviceAccountEmail: '',
+      ...(loaded.settings?.googleDriveConfig || {}),
+    },
+    configVersion: loaded.settings?.configVersion || 1,
+    updatedAt: loaded.settings?.updatedAt || new Date().toISOString(),
+  };
+
+  const paletteKeys = ['blue', 'emerald', 'amber', 'red', 'purple', 'teal', 'indigo', 'orange', 'cyan', 'pink'];
+  const documentTypes = Array.isArray(loaded.documentTypes) ? [...loaded.documentTypes] : [...DEFAULT_DOC_TYPES];
+  // Bảo đảm danh mục loại văn bản chung luôn có sẵn Quyết định (QĐ)
+  if (!documentTypes.some((t) => t.code.toUpperCase() === 'QĐ' || t.code.toUpperCase() === 'QD')) {
+    const khIdx = documentTypes.findIndex((t) => t.code.toUpperCase() === 'KH');
+    const qdType: DocumentTypeConfig = { id: 'QĐ', code: 'QĐ', name: 'Quyết định', color: 'red', isActive: true };
+    if (khIdx !== -1) {
+      documentTypes.splice(khIdx + 1, 0, qdType);
+    } else {
+      documentTypes.push(qdType);
+    }
+  }
+  documentTypes.forEach((t, idx) => {
+    if (!t.color) {
+      t.color = DEFAULT_TYPE_COLORS[t.code.toUpperCase()] || paletteKeys[idx % paletteKeys.length];
+    }
+  });
+
+  const signers = Array.isArray(loaded.signers) ? loaded.signers : [...DEFAULT_SIGNERS];
+
+  const books: RegistryBook[] = Array.isArray(loaded.books) ? loaded.books.map((b) => ({ ...b })) : [];
+  let defaultBook = books.find((b) => b.id === DEFAULT_BOOK_ID);
+  if (!defaultBook) {
+    defaultBook = createDefaultBookFromSettings(settings, signers);
+    books.unshift(defaultBook);
+  } else {
+    if (!defaultBook.code) defaultBook.code = 'DOAN_TRUONG';
+    if (!defaultBook.name || defaultBook.name === `Sổ văn bản ${settings.unitName}`) {
+      defaultBook.name = 'Đoàn trường';
+    }
+    if (!defaultBook.unitName) defaultBook.unitName = settings.unitName;
+    if (!defaultBook.unitCode) defaultBook.unitCode = settings.unitCode;
+    if (!defaultBook.numberFormat) defaultBook.numberFormat = settings.numberFormat;
+    if (!defaultBook.numberMode) defaultBook.numberMode = settings.numberMode;
+    if (!defaultBook.customStartSequences || typeof defaultBook.customStartSequences !== 'object') {
+      defaultBook.customStartSequences = { ...(settings.customStartSequences || {}) };
+    }
+    if (defaultBook.isActive === undefined) defaultBook.isActive = true;
+    if (defaultBook.isShared === undefined) defaultBook.isShared = true;
+    if (!Array.isArray(defaultBook.signers)) {
+      defaultBook.signers = signers.map((s) => ({ ...s }));
+    }
+  }
+
+  // Tạo sẵn 2 sổ Chi bộ & Nhà trường nếu chưa có (an toàn khi chạy lại nhiều lần)
+  for (const prebuilt of createPrebuiltBooks()) {
+    if (!books.some((b) => b.id === prebuilt.id || b.code === prebuilt.code)) {
+      books.push(prebuilt);
+    }
+  }
+
+  // Đảm bảo mọi sổ đều có mã nội bộ cố định (code) duy nhất và chuẩn hóa customStartSequences
+  const usedCodes = new Set<string>();
+  books.forEach((b, idx) => {
+    let baseCode = normalizeBookCode(b.code || b.name || `SO_${idx + 1}`) || `SO_${idx + 1}`;
+    let candidate = baseCode;
+    let suffix = 2;
+    while (usedCodes.has(candidate)) {
+      candidate = `${baseCode}_${suffix}`;
+      suffix++;
+    }
+    b.code = candidate;
+    usedCodes.add(candidate);
+    if (b.isActive === undefined) b.isActive = true;
+    b.customStartSequences = normalizeCustomStartSequencesMap(
+      b.customStartSequences || {},
+      b.code,
+      b.id,
+      documentTypes,
+      { scopeLabel: `Sổ ${b.name} (${b.code})`, warnings: reconciliationWarnings }
+    );
+    if (!Array.isArray(b.signers)) b.signers = [];
+    if (!b.configVersion) b.configVersion = 1;
+    if (!b.updatedAt) b.updatedAt = b.createdAt || new Date().toISOString();
+  });
+
+  if (defaultBook && settings.customStartSequences && typeof settings.customStartSequences === 'object') {
+    const normalizedLegacy = normalizeCustomStartSequencesMap(
+      settings.customStartSequences,
+      defaultBook.code,
+      defaultBook.id,
+      documentTypes,
+      { scopeLabel: `Cấu hình chung cũ (${defaultBook.name})`, warnings: reconciliationWarnings }
+    );
+    for (const [legacyKey, legacyVal] of Object.entries(normalizedLegacy)) {
+      const currentVal = defaultBook.customStartSequences[legacyKey];
+      if (currentVal === undefined) {
+        defaultBook.customStartSequences[legacyKey] = legacyVal;
+      } else if (currentVal !== legacyVal) {
+        reconciliationWarnings.push(
+          `Phát hiện chênh lệch mốc cũ tại ${defaultBook.name} (${defaultBook.code}:${legacyKey}): cấu hình chung cũ = ${legacyVal}, cấu hình sổ = ${currentVal}. Hệ thống đang giữ ${currentVal}; vui lòng đối chiếu lại với sổ giấy.`
+        );
+      }
+    }
+    settings.customStartSequences = { ...(defaultBook.customStartSequences || {}) };
+  }
+
+  currentReconciliationWarnings = Array.from(new Set(reconciliationWarnings));
+
+  const bookMap = new Map<string, RegistryBook>();
+  books.forEach((b) => bookMap.set(b.id, b));
+
+  const documents = Array.isArray(loaded.documents) ? loaded.documents : [];
+  documents.forEach((doc) => {
+    if (!doc.bookId || !bookMap.has(doc.bookId)) {
+      doc.bookId = DEFAULT_BOOK_ID;
+    }
+    const assignedBook = bookMap.get(doc.bookId) || defaultBook!;
+    doc.bookCode = assignedBook.code;
+    if (!doc.bookName || doc.bookName.startsWith('Sổ văn bản Đoàn Trường')) {
+      doc.bookName = assignedBook.name;
+    }
+    // Chuẩn hóa ngày ban hành/ngày ký chỉ gồm dd/MM/yyyy; giữ nguyên rỗng nếu văn bản đến không có ngày ban hành
+    if (doc.issueDate && doc.issueDate.trim()) {
+      doc.issueDate = normalizeDateOnlyDdMmYyyy(doc.issueDate) || doc.issueDate.trim();
+    } else if (doc.docCategory === 'incoming') {
+      doc.issueDate = '';
+    }
+    if (doc.signDate && doc.signDate.trim()) {
+      doc.signDate = normalizeDateOnlyDdMmYyyy(doc.signDate) || undefined;
+    }
+  });
+
+  const rawUsers = (Array.isArray(loaded.users) ? loaded.users : []).filter(
+    (u) => u.username.toLowerCase() !== 'doantruong'
+  );
+  const adminIdx = rawUsers.findIndex((u) => u.username.toLowerCase() === 'admin');
+  if (adminIdx === -1) {
+    rawUsers.unshift({ ...DEFAULT_USERS[0] });
+  } else {
+    rawUsers[adminIdx].role = 'admin';
+    rawUsers[adminIdx].isActive = true;
+  }
+
+  rawUsers.forEach((u) => {
+    if (u.role !== 'admin') {
+      u.role = 'issuer';
+      if (!u.bookPermissions || typeof u.bookPermissions !== 'object') {
+        // Mặc định an toàn cho tài khoản đã tạo trước đó: chỉ Xem và Xin số (không tự động cấp quyền Cấp số)
+        u.bookPermissions = { [DEFAULT_BOOK_ID]: ['view', 'request_number'] };
+      } else {
+        u.bookPermissions = sanitizeBookPermissionsMap(u.bookPermissions);
+      }
+    }
+  });
+
+  const numberRequests = Array.isArray(loaded.numberRequests) ? loaded.numberRequests : [];
+  const idempotencyKeys = loaded.idempotencyKeys && typeof loaded.idempotencyKeys === 'object' ? loaded.idempotencyKeys : {};
+  const systemAuditLogs = Array.isArray(loaded.systemAuditLogs) ? loaded.systemAuditLogs : [];
+  const existingHistory = Array.isArray(loaded.documentHistoryLogs) ? [...loaded.documentHistoryLogs] : [];
+  const historySeen = new Set<string>();
+  for (const h of existingHistory) {
+    historySeen.add(`${h.docId}|${h.timestamp}|${h.action}|${h.userId}`);
+  }
+  for (const doc of documents) {
+    const bId = getDocBookId(doc);
+    const assignedBook = bookMap.get(bId) || defaultBook!;
+    if (Array.isArray(doc.auditLogs)) {
+      for (const log of doc.auditLogs) {
+        const sig = `${doc.id}|${log.timestamp}|${log.action}|${log.userId}`;
+        if (!log.timestampVietnam && log.timestamp) {
+          log.timestampVietnam = formatVietnamDateTime(new Date(log.timestamp));
+        }
+        if (!log.dateKeyVietnam && log.timestamp) {
+          log.dateKeyVietnam = getVietnamDateKey(new Date(log.timestamp));
+        }
+        if (!log.docId) log.docId = doc.id;
+        if (!log.fullDocNumber) log.fullDocNumber = doc.fullDocNumber;
+        if (!log.docName) log.docName = doc.docName || doc.title;
+        if (!log.bookId) log.bookId = assignedBook.id;
+        if (!log.bookCode) log.bookCode = assignedBook.code;
+        if (!log.bookName) log.bookName = assignedBook.name;
+        if (!historySeen.has(sig)) {
+          historySeen.add(sig);
+          const unameMatch = (log.userName || '').match(/\(([^)]+)\)\s*$/);
+          existingHistory.push({
+            ...log,
+            id: log.id || `hist-${crypto.createHash('md5').update(sig).digest('hex').slice(0, 12)}`,
+            timestampVietnam: log.timestampVietnam || formatVietnamDateTime(new Date(log.timestamp || Date.now())),
+            dateKeyVietnam: log.dateKeyVietnam || getVietnamDateKey(new Date(log.timestamp || Date.now())),
+            username: log.username || (unameMatch ? unameMatch[1] : log.userId || 'unknown'),
+            bookId: log.bookId || assignedBook.id,
+            bookCode: log.bookCode || assignedBook.code,
+            bookName: log.bookName || assignedBook.name,
+            docId: doc.id,
+            fullDocNumber: doc.fullDocNumber,
+            docName: doc.docName || doc.title,
+          });
+        }
+      }
+    }
+  }
+  existingHistory.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+  const nowMs = Date.now();
+  const revokedSessions: Record<string, number> = {};
+  if (loaded.revokedSessions && typeof loaded.revokedSessions === 'object') {
+    for (const [sid, exp] of Object.entries(loaded.revokedSessions)) {
+      if (typeof exp === 'number' && exp > nowMs) {
+        revokedSessions[sid] = exp;
+      }
+    }
+  }
+
+  const wordTemplates: WordTemplate[] = Array.isArray(loaded.wordTemplates) ? [...loaded.wordTemplates] : [];
+  const documentTasks: DocumentTask[] = Array.isArray(loaded.documentTasks) ? [...loaded.documentTasks] : [];
+  const closingSnapshots: YearEndClosingSnapshot[] = Array.isArray(loaded.closingSnapshots)
+    ? [...loaded.closingSnapshots]
+    : [];
+  const archiveImportedFingerprints: Record<string, string> =
+    loaded.archiveImportedFingerprints && typeof loaded.archiveImportedFingerprints === 'object'
+      ? { ...loaded.archiveImportedFingerprints }
+      : {};
+  const driveFolderCache: Record<string, DriveFolderCacheEntry> = {};
+  if (loaded.driveFolderCache && typeof loaded.driveFolderCache === 'object') {
+    for (const [k, v] of Object.entries(loaded.driveFolderCache)) {
+      if (v && typeof v === 'object' && typeof (v as any).categoryFolderId === 'string' && (v as any).categoryFolderId.trim()) {
+        driveFolderCache[k] = {
+          bookFolderId: typeof (v as any).bookFolderId === 'string' ? (v as any).bookFolderId : undefined,
+          yearFolderId: typeof (v as any).yearFolderId === 'string' ? (v as any).yearFolderId : undefined,
+          categoryFolderId: String((v as any).categoryFolderId).trim(),
+          folderPath: typeof (v as any).folderPath === 'string' ? (v as any).folderPath : '',
+          updatedAt: typeof (v as any).updatedAt === 'string' ? (v as any).updatedAt : new Date().toISOString(),
+        };
+      }
+    }
+  }
+
+  const driveReconcileHistory: DriveReconciliationHistoryEntry[] = Array.isArray(loaded.driveReconcileHistory)
+    ? loaded.driveReconcileHistory.slice(0, 100)
+    : [];
+
+  return {
+    meta: loaded.meta,
+    settings,
+    documentTypes,
+    signers,
+    users: rawUsers,
+    documents,
+    books,
+    numberRequests,
+    idempotencyKeys,
+    systemAuditLogs,
+    documentHistoryLogs: existingHistory,
+    revokedSessions,
+    wordTemplates,
+    documentTasks,
+    closingSnapshots,
+    archiveImportedFingerprints,
+    driveFolderCache,
+    driveReconcileHistory,
+  };
+}
+
+const CURRENT_SCHEMA_VERSION = 2;
+
+let lastDbMtimeMs = 0;
+let remoteHydrated = false;
+let lastRemoteSyncMs = 0;
+let lastRemoteRawPayload: string | null = null;
+let lastPersistedAt = '';
+let lastVerifiedAt = '';
+let inFlightRemoteLoad: Promise<void> | null = null;
+let lastStorageDiagnostic: {
+  state: StorageConnectionState;
+  error?: string;
+} = { state: 'connected' };
+
+class StorageError extends Error {
+  constructor(
+    public code:
+      | 'DURABLE_STORAGE_NOT_CONFIGURED'
+      | 'STORAGE_CONFIG_CONFLICT'
+      | 'PRIMARY_STORAGE_UNAVAILABLE'
+      | 'STORAGE_AWAITING_INITIALIZATION'
+      | 'STORAGE_CORRUPT_DATA'
+      | 'REVISION_CONFLICT',
+    public statusCode: number,
+    message: string
+  ) {
+    super(message);
+    this.name = 'StorageError';
+  }
+}
+
+function sanitizeErrorForLog(err: any): string {
+  const raw = typeof err === 'string' ? err : err?.message || 'Lỗi không xác định';
+  return scrubSecretsFromText(raw);
+}
+
+function maskUrlHostname(rawUrl?: string): string | undefined {
+  if (!rawUrl) return undefined;
+  try {
+    return new URL(rawUrl).hostname;
+  } catch {
+    return undefined;
+  }
+}
+
+interface StorageAdapterConfig {
+  mode: StorageMode;
+  durable: boolean;
+  label: string;
+  envPairUsed: NonNullable<PersistenceStatus['envPairUsed']>;
+  kvUrl?: string;
+  kvToken?: string;
+  kvKey: string;
+  blobToken?: string;
+  blobPathname: string;
+  webhookUrl?: string;
+  webhookSecret?: string;
+  configConflictError?: string;
+  missingConfigError?: string;
+}
+
+function normalizeRestUrl(raw?: string): string {
+  return (raw || '').trim().replace(/\/+$/, '');
+}
+
+function getStorageAdapterConfig(): StorageAdapterConfig {
+  const upstashUrl = normalizeRestUrl(process.env.UPSTASH_REDIS_REST_URL);
+  const upstashToken = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+  const kvUrl = normalizeRestUrl(process.env.KV_REST_API_URL);
+  const kvToken = (process.env.KV_REST_API_TOKEN || '').trim();
+
+  const kvKey = (process.env.PERSISTENT_DB_KEY || 'nct_vanban_registry_db_v1').trim() || 'nct_vanban_registry_db_v1';
+  const blobToken = (process.env.BLOB_READ_WRITE_TOKEN || '').trim();
+  const blobPathname =
+    (process.env.PERSISTENT_BLOB_PATHNAME || 'nct-registry/db.json').trim().replace(/^\/+/, '') ||
+    'nct-registry/db.json';
+  const webhookUrl = normalizeRestUrl(process.env.PERSISTENT_DB_WEBHOOK_URL);
+  const webhookSecret = (process.env.PERSISTENT_DB_SECRET || '').trim();
+
+  const hasUpstashComplete = Boolean(upstashUrl && upstashToken);
+  const hasUpstashPartial = Boolean(upstashUrl) !== Boolean(upstashToken);
+  const hasKvComplete = Boolean(kvUrl && kvToken);
+  const hasKvPartial = Boolean(kvUrl) !== Boolean(kvToken);
+
+  if (hasUpstashComplete && hasKvComplete) {
+    const sameEndpoint = upstashUrl.toLowerCase() === kvUrl.toLowerCase() && upstashToken === kvToken;
+    if (!sameEndpoint) {
+      return {
+        mode: 'ephemeral_tmp',
+        durable: false,
+        label: 'Cấu hình Redis mâu thuẫn giữa UPSTASH_REDIS_REST_* và KV_REST_API_*',
+        envPairUsed: 'NONE',
+        kvKey,
+        blobPathname,
+        configConflictError:
+          'Phát hiện cấu hình Redis bị mâu thuẫn: UPSTASH_REDIS_REST_* và KV_REST_API_* đang trỏ tới hai database hoặc token khác nhau. Vui lòng giữ lại đúng 1 cặp biến cho database chính trên Vercel Environment Variables rồi Redeploy.',
+      };
+    }
+    return {
+      mode: 'upstash_kv',
+      durable: true,
+      label: 'Upstash Redis (Bền vững dùng chung)',
+      envPairUsed: 'UPSTASH_REDIS_REST',
+      kvUrl: upstashUrl,
+      kvToken: upstashToken,
+      kvKey,
+      blobPathname,
+    };
+  }
+
+  if (hasUpstashComplete) {
+    return {
+      mode: 'upstash_kv',
+      durable: true,
+      label: 'Upstash Redis (Bền vững dùng chung)',
+      envPairUsed: 'UPSTASH_REDIS_REST',
+      kvUrl: upstashUrl,
+      kvToken: upstashToken,
+      kvKey,
+      blobPathname,
+    };
+  }
+
+  if (hasKvComplete) {
+    return {
+      mode: 'upstash_kv',
+      durable: true,
+      label: 'Vercel KV / Upstash Redis (Bền vững dùng chung)',
+      envPairUsed: 'KV_REST_API',
+      kvUrl,
+      kvToken,
+      kvKey,
+      blobPathname,
+    };
+  }
+
+  if (blobToken) {
+    return {
+      mode: 'vercel_blob',
+      durable: true,
+      label: 'Vercel Blob Store (Bền vững dùng chung)',
+      envPairUsed: 'VERCEL_BLOB',
+      kvKey,
+      blobToken,
+      blobPathname,
+    };
+  }
+
+  if (webhookUrl) {
+    return {
+      mode: 'remote_webhook',
+      durable: true,
+      label: 'Remote Storage Webhook (Bền vững dùng chung)',
+      envPairUsed: 'REMOTE_WEBHOOK',
+      kvKey,
+      blobPathname,
+      webhookUrl,
+      webhookSecret,
+    };
+  }
+
+  const partialHint =
+    hasUpstashPartial || hasKvPartial
+      ? 'Phát hiện cặp biến Redis bị thiếu một nửa (cần khai báo đủ cả *_URL và *_TOKEN trong cùng một cặp UPSTASH_REDIS_REST_* hoặc KV_REST_API_*).'
+      : undefined;
+
+  if (!IS_SERVERLESS || Boolean(process.env.DATA_DIR)) {
+    return {
+      mode: 'local_disk',
+      durable: true,
+      label: 'Ổ đĩa máy chủ (data/db.json)',
+      envPairUsed: 'LOCAL_DISK',
+      kvKey,
+      blobPathname,
+      missingConfigError: partialHint,
+    };
+  }
+
+  return {
+    mode: 'ephemeral_tmp',
+    durable: false,
+    label: 'Chưa gắn lưu trữ bền vững cho Vercel Production',
+    envPairUsed: 'NONE',
+    kvKey,
+    blobPathname,
+    missingConfigError:
+      partialHint ||
+      'Thiếu cặp biến UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN (hoặc KV_REST_API_URL + KV_REST_API_TOKEN) trên Vercel Production.',
+  };
+}
+
+function summarizeDatabaseObject(candidate: Partial<DatabaseSchema>): LegacySnapshotSummary {
+  const docs = Array.isArray(candidate.documents) ? candidate.documents : [];
+  const books = Array.isArray(candidate.books) ? candidate.books : [];
+  const users = Array.isArray(candidate.users) ? candidate.users : [];
+  let startMilestonesCount = 0;
+  for (const b of books) {
+    if (b?.customStartSequences && typeof b.customStartSequences === 'object') {
+      startMilestonesCount += Object.keys(b.customStartSequences).length;
+    }
+  }
+  if (
+    startMilestonesCount === 0 &&
+    candidate.settings?.customStartSequences &&
+    typeof candidate.settings.customStartSequences === 'object'
+  ) {
+    startMilestonesCount = Object.keys(candidate.settings.customStartSequences).length;
+  }
+  return {
+    usersCount: users.length,
+    booksCount: books.length,
+    documentsCount: docs.filter((d) => d?.status !== 'deleted').length,
+    deletedDocumentsCount: docs.filter((d) => d?.status === 'deleted').length,
+    startMilestonesCount,
+    driveLinkedCount: docs.filter((d) => Boolean(d?.driveFileId || d?.driveFileUrl)).length,
+    bookNames: books.map((b) => String(b?.name || b?.code || '')).filter(Boolean),
+  };
+}
+
+function getBundledLegacySnapshot(): Partial<DatabaseSchema> | null {
+  try {
+    if (!fs.existsSync(BUNDLED_DB_FILE)) return null;
+    const raw = fs.readFileSync(BUNDLED_DB_FILE, 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<DatabaseSchema>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function validateRegistryPayloadShape(parsed: any): parsed is Partial<DatabaseSchema> {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  const hasAnyCoreCollection =
+    Array.isArray(parsed.books) ||
+    Array.isArray(parsed.users) ||
+    Array.isArray(parsed.documents) ||
+    (parsed.settings && typeof parsed.settings === 'object');
+  return Boolean(hasAnyCoreCollection);
+}
+
+const CONNECTION_LABELS: Record<StorageConnectionState, string> = {
+  connected: 'Đã kết nối',
+  missing_config: 'Thiếu cấu hình',
+  conflict: 'Cấu hình mâu thuẫn',
+  connection_error: 'Lỗi kết nối',
+  awaiting_migration: 'Chờ chuyển dữ liệu',
+  corrupt_data: 'Dữ liệu cần kiểm tra',
+};
+
+function getPersistenceStatus(): PersistenceStatus {
+  const cfg = getStorageAdapterConfig();
+  const bundledLegacy = getBundledLegacySnapshot();
+  const hasBundled = Boolean(bundledLegacy);
+  const legacySummary = bundledLegacy ? summarizeDatabaseObject(bundledLegacy) : undefined;
+  const sessionSecretConfigured = Boolean((process.env.SESSION_SECRET || process.env.AUTH_SECRET || '').trim());
+
+  let connectionState: StorageConnectionState = 'connected';
+  let errorDetail: string | undefined;
+
+  if (cfg.configConflictError) {
+    connectionState = 'conflict';
+    errorDetail = cfg.configConflictError;
+  } else if (cfg.mode === 'ephemeral_tmp') {
+    connectionState = 'missing_config';
+    errorDetail = cfg.missingConfigError;
+  } else if (cfg.mode === 'upstash_kv' || cfg.mode === 'vercel_blob' || cfg.mode === 'remote_webhook') {
+    connectionState = lastStorageDiagnostic.state;
+    errorDetail = lastStorageDiagnostic.error;
+  } else {
+    connectionState = 'connected';
+  }
+
+  const isOperationallyDurable =
+    cfg.durable && !cfg.configConflictError && connectionState === 'connected';
+
+  return {
+    durable: isOperationallyDurable,
+    storageMode: cfg.mode,
+    storageLabel: cfg.label,
+    connectionState,
+    connectionLabel: CONNECTION_LABELS[connectionState],
+    envPairUsed: cfg.envPairUsed,
+    dbKey: cfg.mode === 'upstash_kv' || cfg.mode === 'remote_webhook' ? cfg.kvKey : undefined,
+    maskedHost: maskUrlHostname(cfg.kvUrl || cfg.webhookUrl),
+    schemaVersion: db?.meta?.schemaVersion || CURRENT_SCHEMA_VERSION,
+    hasLegacyBundledSnapshot: hasBundled,
+    legacySnapshotSummary: legacySummary,
+    sessionSecretConfigured,
+    requiresRemoteEnvOnVercel: IS_SERVERLESS && (!cfg.durable || Boolean(cfg.configConflictError)),
+    lastSavedAt: lastPersistedAt || db?.meta?.updatedAt || undefined,
+    lastVerifiedAt: lastVerifiedAt || undefined,
+    warning: !isOperationallyDurable
+      ? errorDetail ||
+        'Hệ thống chưa sẵn sàng lưu bền vững lên Redis/Remote Storage; thao tác cấp số và lưu mốc bị khóa để bảo vệ dữ liệu.'
+      : cfg.missingConfigError,
+    errorDetail,
+  };
+}
+
+async function fetchRemoteWithTimeout(url: string, init: RequestInit, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Kết nối tới dịch vụ lưu trữ từ xa bị quá thời gian chờ.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function executeUpstashCommand<T = any>(
+  cfg: StorageAdapterConfig,
+  command: any[],
+  timeoutMs = 10000
+): Promise<T> {
+  if (!cfg.kvUrl || !cfg.kvToken) {
+    throw new StorageError(
+      'DURABLE_STORAGE_NOT_CONFIGURED',
+      503,
+      'Chưa cấu hình đầy đủ cặp biến kết nối Upstash Redis.'
+    );
+  }
+  const res = await fetchRemoteWithTimeout(
+    cfg.kvUrl,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${cfg.kvToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(command),
+    },
+    timeoutMs
+  );
+  if (res.status === 401 || res.status === 403) {
+    throw new StorageError(
+      'PRIMARY_STORAGE_UNAVAILABLE',
+      503,
+      'Token Upstash Redis không hợp lệ hoặc không có quyền thực hiện thao tác.'
+    );
+  }
+  if (!res.ok) {
+    throw new StorageError(
+      'PRIMARY_STORAGE_UNAVAILABLE',
+      503,
+      `Upstash Redis trả về lỗi HTTP ${res.status}.`
+    );
+  }
+  const payload = (await res.json()) as { result?: T; error?: string };
+  if (payload?.error) {
+    const errLower = String(payload.error).toLowerCase();
+    if (errLower.includes('noperm') || errLower.includes('readonly') || errLower.includes('auth')) {
+      throw new StorageError(
+        'PRIMARY_STORAGE_UNAVAILABLE',
+        503,
+        'Token Upstash Redis bị giới hạn quyền (chỉ đọc hoặc sai quyền ghi).'
+      );
+    }
+    throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Upstash Redis báo lỗi: ${payload.error}`);
+  }
+  return payload.result as T;
+}
+
+const LUA_COMPARE_AND_SWAP = `
+local cur = redis.call('GET', KEYS[1])
+if not cur then
+  return 'ERR_KEY_MISSING'
+end
+if cur ~= ARGV[1] then
+  return 'ERR_CONFLICT'
+end
+redis.call('SET', KEYS[1], ARGV[2])
+return 'OK'
+`;
+
+async function readRawFromPrimaryRemote(
+  cfg: StorageAdapterConfig,
+  timeoutMs = 10000
+): Promise<{ raw: string | null; parsed: Partial<DatabaseSchema> | null }> {
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    const result = await executeUpstashCommand<any>(cfg, ['GET', cfg.kvKey], timeoutMs);
+    if (result === null || result === undefined || result === '') {
+      return { raw: null, parsed: null };
+    }
+    const rawStr = typeof result === 'string' ? result : JSON.stringify(result);
+    let parsed: any;
+    try {
+      parsed = typeof result === 'string' ? JSON.parse(result) : result;
+    } catch {
+      throw new StorageError(
+        'STORAGE_CORRUPT_DATA',
+        503,
+        `Dữ liệu tại khóa "${cfg.kvKey}" trên Upstash Redis không phải JSON hợp lệ. Hệ thống giữ nguyên khóa và tạm khóa cấp số để kiểm tra.`
+      );
+    }
+    if (!validateRegistryPayloadShape(parsed)) {
+      throw new StorageError(
+        'STORAGE_CORRUPT_DATA',
+        503,
+        `Cấu trúc dữ liệu tại khóa "${cfg.kvKey}" trên Upstash Redis không khớp định dạng sổ văn bản. Vui lòng kiểm tra trước khi ghi đè.`
+      );
+    }
+    return { raw: rawStr, parsed };
+  }
+
+  if (cfg.mode === 'vercel_blob' && cfg.blobToken) {
+    const listUrl = `https://blob.vercel-storage.com?prefix=${encodeURIComponent(cfg.blobPathname)}&limit=10`;
+    const listRes = await fetchRemoteWithTimeout(
+      listUrl,
+      {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${cfg.blobToken}`,
+          'x-api-version': '7',
+        },
+      },
+      timeoutMs
+    );
+    if (!listRes.ok) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Vercel Blob list trả về HTTP ${listRes.status}`);
+    }
+    const listData = (await listRes.json()) as {
+      blobs?: Array<{ pathname: string; url: string; downloadUrl?: string }>;
+    };
+    const match = listData.blobs?.find((b) => b.pathname === cfg.blobPathname);
+    if (!match) return { raw: null, parsed: null };
+
+    const targetUrl = new URL(match.downloadUrl || match.url);
+    targetUrl.searchParams.set('_ts', String(Date.now()));
+    let fileRes = await fetchRemoteWithTimeout(targetUrl.toString(), { method: 'GET', cache: 'no-store' }, timeoutMs);
+    if (fileRes.status === 401 || fileRes.status === 403) {
+      fileRes = await fetchRemoteWithTimeout(
+        targetUrl.toString(),
+        {
+          method: 'GET',
+          cache: 'no-store',
+          headers: { Authorization: `Bearer ${cfg.blobToken}` },
+        },
+        timeoutMs
+      );
+    }
+    if (!fileRes.ok) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Vercel Blob get trả về HTTP ${fileRes.status}`);
+    }
+    const rawStr = await fileRes.text();
+    let parsed: any;
+    try {
+      parsed = JSON.parse(rawStr);
+    } catch {
+      throw new StorageError('STORAGE_CORRUPT_DATA', 503, 'Dữ liệu Vercel Blob bị lỗi định dạng JSON.');
+    }
+    if (!validateRegistryPayloadShape(parsed)) {
+      throw new StorageError('STORAGE_CORRUPT_DATA', 503, 'Cấu trúc dữ liệu Vercel Blob không hợp lệ.');
+    }
+    return { raw: rawStr, parsed };
+  }
+
+  if (cfg.mode === 'remote_webhook' && cfg.webhookUrl) {
+    const res = await fetchRemoteWithTimeout(
+      cfg.webhookUrl,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'load',
+          key: cfg.kvKey,
+          ...(cfg.webhookSecret ? { secret: cfg.webhookSecret } : {}),
+        }),
+      },
+      timeoutMs
+    );
+    if (!res.ok) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Remote Storage Webhook trả về HTTP ${res.status}`);
+    }
+    const json = (await res.json()) as { ok?: boolean; error?: string; data?: Partial<DatabaseSchema> | null };
+    if (json?.error || json?.ok === false) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, json?.error || 'Remote Storage Webhook báo lỗi khi đọc.');
+    }
+    if (json?.data === null || json?.data === undefined) {
+      return { raw: null, parsed: null };
+    }
+    if (!validateRegistryPayloadShape(json.data)) {
+      throw new StorageError('STORAGE_CORRUPT_DATA', 503, 'Cấu trúc dữ liệu từ Remote Webhook không hợp lệ.');
+    }
+    return { raw: JSON.stringify(json.data), parsed: json.data };
+  }
+
+  return { raw: null, parsed: null };
+}
+
+async function writeToPrimaryRemoteNX(
+  cfg: StorageAdapterConfig,
+  serialized: string,
+  expectedRevision: string
+): Promise<string> {
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    const result = await executeUpstashCommand<any>(cfg, ['SET', cfg.kvKey, serialized, 'NX']);
+    if (result === null) {
+      throw new StorageError(
+        'REVISION_CONFLICT',
+        409,
+        `Khóa "${cfg.kvKey}" trên Upstash Redis vừa được khởi tạo từ một phiên khác. Hệ thống đang nạp lại dữ liệu hiện có.`
+      );
+    }
+    if (result !== 'OK') {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, 'Upstash Redis không xác nhận ghi khởi tạo thành công.');
+    }
+    const readBack = await readRawFromPrimaryRemote(cfg);
+    if (!readBack.parsed || readBack.parsed.meta?.revision !== expectedRevision || !readBack.raw) {
+      throw new StorageError(
+        'PRIMARY_STORAGE_UNAVAILABLE',
+        503,
+        'Đọc lại từ Upstash Redis sau khi khởi tạo không khớp phiên bản dữ liệu.'
+      );
+    }
+    return readBack.raw;
+  }
+
+  await writeToPrimaryRemoteDirectAndVerify(cfg, serialized, expectedRevision);
+  return serialized;
+}
+
+async function writeToPrimaryRemoteCAS(
+  cfg: StorageAdapterConfig,
+  expectedPreviousRaw: string | null,
+  serialized: string,
+  expectedRevision: string
+): Promise<string> {
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    if (!expectedPreviousRaw) {
+      throw new StorageError(
+        'STORAGE_AWAITING_INITIALIZATION',
+        503,
+        'Khóa dữ liệu trên Upstash Redis chưa được khởi tạo hoặc chưa sẵn sàng.'
+      );
+    }
+    const evalResult = await executeUpstashCommand<string>(cfg, [
+      'EVAL',
+      LUA_COMPARE_AND_SWAP,
+      '1',
+      cfg.kvKey,
+      expectedPreviousRaw,
+      serialized,
+    ]);
+    if (evalResult === 'ERR_KEY_MISSING') {
+      remoteHydrated = false;
+      lastRemoteRawPayload = null;
+      lastStorageDiagnostic = { state: 'awaiting_migration', error: 'Khóa dữ liệu trên Upstash Redis không còn tồn tại.' };
+      throw new StorageError(
+        'STORAGE_AWAITING_INITIALIZATION',
+        503,
+        'Khóa dữ liệu trên Upstash Redis chưa tồn tại. Vui lòng kiểm tra mục Cài đặt → Lưu trữ & Đồng bộ.'
+      );
+    }
+    if (evalResult === 'ERR_CONFLICT') {
+      remoteHydrated = false;
+      throw new StorageError(
+        'REVISION_CONFLICT',
+        409,
+        'Dữ liệu trên Redis vừa được cập nhật đồng thời từ một phiên khác. Vui lòng thử lại để giữ an toàn dữ liệu.'
+      );
+    }
+    if (evalResult !== 'OK') {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, 'Upstash Redis không xác nhận ghi dữ liệu thành công.');
+    }
+    const readBack = await readRawFromPrimaryRemote(cfg);
+    if (!readBack.parsed || readBack.parsed.meta?.revision !== expectedRevision || !readBack.raw) {
+      throw new StorageError(
+        'PRIMARY_STORAGE_UNAVAILABLE',
+        503,
+        'Đọc lại từ Upstash Redis không khớp phiên bản dữ liệu vừa lưu.'
+      );
+    }
+    return readBack.raw;
+  }
+
+  await writeToPrimaryRemoteDirectAndVerify(cfg, serialized, expectedRevision);
+  return serialized;
+}
+
+async function writeToPrimaryRemoteDirectAndVerify(
+  cfg: StorageAdapterConfig,
+  serialized: string,
+  expectedRevision: string
+): Promise<void> {
+  if (cfg.mode === 'vercel_blob' && cfg.blobToken) {
+    const putUrl = `https://blob.vercel-storage.com/${cfg.blobPathname}`;
+    const res = await fetchRemoteWithTimeout(putUrl, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${cfg.blobToken}`,
+        'x-api-version': '7',
+        'x-add-random-suffix': '0',
+        'x-allow-overwrite': '1',
+        'x-content-type': 'application/json',
+        'x-cache-control-max-age': '0',
+      },
+      body: serialized,
+    });
+    if (!res.ok) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Ghi Vercel Blob thất bại (HTTP ${res.status})`);
+    }
+    const putData = (await res.json()) as { url?: string; downloadUrl?: string };
+    const verifyUrl = new URL(putData.downloadUrl || putData.url || '');
+    verifyUrl.searchParams.set('_ts', String(Date.now()));
+    let checkRes = await fetchRemoteWithTimeout(verifyUrl.toString(), { method: 'GET', cache: 'no-store' });
+    if (checkRes.status === 401 || checkRes.status === 403) {
+      checkRes = await fetchRemoteWithTimeout(verifyUrl.toString(), {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { Authorization: `Bearer ${cfg.blobToken}` },
+      });
+    }
+    if (!checkRes.ok) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Không đọc lại được từ Vercel Blob (HTTP ${checkRes.status}).`);
+    }
+    const verified = (await checkRes.json()) as Partial<DatabaseSchema>;
+    if (!verified || verified.meta?.revision !== expectedRevision) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, 'Đọc lại từ Vercel Blob không khớp phiên bản vừa lưu.');
+    }
+    return;
+  }
+
+  if (cfg.mode === 'remote_webhook' && cfg.webhookUrl) {
+    const res = await fetchRemoteWithTimeout(cfg.webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'save',
+        key: cfg.kvKey,
+        data: JSON.parse(serialized),
+        ...(cfg.webhookSecret ? { secret: cfg.webhookSecret } : {}),
+      }),
+    });
+    if (!res.ok) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Ghi Remote Storage Webhook thất bại (HTTP ${res.status})`);
+    }
+    const json = (await res.json()) as { ok?: boolean; error?: string };
+    if (json?.error || json?.ok === false) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, json?.error || 'Remote Webhook không xác nhận ghi.');
+    }
+    const verified = await readRawFromPrimaryRemote(cfg);
+    if (!verified.parsed || verified.parsed.meta?.revision !== expectedRevision) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, 'Đọc lại từ Remote Webhook không khớp phiên bản vừa lưu.');
+    }
+  }
+}
+
+async function testUpstashRedisConnection(): Promise<StorageTestResult> {
+  const startedAt = Date.now();
+  const cfg = getStorageAdapterConfig();
+
+  if (cfg.configConflictError) {
+    lastStorageDiagnostic = { state: 'conflict', error: cfg.configConflictError };
+    return {
+      success: false,
+      readOk: false,
+      writeOk: false,
+      deleteOk: false,
+      keyExists: false,
+      latencyMs: Date.now() - startedAt,
+      message: cfg.configConflictError,
+      persistenceStatus: getPersistenceStatus(),
+    };
+  }
+
+  if (cfg.mode !== 'upstash_kv') {
+    const msg =
+      cfg.mode === 'local_disk'
+        ? 'Máy chủ hiện dùng ổ đĩa cục bộ (data/db.json) vì chưa khai báo biến môi trường Upstash Redis.'
+        : cfg.missingConfigError || 'Chưa cấu hình Upstash Redis.';
+    return {
+      success: cfg.mode === 'local_disk',
+      readOk: cfg.mode === 'local_disk',
+      writeOk: cfg.mode === 'local_disk',
+      deleteOk: cfg.mode === 'local_disk',
+      keyExists: cfg.mode === 'local_disk',
+      latencyMs: Date.now() - startedAt,
+      message: msg,
+      persistenceStatus: getPersistenceStatus(),
+    };
+  }
+
+  const probeKey = `${cfg.kvKey}:healthcheck:${Date.now()}:${crypto.randomBytes(4).toString('hex')}`;
+  const probeVal = `nct-probe-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+  let writeOk = false;
+  let readOk = false;
+  let deleteOk = false;
+  let keyExists = false;
+  let schemaValid: boolean | undefined;
+
+  try {
+    const setRes = await executeUpstashCommand<any>(cfg, ['SET', probeKey, probeVal, 'EX', '30'], 8000);
+    if (setRes !== 'OK') {
+      throw new Error('Redis không xác nhận ghi khóa kiểm tra.');
+    }
+    writeOk = true;
+
+    const getRes = await executeUpstashCommand<any>(cfg, ['GET', probeKey], 8000);
+    if (getRes !== probeVal) {
+      throw new Error('Giá trị đọc lại từ khóa kiểm tra không khớp.');
+    }
+    readOk = true;
+
+    try {
+      await executeUpstashCommand(cfg, ['DEL', probeKey], 5000);
+      deleteOk = true;
+    } catch {
+      deleteOk = false;
+    }
+
+    const mainCheck = await readRawFromPrimaryRemote(cfg, 8000);
+    if (mainCheck.raw === null) {
+      keyExists = false;
+      lastStorageDiagnostic = {
+        state: 'awaiting_migration',
+        error: `Kết nối Redis thành công nhưng khóa "${cfg.kvKey}" chưa tồn tại dữ liệu.`,
+      };
+    } else {
+      keyExists = true;
+      schemaValid = true;
+      lastRemoteRawPayload = mainCheck.raw;
+      db = migrateDatabaseIdempotent(mainCheck.parsed!);
+      remoteHydrated = true;
+      lastRemoteSyncMs = Date.now();
+      lastVerifiedAt = new Date().toISOString();
+      lastStorageDiagnostic = { state: 'connected' };
+    }
+
+    return {
+      success: true,
+      readOk,
+      writeOk,
+      deleteOk,
+      keyExists,
+      schemaValid,
+      latencyMs: Date.now() - startedAt,
+      probeKey,
+      message: keyExists
+        ? `Kết nối Upstash Redis thành công (ghi & đọc khóa kiểm tra riêng an toàn, khóa chính "${cfg.kvKey}" hợp lệ).`
+        : `Kết nối Upstash Redis thành công (ghi & đọc tốt), nhưng khóa chính "${cfg.kvKey}" chưa có dữ liệu — đang ở trạng thái Chờ chuyển dữ liệu.`,
+      persistenceStatus: getPersistenceStatus(),
+    };
+  } catch (err: any) {
+    const errMsg = sanitizeErrorForLog(err);
+    if (err instanceof StorageError && err.code === 'STORAGE_CORRUPT_DATA') {
+      keyExists = true;
+      schemaValid = false;
+      lastStorageDiagnostic = { state: 'corrupt_data', error: errMsg };
+    } else {
+      lastStorageDiagnostic = { state: 'connection_error', error: errMsg };
+    }
+    return {
+      success: false,
+      readOk,
+      writeOk,
+      deleteOk,
+      keyExists,
+      schemaValid,
+      latencyMs: Date.now() - startedAt,
+      probeKey,
+      message: errMsg,
+      persistenceStatus: getPersistenceStatus(),
+    };
+  }
+}
+
+function loadDatabase(): DatabaseSchema {
+  const cfg = getStorageAdapterConfig();
+  if (cfg.mode === 'local_disk' && fs.existsSync(DB_FILE)) {
+    try {
+      const content = fs.readFileSync(DB_FILE, 'utf-8');
+      const loaded = JSON.parse(content) as Partial<DatabaseSchema>;
+      const migrated = migrateDatabaseIdempotent(loaded);
+      saveDatabaseSync(migrated);
+      return migrated;
+    } catch (e) {
+      console.error('Lỗi khi đọc file db.json, khởi tạo lại:', e);
+    }
+  } else if (fs.existsSync(BUNDLED_DB_FILE)) {
+    try {
+      const content = fs.readFileSync(BUNDLED_DB_FILE, 'utf-8');
+      const loaded = JSON.parse(content) as Partial<DatabaseSchema>;
+      const migrated = migrateDatabaseIdempotent(loaded);
+      return migrated;
+    } catch (e) {
+      console.error('Lỗi đọc dữ liệu seed:', e);
+    }
+  }
+
+  const initialDb = migrateDatabaseIdempotent({
+    meta: { revision: 'bootstrap', updatedAt: new Date().toISOString(), schemaVersion: CURRENT_SCHEMA_VERSION },
+    settings: DEFAULT_SETTINGS,
+    documentTypes: DEFAULT_DOC_TYPES,
+    signers: DEFAULT_SIGNERS,
+    users: DEFAULT_USERS,
+    documents: [],
+    books: [],
+    numberRequests: [],
+    idempotencyKeys: {},
+    systemAuditLogs: [],
+    revokedSessions: {},
+  });
+  if (cfg.mode === 'local_disk') {
+    saveDatabaseSync(initialDb);
+  }
+  return initialDb;
+}
+
+let lastDbFileSize = -1;
+
+function saveDatabaseSync(data: DatabaseSchema) {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  const tmpFile = `${DB_FILE}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+  fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf-8');
+  fs.renameSync(tmpFile, DB_FILE);
+  try {
+    const st = fs.statSync(DB_FILE);
+    lastDbMtimeMs = st.mtimeMs;
+    lastDbFileSize = st.size;
+  } catch {
+    lastDbMtimeMs = Date.now();
+    lastDbFileSize = -1;
+  }
+}
+
+function reloadDatabaseFromDiskIfNewer(force = false) {
+  if (!fs.existsSync(DB_FILE)) return;
+  try {
+    const stat = fs.statSync(DB_FILE);
+    const unchanged =
+      lastDbMtimeMs > 0 && stat.mtimeMs === lastDbMtimeMs && stat.size === lastDbFileSize;
+    if (unchanged) {
+      return;
+    }
+    if (force || stat.mtimeMs > lastDbMtimeMs || stat.size !== lastDbFileSize) {
+      const content = fs.readFileSync(DB_FILE, 'utf-8');
+      const loaded = JSON.parse(content) as Partial<DatabaseSchema>;
+      db = migrateDatabaseIdempotent(loaded);
+      lastDbMtimeMs = stat.mtimeMs;
+      lastDbFileSize = stat.size;
+    }
+  } catch (err) {
+    console.error('Lỗi đọc lại dữ liệu mới từ ổ đĩa:', err);
+  }
+}
+
+async function ensureLatestDb(options: { maxAgeMs?: number } = {}): Promise<void> {
+  const cfg = getStorageAdapterConfig();
+  const maxAgeMs = options.maxAgeMs ?? 500;
+
+  if (cfg.configConflictError) {
+    lastStorageDiagnostic = { state: 'conflict', error: cfg.configConflictError };
+    throw new StorageError('STORAGE_CONFIG_CONFLICT', 503, cfg.configConflictError);
+  }
+
+  if (cfg.mode === 'ephemeral_tmp') {
+    lastStorageDiagnostic = { state: 'missing_config', error: cfg.missingConfigError };
+    throw new StorageError(
+      'DURABLE_STORAGE_NOT_CONFIGURED',
+      503,
+      cfg.missingConfigError ||
+        'Máy chủ Vercel Production chưa cấu hình nguồn lưu trữ bền vững Upstash Redis. Đã chặn thao tác để tránh mất dữ liệu.'
+    );
+  }
+
+  if (cfg.mode === 'local_disk') {
+    reloadDatabaseFromDiskIfNewer(maxAgeMs === 0);
+    lastStorageDiagnostic = { state: 'connected' };
+    return;
+  }
+
+  if (remoteHydrated && maxAgeMs > 0 && Date.now() - lastRemoteSyncMs < maxAgeMs && lastStorageDiagnostic.state === 'connected') {
+    return;
+  }
+
+  if (inFlightRemoteLoad && maxAgeMs > 0) {
+    await inFlightRemoteLoad;
+    return;
+  }
+
+  const loadPromise = (async () => {
+    try {
+      const remoteResult = await readRawFromPrimaryRemote(cfg);
+      if (remoteResult.raw === null || remoteResult.parsed === null) {
+        remoteHydrated = false;
+        lastRemoteRawPayload = null;
+        lastStorageDiagnostic = {
+          state: 'awaiting_migration',
+          error: `Khóa "${cfg.kvKey}" trên Redis chưa tồn tại. Cần nhập bản sao từ nguồn cũ hoặc xác nhận khởi tạo hệ thống mới.`,
+        };
+        throw new StorageError(
+          'STORAGE_AWAITING_INITIALIZATION',
+          503,
+          `Chờ chuyển dữ liệu: Khóa "${cfg.kvKey}" trên Upstash Redis chưa tồn tại. Vui lòng mở Cài đặt → Lưu trữ & Đồng bộ để nhập bản sao hoặc xác nhận hệ thống mới.`
+        );
+      }
+
+      const incomingVersion = Number(remoteResult.parsed.meta?.schemaVersion || 0);
+      const migrated = migrateDatabaseIdempotent(remoteResult.parsed);
+      const needsSchemaUpgrade = incomingVersion < CURRENT_SCHEMA_VERSION;
+      migrated.meta = {
+        revision: remoteResult.parsed.meta?.revision || `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+        updatedAt: remoteResult.parsed.meta?.updatedAt || new Date().toISOString(),
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      };
+
+      if (needsSchemaUpgrade) {
+        const upgradeRev = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        migrated.meta = {
+          revision: upgradeRev,
+          updatedAt: new Date().toISOString(),
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+        };
+        const upgradedSerialized = JSON.stringify(migrated, null, 2);
+        try {
+          lastRemoteRawPayload = await writeToPrimaryRemoteCAS(cfg, remoteResult.raw, upgradedSerialized, upgradeRev);
+        } catch (casErr: any) {
+          if (casErr instanceof StorageError && casErr.code === 'REVISION_CONFLICT') {
+            const fresh = await readRawFromPrimaryRemote(cfg);
+            if (!fresh.parsed || !fresh.raw) throw casErr;
+            lastRemoteRawPayload = fresh.raw;
+            db = migrateDatabaseIdempotent(fresh.parsed);
+          } else {
+            throw casErr;
+          }
+        }
+      } else {
+        lastRemoteRawPayload = remoteResult.raw;
+        db = migrated;
+      }
+
+      if (!needsSchemaUpgrade) {
+        db = migrated;
+      }
+      remoteHydrated = true;
+      lastRemoteSyncMs = Date.now();
+      lastVerifiedAt = new Date().toISOString();
+      lastStorageDiagnostic = { state: 'connected' };
+    } catch (err: any) {
+      if (err instanceof StorageError) {
+        if (err.code === 'STORAGE_CORRUPT_DATA') {
+          lastStorageDiagnostic = { state: 'corrupt_data', error: err.message };
+        } else if (err.code === 'STORAGE_AWAITING_INITIALIZATION') {
+          lastStorageDiagnostic = { state: 'awaiting_migration', error: err.message };
+        } else {
+          lastStorageDiagnostic = { state: 'connection_error', error: err.message };
+        }
+        throw err;
+      }
+      const msg = sanitizeErrorForLog(err);
+      lastStorageDiagnostic = { state: 'connection_error', error: msg };
+      throw new StorageError(
+        'PRIMARY_STORAGE_UNAVAILABLE',
+        503,
+        `Không thể kết nối tới nguồn lưu trữ chính: ${msg}`
+      );
+    }
+  })();
+
+  inFlightRemoteLoad = loadPromise;
+  try {
+    await loadPromise;
+  } finally {
+    if (inFlightRemoteLoad === loadPromise) {
+      inFlightRemoteLoad = null;
+    }
+  }
+}
+
+// --- Thread-Safe Atomic Lock Mutex ---
+class AsyncLock {
+  private p = Promise.resolve();
+  async acquire(): Promise<() => void> {
+    let release: () => void = () => {};
+    const next = new Promise<void>((res) => {
+      release = res;
+    });
+    const wait = this.p;
+    this.p = this.p.then(() => next);
+    await wait;
+    return release;
+  }
+}
+
+const persistLock = new AsyncLock();
+const atomicLock = new AsyncLock();
+
+async function saveDatabasePersistent(
+  data: DatabaseSchema,
+  options: { verifyWrite?: boolean } = {}
+): Promise<PersistenceStatus> {
+  const releasePersist = await persistLock.acquire();
+  try {
+    const cfg = getStorageAdapterConfig();
+  if (cfg.configConflictError) {
+    lastStorageDiagnostic = { state: 'conflict', error: cfg.configConflictError };
+    throw new StorageError('STORAGE_CONFIG_CONFLICT', 503, cfg.configConflictError);
+  }
+  if (!cfg.durable) {
+    lastStorageDiagnostic = { state: 'missing_config', error: cfg.missingConfigError };
+    throw new StorageError(
+      'DURABLE_STORAGE_NOT_CONFIGURED',
+      503,
+      cfg.missingConfigError ||
+        'Máy chủ Vercel Production chưa cấu hình nguồn lưu trữ bền vững. Đã chặn lưu tạm vào /tmp.'
+    );
+  }
+
+  const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const updatedAt = new Date().toISOString();
+  data.meta = { revision, updatedAt, schemaVersion: CURRENT_SCHEMA_VERSION };
+  const serialized = JSON.stringify(data, null, 2);
+
+  if (cfg.mode === 'local_disk') {
+    saveDatabaseSync(data);
+    lastPersistedAt = updatedAt;
+    if (options.verifyWrite) {
+      const raw = fs.readFileSync(DB_FILE, 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<DatabaseSchema>;
+      if (parsed?.meta?.revision !== revision) {
+        throw new Error('Xác nhận đọc lại tệp dữ liệu trên máy chủ không khớp sau khi lưu.');
+      }
+      db = migrateDatabaseIdempotent(parsed);
+      lastVerifiedAt = new Date().toISOString();
+    }
+    lastStorageDiagnostic = { state: 'connected' };
+    return getPersistenceStatus();
+  }
+
+  try {
+    lastRemoteRawPayload = await writeToPrimaryRemoteCAS(cfg, lastRemoteRawPayload, serialized, revision);
+    lastPersistedAt = updatedAt;
+    remoteHydrated = true;
+    lastRemoteSyncMs = Date.now();
+    lastVerifiedAt = new Date().toISOString();
+    lastStorageDiagnostic = { state: 'connected' };
+    return getPersistenceStatus();
+  } catch (err: any) {
+    remoteHydrated = false;
+    if (err instanceof StorageError) {
+      if (err.code === 'STORAGE_AWAITING_INITIALIZATION') {
+        lastStorageDiagnostic = { state: 'awaiting_migration', error: err.message };
+      } else if (err.code !== 'REVISION_CONFLICT') {
+        lastStorageDiagnostic = { state: 'connection_error', error: err.message };
+      }
+      throw err;
+    }
+    const msg = sanitizeErrorForLog(err);
+    lastStorageDiagnostic = { state: 'connection_error', error: msg };
+    throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Lỗi ghi vào Upstash Redis: ${msg}`);
+  }
+  } finally {
+    releasePersist();
+  }
+}
+
+db = loadDatabase();
+
+const STALE_DRIVE_UPLOAD_MS =
+  Number(process.env.DRIVE_STALE_UPLOAD_MS) > 0
+    ? Number(process.env.DRIVE_STALE_UPLOAD_MS)
+    : 60_000;
+
+const inFlightDriveReconciles = new Map<string, Promise<DocumentRecord | null>>();
+
+function isDriveSyncOnlyReviewReason(reason: string): boolean {
+  const norm = (reason || '').trim().toLowerCase();
+  if (!norm) return false;
+  return (
+    /(google\s*drive|trạng thái drive|đối soát drive|lưu tệp|tải tệp.*drive|đồng bộ.*drive|fileid)/i.test(norm) &&
+    !/(số văn bản|số ký hiệu|ngày ban hành|ngày ký|cơ quan|người ký|chức vụ|trích yếu|ocr|quét)/i.test(norm)
+  );
+}
+
+/**
+ * Tách bạch trạng thái xác minh thông tin (needsReview) khỏi trạng thái lưu trữ Google Drive:
+ * - Khi tệp đã xác minh lưu thành công trên Google Drive, chỉ xóa các lý do review thuần túy do lỗi/đồng bộ Drive.
+ * - Tuyệt đối GIỮ NGUYÊN needsReview và reviewReasons nếu còn bất kỳ lý do xác minh nội dung/AI/OCR hoặc chờ xác nhận ngày.
+ */
+function clearDriveOnlyReviewReasons(doc: DocumentRecord): boolean {
+  if (!doc.needsReview) return false;
+  const reasons = Array.isArray(doc.reviewReasons) ? doc.reviewReasons : [];
+  if (reasons.length === 0) {
+    // Không tự ý xóa cờ needsReview nếu người dùng/OCR đã đánh dấu cần kiểm tra mà không có lý do Drive-only rõ ràng
+    return false;
+  }
+  const remaining = reasons.filter((r) => !isDriveSyncOnlyReviewReason(r));
+  if (remaining.length === reasons.length) {
+    return false;
+  }
+  if (remaining.length > 0 || doc.pendingDateConfirmation) {
+    doc.reviewReasons = remaining.length > 0 ? remaining : undefined;
+    doc.needsReview = true;
+    return false;
+  }
+  doc.reviewReasons = undefined;
+  doc.needsReview = false;
+  return true;
+}
+
+/**
+ * Cập nhật 1 bản ghi văn bản nguyên tử trên nguồn DB trung tâm:
+ * - Khóa atomicLock, nạp bản DB mới nhất (`ensureLatestDb({ maxAgeMs: 0 })`) trước khi sửa
+ * - Sửa trực tiếp trên bản ghi LIVE trong `db.documents` (tránh lỗi sửa object tách rời khi `db` bị nạp lại)
+ * - Tự động thử lại tối đa 3 lần nếu gặp xung đột CAS (`REVISION_CONFLICT`) trên Redis/Upstash
+ * - Xác nhận ghi thành công trước khi trả về bản ghi đã lưu bền vững.
+ */
+async function mutateDocumentInDb(
+  docId: string,
+  mutator: (liveDoc: DocumentRecord, currentDb: DatabaseSchema) => boolean | void,
+  options: { verifyWrite?: boolean; maxRetries?: number } = {}
+): Promise<DocumentRecord | null> {
+  const verifyWrite = options.verifyWrite ?? true;
+  const maxRetries = Math.max(1, options.maxRetries ?? 3);
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const release = await atomicLock.acquire();
+    try {
+      await ensureLatestDb({ maxAgeMs: 0 });
+      const liveDoc = db.documents.find((d) => d.id === docId);
+      if (!liveDoc) return null;
+
+      const shouldSave = mutator(liveDoc, db);
+      if (shouldSave === false) {
+        return liveDoc;
+      }
+
+      await saveDatabasePersistent(db, { verifyWrite });
+      return db.documents.find((d) => d.id === docId) || liveDoc;
+    } catch (err: any) {
+      const isConflict = err instanceof StorageError && err.code === 'REVISION_CONFLICT';
+      if (isConflict && attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 40 * attempt));
+        continue;
+      }
+      throw err;
+    } finally {
+      release();
+    }
+  }
+  return null;
+}
+
+function applyVerifiedDriveFileToDocument(
+  liveDoc: DocumentRecord,
+  params: {
+    fileId: string;
+    fileName?: string;
+    webViewLink?: string;
+    folderId?: string;
+    folderPath?: string;
+    verifiedAtIso: string;
+    actor?: User;
+    book: RegistryBook;
+    auditReason?: string;
+    matchedBy?: 'file_id' | 'record_metadata';
+  }
+) {
+  const {
+    fileId,
+    fileName,
+    webViewLink,
+    folderId,
+    folderPath,
+    verifiedAtIso,
+    actor,
+    book,
+    auditReason,
+    matchedBy,
+  } = params;
+  const prevStatus = liveDoc.driveStatus || 'none';
+  const prevFileId = liveDoc.driveFileId || null;
+  const resolvedUrl = webViewLink || `https://drive.google.com/file/d/${fileId}/view`;
+  const resolvedName =
+    (fileName && fileName.trim()) ||
+    liveDoc.driveFileName ||
+    liveDoc.driveOriginalFileName ||
+    `${liveDoc.fullDocNumber || liveDoc.id}`;
+
+  const existingAtts = getEffectiveAttachments(liveDoc);
+  if (existingAtts.length > 0) {
+    const targetIdx =
+      existingAtts.findIndex(
+        (a) =>
+          (a.driveFileId && a.driveFileId === fileId) ||
+          a.driveStatus === 'uploading' ||
+          a.driveStatus === 'failed' ||
+          a.driveStatus === 'needs_reconcile' ||
+          a.isOfficial
+      );
+    const idx = targetIdx !== -1 ? targetIdx : 0;
+    const att = { ...existingAtts[idx] };
+    att.driveStatus = 'saved';
+    att.driveFileId = fileId;
+    att.driveFileUrl = resolvedUrl;
+    att.fileName = resolvedName;
+    if (folderId) att.driveFolderId = folderId;
+    if (folderPath) att.driveFolderPath = folderPath;
+    delete att.driveError;
+    if (Array.isArray(att.versions) && att.versions.length > 0) {
+      const nextVers = [...att.versions];
+      const lastIdx = nextVers.length - 1;
+      nextVers[lastIdx] = {
+        ...nextVers[lastIdx],
+        driveStatus: 'saved',
+        driveFileId: fileId,
+        driveFileUrl: resolvedUrl,
+        fileName: resolvedName,
+        ...(folderId ? { driveFolderId: folderId } : {}),
+        ...(folderPath ? { driveFolderPath: folderPath } : {}),
+        driveError: undefined,
+      };
+      att.versions = nextVers;
+    }
+    existingAtts[idx] = att;
+    liveDoc.attachments = existingAtts;
+    syncRootDriveFieldsFromAttachments(liveDoc);
+  }
+
+  liveDoc.driveStatus = 'saved';
+  liveDoc.driveFileId = fileId;
+  liveDoc.driveFileUrl = resolvedUrl;
+  liveDoc.driveFileName = resolvedName;
+  if (folderId) liveDoc.driveFolderId = folderId;
+  if (folderPath) liveDoc.driveFolderPath = folderPath;
+  if (!liveDoc.driveUploadedAt) liveDoc.driveUploadedAt = verifiedAtIso;
+  liveDoc.driveLastVerifiedAt = verifiedAtIso;
+  delete liveDoc.driveError;
+  delete liveDoc.driveReconcileNote;
+  delete liveDoc.driveUploadStartedAt;
+  if (liveDoc.templateId && liveDoc.wordGenerationStatus !== 'generated') {
+    liveDoc.wordGenerationStatus = 'generated';
+    delete liveDoc.wordGenerationError;
+  }
+
+  clearDriveOnlyReviewReasons(liveDoc);
+
+  if (actor && (prevStatus !== 'saved' || prevFileId !== fileId)) {
+    recordDocumentHistoryEntry({
+      doc: liveDoc,
+      book,
+      actor,
+      action: 'reconcile_sync',
+      changes: {
+        driveStatus: { old: prevStatus, new: 'saved' },
+        driveFileId: { old: prevFileId, new: fileId },
+      },
+      reason:
+        auditReason ||
+        (matchedBy === 'file_id'
+          ? 'Đối soát Google Drive xác nhận tệp đã tồn tại hợp lệ theo mã tệp'
+          : 'Đối soát Google Drive tìm thấy tệp theo mã bản ghi trong thư mục sổ'),
+    });
+  }
+}
+
+async function reconcileSingleDocumentDriveStatus(
+  docId: string,
+  options: {
+    actor?: User;
+    forceCheck?: boolean;
+    auditReason?: string;
+    allowNotFoundTransitionToFailed?: boolean;
+  } = {}
+): Promise<{
+  document: DocumentRecord | null;
+  outcome: 'verified_saved' | 'failed' | 'needs_reconcile' | 'unchanged';
+  previousStatus: DriveUploadStatus;
+  newStatus: DriveUploadStatus;
+  matchedBy?: 'file_id' | 'record_metadata';
+  message: string;
+  errorCode?: AppsScriptAuthErrorCode;
+}> {
+  if (inFlightDocUploads.has(docId) && !options.forceCheck) {
+    const cur = db.documents.find((d) => d.id === docId) || null;
+    const st = (cur?.driveStatus || 'none') as DriveUploadStatus;
+    return {
+      document: cur,
+      outcome: 'unchanged',
+      previousStatus: st,
+      newStatus: st,
+      message: 'Tệp đang được tải lên trong tiến trình hiện tại.',
+    };
+  }
+
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const snapshot = db.documents.find((d) => d.id === docId);
+  if (!snapshot) {
+    return {
+      document: null,
+      outcome: 'unchanged',
+      previousStatus: 'none',
+      newStatus: 'none',
+      message: 'Không tìm thấy hồ sơ văn bản.',
+    };
+  }
+
+  const prevStatus = (snapshot.driveStatus || 'none') as DriveUploadStatus;
+  const book = resolveStrictBookForDocument(snapshot);
+  if (!book) {
+    return {
+      document: snapshot,
+      outcome: 'needs_reconcile',
+      previousStatus: prevStatus,
+      newStatus: prevStatus,
+      message: `Không xác định được đơn vị/sổ văn bản hợp lệ cho hồ sơ ${snapshot.fullDocNumber} (bookId=${snapshot.bookId || ''}, bookCode=${snapshot.bookCode || ''}).`,
+    };
+  }
+  const driveCfg = resolveDriveForBook(book);
+  const effectiveCategory: 'outgoing' | 'incoming' = snapshot.docCategory || 'outgoing';
+  const yearLabel = resolveDocumentDriveYearLabel({ ...snapshot, docCategory: effectiveCategory });
+  const cacheKey = `${book.id}::${driveCfg.folderId}::${yearLabel}::${effectiveCategory}`;
+
+  const verifyRes = await verifyOrLocateDocumentOnGoogleDrive({
+    config: driveCfg,
+    docId: snapshot.id,
+    driveFileId: snapshot.driveFileId,
+    bookName: book.name,
+    bookCode: book.code,
+    unit: book.code,
+    year: yearLabel,
+    docCategory: effectiveCategory,
+    folderCache: db.driveFolderCache,
+    cacheKey,
+  });
+
+  const nowIso = new Date().toISOString();
+
+  if (verifyRes.outcome === 'verified_saved' && verifyRes.fileId) {
+    let changed = false;
+    const updated = await mutateDocumentInDb(
+      docId,
+      (liveDoc) => {
+        const wasSavedWithSameId =
+          liveDoc.driveStatus === 'saved' &&
+          liveDoc.driveFileId === verifyRes.fileId &&
+          Boolean(liveDoc.driveFileUrl);
+        applyVerifiedDriveFileToDocument(liveDoc, {
+          fileId: verifyRes.fileId!,
+          fileName: verifyRes.fileName,
+          webViewLink: verifyRes.webViewLink,
+          folderId: verifyRes.folderId,
+          folderPath: verifyRes.folderPath,
+          verifiedAtIso: nowIso,
+          actor: options.actor,
+          book,
+          auditReason: options.auditReason,
+          matchedBy: verifyRes.matchedBy,
+        });
+        changed = !wasSavedWithSameId;
+        return true;
+      },
+      { verifyWrite: true }
+    );
+    if (updated && changed) {
+      broadcastSSE('document_updated', { document: updated });
+      void syncToGoogleSheets(updated, 'update').catch(() => {});
+    }
+    return {
+      document: updated,
+      outcome: 'verified_saved',
+      previousStatus: prevStatus,
+      newStatus: 'saved',
+      matchedBy: verifyRes.matchedBy,
+      message: verifyRes.message,
+    };
+  }
+
+  if (verifyRes.outcome === 'not_found') {
+    const canTransitionToFailed =
+      options.allowNotFoundTransitionToFailed !== false &&
+      (prevStatus === 'uploading' || prevStatus === 'failed');
+    const targetStatus: DriveUploadStatus = canTransitionToFailed ? 'failed' : 'needs_reconcile';
+
+    let finalStatus: DriveUploadStatus = targetStatus;
+    let changed = false;
+    const updated = await mutateDocumentInDb(
+      docId,
+      (liveDoc) => {
+        // Không bao giờ ghi đè trạng thái saved mới hơn đã được xác nhận đồng thời từ tiến trình khác
+        if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl && prevStatus !== 'saved') {
+          finalStatus = 'saved';
+          return false;
+        }
+        changed = liveDoc.driveStatus !== targetStatus;
+        liveDoc.driveStatus = targetStatus;
+        liveDoc.driveLastVerifiedAt = nowIso;
+        delete liveDoc.driveUploadStartedAt;
+        if (targetStatus === 'failed') {
+          liveDoc.driveError =
+            'Quá trình tải lên trước đó chưa hoàn tất trên Google Drive. Bấm Thử lại để tải tệp.';
+          delete liveDoc.driveReconcileNote;
+        } else {
+          liveDoc.driveReconcileNote = verifyRes.message;
+        }
+        if (Array.isArray(liveDoc.attachments) && liveDoc.attachments.length > 0) {
+          liveDoc.attachments = liveDoc.attachments.map((att) =>
+            att.driveStatus === 'uploading' || (att.isOfficial && att.driveStatus !== 'saved')
+              ? {
+                  ...att,
+                  driveStatus: targetStatus,
+                  ...(targetStatus === 'failed' ? { driveError: liveDoc.driveError } : {}),
+                }
+              : att
+          );
+        }
+        if (options.actor && changed) {
+          recordDocumentHistoryEntry({
+            doc: liveDoc,
+            book,
+            actor: options.actor,
+            action: 'reconcile_sync',
+            changes: {
+              driveStatus: { old: prevStatus, new: targetStatus },
+            },
+            reason: verifyRes.message,
+          });
+        }
+        return true;
+      },
+      { verifyWrite: true }
+    );
+    if (updated && changed) {
+      broadcastSSE('document_updated', { document: updated });
+    }
+    const resolvedStatus = finalStatus as DriveUploadStatus;
+    return {
+      document: updated,
+      outcome: resolvedStatus === 'saved' ? 'verified_saved' : resolvedStatus === 'failed' ? 'failed' : 'needs_reconcile',
+      previousStatus: prevStatus,
+      newStatus: resolvedStatus,
+      message: verifyRes.message,
+    };
+  }
+
+  // outcome === 'needs_reconcile': không thể xác minh (lỗi mạng/quyền/chưa cấu hình) -> KHÔNG mặc định tệp đã mất
+  let finalStatus: DriveUploadStatus = 'needs_reconcile';
+  let changed = false;
+  const updated = await mutateDocumentInDb(
+    docId,
+    (liveDoc) => {
+      if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl && prevStatus !== 'saved') {
+        finalStatus = 'saved';
+        return false;
+      }
+      changed = liveDoc.driveStatus !== 'needs_reconcile' || liveDoc.driveReconcileNote !== verifyRes.message;
+      liveDoc.driveStatus = 'needs_reconcile';
+      liveDoc.driveLastVerifiedAt = nowIso;
+      liveDoc.driveReconcileNote = verifyRes.message;
+      delete liveDoc.driveUploadStartedAt;
+      if (Array.isArray(liveDoc.attachments) && liveDoc.attachments.length > 0) {
+        liveDoc.attachments = liveDoc.attachments.map((att) =>
+          att.driveStatus === 'uploading'
+            ? { ...att, driveStatus: 'needs_reconcile', driveError: verifyRes.message }
+            : att
+        );
+      }
+      if (options.actor && changed) {
+        recordDocumentHistoryEntry({
+          doc: liveDoc,
+          book,
+          actor: options.actor,
+          action: 'reconcile_sync',
+          changes: {
+            driveStatus: { old: prevStatus, new: 'needs_reconcile' },
+          },
+          reason: verifyRes.message,
+        });
+      }
+      return true;
+    },
+    { verifyWrite: true }
+  );
+  if (updated && changed) {
+    broadcastSSE('document_updated', { document: updated });
+  }
+  const resolvedStatus = finalStatus as DriveUploadStatus;
+  return {
+    document: updated,
+    outcome: resolvedStatus === 'saved' ? 'verified_saved' : 'needs_reconcile',
+    previousStatus: prevStatus,
+    newStatus: resolvedStatus,
+    message: verifyRes.message,
+    errorCode: verifyRes.errorCode,
+  };
+}
+
+function isDocumentStaleUploading(doc: DocumentRecord, nowMs = Date.now()): boolean {
+  if (doc.status === 'deleted' || doc.status === 'cancelled') return false;
+  if (doc.driveStatus !== 'uploading') return false;
+  if (inFlightDocUploads.has(doc.id)) return false;
+  const startedIso = doc.driveUploadStartedAt || doc.createdAt;
+  const startedMs = startedIso ? new Date(startedIso).getTime() : 0;
+  if (!Number.isFinite(startedMs) || startedMs <= 0) return true;
+  return nowMs - startedMs >= STALE_DRIVE_UPLOAD_MS;
+}
+
+async function reconcileStaleUploadingDocuments(candidateDocs: DocumentRecord[], limit = 6): Promise<void> {
+  const nowMs = Date.now();
+  const stale = candidateDocs.filter((d) => isDocumentStaleUploading(d, nowMs)).slice(0, limit);
+  if (stale.length === 0) return;
+
+  await Promise.all(
+    stale.map(async (d) => {
+      const existing = inFlightDriveReconciles.get(d.id);
+      if (existing) {
+        await existing.catch(() => null);
+        return;
+      }
+      const p = reconcileSingleDocumentDriveStatus(d.id, {
+        allowNotFoundTransitionToFailed: true,
+        auditReason: 'Tự động đối soát bản ghi bị kẹt trạng thái Đang lưu',
+      })
+        .then((r) => r.document)
+        .catch(() => null)
+        .finally(() => {
+          if (inFlightDriveReconciles.get(d.id) === p) {
+            inFlightDriveReconciles.delete(d.id);
+          }
+        });
+      inFlightDriveReconciles.set(d.id, p);
+      await p;
+    })
+  );
+}
+
+if (!IS_SERVERLESS) {
+  setInterval(() => {
+    const stale = (db.documents || []).filter((d) => isDocumentStaleUploading(d));
+    if (stale.length > 0) {
+      void reconcileStaleUploadingDocuments(stale, 5).catch(() => {});
+    }
+  }, 45_000).unref();
+}
+
+function appendSystemAuditLog(entry: Omit<SystemAuditLog, 'id' | 'timestamp'>) {
+  if (!Array.isArray(db.systemAuditLogs)) db.systemAuditLogs = [];
+  db.systemAuditLogs.unshift({
+    id: `sys-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+    timestamp: new Date().toISOString(),
+    ...entry,
+  });
+  if (db.systemAuditLogs.length > 500) {
+    db.systemAuditLogs = db.systemAuditLogs.slice(0, 500);
+  }
+}
+
+export function buildDocumentSnapshot(doc: DocumentRecord, book: RegistryBook) {
+  return {
+    id: doc.id,
+    bookId: book.id,
+    bookCode: book.code,
+    bookName: book.name,
+    year: doc.year,
+    issueDate: normalizeDateOnlyDdMmYyyy(doc.issueDate) || doc.issueDate || '',
+    signDate: normalizeDateOnlyDdMmYyyy(doc.signDate || '') || '',
+    docCategory: doc.docCategory || 'outgoing',
+    issuingAgency: doc.issuingAgency || '',
+    typeCode: doc.typeCode,
+    typeName: doc.typeName,
+    sequenceNumber: doc.sequenceNumber,
+    fullDocNumber: doc.fullDocNumber,
+    docName: doc.docName || doc.title,
+    title: doc.title || '',
+    signer: doc.signer,
+    signerRole: doc.signerRole,
+    issuedBy: doc.issuedBy,
+    issuedByUsername: doc.issuedByUsername,
+    issuedByUserId: doc.issuedByUserId,
+    status: doc.status,
+    cancelReason: doc.cancelReason || '',
+    notes: doc.notes || '',
+    driveStatus: doc.driveStatus || 'none',
+    driveFileId: doc.driveFileId || '',
+    driveFileName: doc.driveFileName || '',
+    driveFileUrl: doc.driveFileUrl || '',
+    driveFolderPath: doc.driveFolderPath || '',
+    createdAt: doc.createdAt,
+  };
+}
+
+function recordDocumentHistoryEntry(params: {
+  doc: DocumentRecord;
+  book: RegistryBook;
+  actor: { id: string; username: string; fullName: string };
+  action: DocumentAuditAction;
+  changes: Record<string, { old: string | null; new: string | null }>;
+  reason?: string;
+  timestampIso?: string;
+  snapshot?: Record<string, any>;
+  pushToDocAuditLogs?: boolean;
+}): DocumentHistoryEntry {
+  const nowDate = params.timestampIso ? new Date(params.timestampIso) : new Date();
+  const timestamp = Number.isNaN(nowDate.getTime()) ? new Date().toISOString() : nowDate.toISOString();
+  const timestampVietnam = formatVietnamDateTime(new Date(timestamp));
+  const dateKeyVietnam = getVietnamDateKey(new Date(timestamp));
+  const id = `hist-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const entry: DocumentHistoryEntry = {
+    id,
+    timestamp,
+    timestampVietnam,
+    dateKeyVietnam,
+    userId: params.actor.id,
+    username: params.actor.username,
+    userName: `${params.actor.fullName} (${params.actor.username})`,
+    bookId: params.book.id,
+    bookCode: params.book.code,
+    bookName: params.book.name,
+    docId: params.doc.id,
+    fullDocNumber: params.doc.fullDocNumber,
+    docName: params.doc.docName || params.doc.title,
+    action: params.action,
+    changes: params.changes,
+    ...(params.reason ? { reason: params.reason } : {}),
+    ...(params.snapshot ? { snapshot: params.snapshot } : {}),
+  };
+
+  if (params.pushToDocAuditLogs !== false) {
+    if (!Array.isArray(params.doc.auditLogs)) params.doc.auditLogs = [];
+    params.doc.auditLogs.push(entry);
+  }
+  if (!Array.isArray(db.documentHistoryLogs)) {
+    db.documentHistoryLogs = [];
+  }
+  db.documentHistoryLogs.unshift(entry);
+  return entry;
+}
+
+export function buildGoogleSheetsPayload(
+  doc: DocumentRecord,
+  book: RegistryBook,
+  action:
+    | 'create'
+    | 'update'
+    | 'cancel'
+    | 'delete'
+    | 'delete_append_to_deleted'
+    | 'delete_remove_main'
+    | 'restore'
+    | 'test' = 'create',
+  extra: Record<string, any> = {}
+) {
+  const driveStatusLabel =
+    doc.driveStatus === 'saved'
+      ? 'Đã lưu'
+      : doc.driveStatus === 'failed'
+      ? 'Lưu tệp thất bại'
+      : doc.driveStatus === 'uploading'
+      ? 'Đang tải lên'
+      : 'Không đính kèm';
+  const statusLabel =
+    doc.status === 'deleted'
+      ? `Đã xóa (${doc.deleteReason || 'Đã xóa khỏi sổ hiệu lực'})`
+      : doc.status === 'cancelled'
+      ? `Đã hủy (${doc.cancelReason || 'Lý do sai sót'})`
+      : doc.docCategory === 'incoming'
+      ? 'Đã ghi sổ văn bản đến'
+      : 'Đã cấp số';
+
+  return {
+    action,
+    matchBy: 'id',
+    id: doc.id,
+    bookId: book.id,
+    bookCode: book.code,
+    bookName: book.name,
+    unitCode: book.unitCode,
+    stt: doc.stt,
+    year: doc.year,
+    issueDate: normalizeDateOnlyDdMmYyyy(doc.issueDate) || doc.issueDate || '',
+    signDate: normalizeDateOnlyDdMmYyyy(doc.signDate || '') || '',
+    pendingDateConfirmation: Boolean(doc.pendingDateConfirmation),
+    docCategory: doc.docCategory || 'outgoing',
+    categoryLabel: doc.docCategory === 'incoming' ? 'Văn bản đến' : 'Văn bản đi',
+    parentAgency: doc.parentAgency || '',
+    issuingAgency: doc.issuingAgency || '',
+    typeCode: doc.typeCode,
+    typeName: doc.typeName,
+    sequenceNumber: doc.docCategory === 'incoming' ? 0 : doc.sequenceNumber,
+    fullDocNumber: doc.fullDocNumber,
+    docName: doc.docName || doc.title,
+    title: doc.title || '',
+    signer: doc.signer,
+    signerRole: doc.signerRole,
+    issuedBy: doc.issuedBy,
+    status: statusLabel,
+    driveStatus: doc.driveStatus || 'none',
+    driveStatusLabel,
+    driveFileName: doc.driveFileName || '',
+    driveFileId: doc.driveFileId || '',
+    driveFileUrl: doc.driveFileUrl || '',
+    driveFolderPath: doc.driveFolderPath || '',
+    notes: doc.notes || '',
+    deletedBy: doc.deletedBy || '',
+    deletedByUsername: doc.deletedByUsername || '',
+    deletedAt: doc.deletedAt || '',
+    deletedAtVietnam: doc.deletedAtVietnam || '',
+    deleteReason: doc.deleteReason || '',
+    deletedSheetName: 'VB đã xóa',
+    timestamp: new Date().toISOString(),
+    ...extra,
+  };
+}
+
+function getGoogleSheetsTargets(book: RegistryBook) {
+  const targets: Array<{
+    url: string;
+    cfg: { enabled: boolean; webhookUrl: string; lastSyncTime?: string };
+    scope: 'master' | 'book';
+  }> = [];
+  const masterCfg = db.settings.googleSheetsConfig;
+  if (masterCfg && masterCfg.enabled && masterCfg.webhookUrl?.trim()) {
+    targets.push({ url: masterCfg.webhookUrl.trim(), cfg: masterCfg, scope: 'master' });
+  }
+  const bookCfg = book.googleSheetsConfig;
+  if (
+    bookCfg &&
+    bookCfg.enabled &&
+    bookCfg.webhookUrl?.trim() &&
+    bookCfg.webhookUrl.trim() !== masterCfg?.webhookUrl?.trim()
+  ) {
+    targets.push({ url: bookCfg.webhookUrl.trim(), cfg: bookCfg, scope: 'book' });
+  }
+  return targets;
+}
+
+async function postJsonWithTimeout(url: string, payload: Record<string, any>, timeoutMs = 8000) {
+  let isGoogleAppsScript = false;
+  try {
+    const parsed = new URL(url.trim());
+    isGoogleAppsScript = parsed.protocol === 'https:' && parsed.hostname.toLowerCase() === 'script.google.com';
+  } catch {
+    isGoogleAppsScript = false;
+  }
+
+  if (isGoogleAppsScript) {
+    const json = await postToGoogleAppsScript({
+      appsScriptUrl: url.trim(),
+      payload,
+      timeoutMs,
+      requireToken: false,
+    });
+    if (json && json.result === 'error') {
+      throw new Error(scrubSecretsFromText(json.error || 'Dịch vụ đồng bộ Excel trả về lỗi'));
+    }
+    return { res: null, json };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let json: any = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      json = null;
+    }
+    if (!res.ok) {
+      throw new Error(scrubSecretsFromText(json?.error || `HTTP ${res.status} từ dịch vụ đồng bộ Excel`));
+    }
+    if (json && json.result === 'error') {
+      throw new Error(scrubSecretsFromText(json.error || 'Dịch vụ đồng bộ Excel trả về lỗi'));
+    }
+    return { res, json };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// --- Google Sheets / Online Excel Webhook Sync Helpers ---
+async function syncToGoogleSheets(
+  doc: DocumentRecord,
+  action: 'create' | 'update' | 'cancel' | 'delete' | 'restore' = 'create'
+): Promise<{ attempted: boolean; ok: boolean; error?: string }> {
+  const book = getBookById(getDocBookId(doc));
+  if (action === 'delete' || (action !== 'restore' && doc.status === 'deleted')) {
+    return syncDeletedDocumentToOnlineExcel(doc, book);
+  }
+
+  const targets = getGoogleSheetsTargets(book);
+  if (targets.length === 0) {
+    return { attempted: false, ok: true };
+  }
+
+  const payload = buildGoogleSheetsPayload(doc, book, action);
+  const errors: string[] = [];
+
+  for (const target of targets) {
+    try {
+      await postJsonWithTimeout(target.url, { ...payload, scope: target.scope });
+      target.cfg.lastSyncTime = new Date().toISOString();
+    } catch (err: any) {
+      const msg = err?.message || 'Lỗi kết nối đồng bộ Excel';
+      console.error(`[Google Sheets Sync - ${book.code}] Lỗi gửi webhook:`, msg);
+      errors.push(msg);
+    }
+  }
+
+  if (errors.length === 0) {
+    const syncedAtIso = new Date().toISOString();
+    doc.syncStatus = 'synced';
+    doc.syncedAt = syncedAtIso;
+    delete doc.syncError;
+    await mutateDocumentInDb(
+      doc.id,
+      (liveDoc) => {
+        liveDoc.syncStatus = 'synced';
+        liveDoc.syncedAt = syncedAtIso;
+        delete liveDoc.syncError;
+        return true;
+      },
+      { verifyWrite: false }
+    ).catch((err) => {
+      console.error(`[Google Sheets Sync - ${book.code}] Lỗi cập nhật trạng thái đồng bộ vào DB:`, sanitizeErrorForLog(err));
+    });
+    return { attempted: true, ok: true };
+  }
+
+  doc.syncStatus = 'error';
+  doc.syncError = errors[0];
+  await mutateDocumentInDb(
+    doc.id,
+    (liveDoc) => {
+      liveDoc.syncStatus = 'error';
+      liveDoc.syncError = errors[0];
+      return true;
+    },
+    { verifyWrite: false }
+  ).catch((err) => {
+    console.error(`[Google Sheets Sync - ${book.code}] Lỗi cập nhật lỗi đồng bộ vào DB:`, sanitizeErrorForLog(err));
+  });
+  return { attempted: true, ok: false, error: errors[0] };
+}
+
+async function syncDeletedDocumentToOnlineExcel(
+  doc: DocumentRecord,
+  book: RegistryBook
+): Promise<{ attempted: boolean; ok: boolean; error?: string }> {
+  const targets = getGoogleSheetsTargets(book);
+  if (targets.length === 0) {
+    doc.excelDeleteSyncStatus = 'not_configured';
+    doc.excelMovedToDeletedSheet = false;
+    doc.excelRemovedFromMainSheet = false;
+    delete doc.excelSyncError;
+    return { attempted: false, ok: true };
+  }
+
+  if (!doc.excelSyncTargets || typeof doc.excelSyncTargets !== 'object') {
+    doc.excelSyncTargets = {};
+  }
+  const hasExistingTargetEntries = Object.keys(doc.excelSyncTargets).length > 0;
+
+  const errors: string[] = [];
+
+  for (const target of targets) {
+    const existingState =
+      doc.excelSyncTargets[target.url] ||
+      (hasExistingTargetEntries
+        ? { movedToDeletedSheet: false, removedFromMainSheet: false }
+        : {
+            movedToDeletedSheet: Boolean(doc.excelMovedToDeletedSheet),
+            removedFromMainSheet: Boolean(doc.excelRemovedFromMainSheet),
+          });
+    const tState = { ...existingState };
+
+    try {
+      // Bước 1: Tạo/cập nhật dòng trong sheet "VB đã xóa" theo mã hồ sơ cố định (doc.id) và xác nhận
+      if (!tState.movedToDeletedSheet) {
+        const step1Payload = buildGoogleSheetsPayload(doc, book, 'delete_append_to_deleted', {
+          scope: target.scope,
+        });
+        const { json } = await postJsonWithTimeout(target.url, step1Payload);
+        if (json && json.confirmed === false) {
+          throw new Error('Chưa xác nhận ghi nhận xong trong sheet "VB đã xóa".');
+        }
+        tState.movedToDeletedSheet = true;
+        delete tState.error;
+        doc.excelSyncTargets[target.url] = tState;
+        doc.excelMovedToDeletedSheet = true;
+        await saveDatabasePersistent(db);
+      }
+
+      // Bước 2: Chỉ xóa dòng khỏi sheet theo dõi chính sau khi đã xác nhận ghi xong ở sheet "VB đã xóa"
+      if (tState.movedToDeletedSheet && !tState.removedFromMainSheet) {
+        const step2Payload = buildGoogleSheetsPayload(doc, book, 'delete_remove_main', {
+          scope: target.scope,
+        });
+        await postJsonWithTimeout(target.url, step2Payload);
+        tState.removedFromMainSheet = true;
+        tState.syncedAt = new Date().toISOString();
+        delete tState.error;
+        doc.excelSyncTargets[target.url] = tState;
+        target.cfg.lastSyncTime = tState.syncedAt;
+      }
+    } catch (err: any) {
+      const msg = err?.message || 'Mất kết nối khi đồng bộ xóa sang Google Trang tính.';
+      tState.error = msg;
+      doc.excelSyncTargets[target.url] = tState;
+      errors.push(msg);
+      console.error(`[Google Sheets Delete Sync - ${book.code}] Lỗi đồng bộ xóa:`, msg);
+    }
+  }
+
+  const allMoved = targets.every((t) => Boolean(doc.excelSyncTargets?.[t.url]?.movedToDeletedSheet));
+  const anyMoved = targets.some((t) => Boolean(doc.excelSyncTargets?.[t.url]?.movedToDeletedSheet));
+  const allRemoved = targets.every((t) => Boolean(doc.excelSyncTargets?.[t.url]?.removedFromMainSheet));
+
+  doc.excelMovedToDeletedSheet = anyMoved;
+  doc.excelRemovedFromMainSheet = allRemoved;
+
+  if (allMoved && allRemoved && errors.length === 0) {
+    doc.excelDeleteSyncStatus = 'synced';
+    doc.excelSyncedAt = new Date().toISOString();
+    doc.syncStatus = 'synced';
+    doc.syncedAt = doc.excelSyncedAt;
+    delete doc.excelSyncError;
+    delete doc.syncError;
+    await saveDatabasePersistent(db);
+    return { attempted: true, ok: true };
+  }
+
+  doc.excelDeleteSyncStatus = 'failed';
+  doc.excelSyncError = errors[0] || 'Đồng bộ xóa Google Trang tính chưa hoàn tất.';
+  doc.syncStatus = 'error';
+  doc.syncError = doc.excelSyncError;
+  await saveDatabasePersistent(db);
+  return { attempted: true, ok: false, error: doc.excelSyncError };
+}
+
+const inFlightDocUploads = new Map<string, Promise<DocumentRecord>>();
+
+function sanitizeSettingsForUser(settings: SystemSettings, user?: User): SystemSettings {
+  const isAdmin = user?.role === 'admin';
+  const safeDrive = sanitizeDriveConfigForClient(settings.googleDriveConfig, isAdmin, settings.unitCode);
+  const { msGraphConfig: _legacyMsGraph, ...cleanSettings } = settings;
+  return {
+    ...cleanSettings,
+    googleSheetsConfig: settings.googleSheetsConfig
+      ? isAdmin
+        ? settings.googleSheetsConfig
+        : {
+            enabled: settings.googleSheetsConfig.enabled,
+            webhookUrl: '',
+            lastSyncTime: settings.googleSheetsConfig.lastSyncTime,
+          }
+      : undefined,
+    googleDriveConfig: safeDrive,
+  };
+}
+
+const wordUploadMiddleware = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: getMaxWordFileSizeBytes(),
+    files: 1,
+  },
+}).single('file');
+
+function handleWordUploadMulter(req: Request, res: Response, next: NextFunction) {
+  wordUploadMiddleware(req, res, (err: any) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({
+          error: `Dung lượng tệp vượt quá giới hạn tối đa ${getMaxWordFileSizeMB()} MB của máy chủ.`,
+        });
+      }
+      return res.status(400).json({
+        error: err.message || 'Lỗi khi tiếp nhận tệp tải lên.',
+      });
+    }
+    next();
+  });
+}
+
+// --- Book & Permission Helpers ---
+function getDefaultBook(): RegistryBook {
+  return db.books.find((b) => b.id === DEFAULT_BOOK_ID) || db.books[0];
+}
+
+function getBookById(bookId?: string): RegistryBook {
+  if (bookId && bookId.trim()) {
+    const found = db.books.find((b) => b.id === bookId.trim());
+    if (found) return found;
+  }
+  return getDefaultBook();
+}
+
+/**
+ * Tra cứu sổ/đơn vị chặt chẽ theo bookId, bookCode (NHA_TRUONG | DOAN_TRUONG | CHI_BO) hoặc unit.
+ * TUYỆT ĐỐI KHÔNG tự mặc định về DOAN_TRUONG khi thiếu hoặc sai mã đơn vị.
+ */
+function findBookStrictly(ref?: {
+  bookId?: string | null;
+  bookCode?: string | null;
+  unit?: string | null;
+}): RegistryBook | null {
+  if (!ref) return null;
+  const rawId = typeof ref.bookId === 'string' ? ref.bookId.trim() : '';
+  if (rawId) {
+    const byId = db.books.find((b) => b.id === rawId);
+    if (byId) return byId;
+  }
+  const rawCode = typeof ref.bookCode === 'string' ? ref.bookCode.trim().toUpperCase() : '';
+  if (rawCode) {
+    const byCode = db.books.find((b) => (b.code || '').trim().toUpperCase() === rawCode);
+    if (byCode) return byCode;
+  }
+  const rawUnit = typeof ref.unit === 'string' ? ref.unit.trim().toUpperCase() : '';
+  if (rawUnit) {
+    const byUnit = db.books.find(
+      (b) =>
+        (b.code || '').trim().toUpperCase() === rawUnit ||
+        (b.unitCode || '').trim().toUpperCase() === rawUnit
+    );
+    if (byUnit) return byUnit;
+  }
+  return null;
+}
+
+/**
+ * Xác minh đúng sổ/đơn vị từ dữ liệu bản ghi gốc trên máy chủ (KHÔNG tự chuyển đơn vị, KHÔNG mặc định DOAN_TRUONG).
+ */
+function resolveStrictBookForDocument(
+  doc: Pick<DocumentRecord, 'bookId' | 'bookCode'>
+): RegistryBook | null {
+  return findBookStrictly({
+    bookId: doc.bookId,
+    bookCode: doc.bookCode,
+  });
+}
+
+function resolveDriveForBook(book: RegistryBook) {
+  return resolveEffectiveDriveConfig(
+    db.settings.googleDriveConfig,
+    book.unitCode,
+    book.googleDriveConfig,
+    book.id === DEFAULT_BOOK_ID
+  );
+}
+
+function sanitizeBookForUser(book: RegistryBook, user?: User): RegistryBook {
+  const canManage = isSystemAdmin(user) || hasBookPermission(user, book.id, 'manage_book');
+  return {
+    ...book,
+    googleDriveConfig: sanitizeDriveConfigForClient(
+      db.settings.googleDriveConfig,
+      canManage,
+      book.unitCode,
+      book.googleDriveConfig,
+      book.id === DEFAULT_BOOK_ID
+    ),
+    googleSheetsConfig: book.googleSheetsConfig
+      ? canManage
+        ? book.googleSheetsConfig
+        : {
+            enabled: book.googleSheetsConfig.enabled,
+            webhookUrl: '',
+            lastSyncTime: book.googleSheetsConfig.lastSyncTime,
+          }
+      : undefined,
+  };
+}
+
+function syncDefaultBookToLegacySettings(book: RegistryBook) {
+  if (book.id !== DEFAULT_BOOK_ID) return;
+  db.settings.unitName = book.unitName;
+  db.settings.unitCode = book.unitCode;
+  db.settings.numberMode = book.numberMode;
+  db.settings.numberFormat = book.numberFormat;
+  db.settings.customStartSequences = { ...(book.customStartSequences || {}) };
+  if (book.configVersion) db.settings.configVersion = book.configVersion;
+  if (book.updatedAt) db.settings.updatedAt = book.updatedAt;
+  if (Array.isArray(book.signers)) {
+    db.signers = book.signers.map((s) => ({ ...s }));
+  }
+}
+
+function findBookExplicitly(bookId?: string): RegistryBook | null {
+  if (!bookId || !bookId.trim()) return getDefaultBook();
+  return db.books.find((b) => b.id === bookId.trim()) || null;
+}
+
+function computeSeriesSequenceState(
+  book: RegistryBook,
+  targetYear: number,
+  rawTypeCode: string
+): StartSequenceSeriesConfig & { sampleTypeCode: string } {
+  const mode = book.numberMode;
+  const canonicalInput = resolveCanonicalTypeCode(rawTypeCode, db.documentTypes);
+  const canonicalType = mode === 'shared' ? 'SHARED' : canonicalInput;
+  const seriesKey = `${book.code}:${targetYear}:${canonicalType}`;
+  const storageKey = `${targetYear}_${canonicalType}`;
+
+  const docsInSeries = db.documents.filter((d) => {
+    if (getDocBookId(d) !== book.id || d.year !== targetYear || d.docCategory === 'incoming') {
+      return false;
+    }
+    if (mode === 'shared') return true;
+    return resolveCanonicalTypeCode(d.typeCode, db.documentTypes) === canonicalType;
+  });
+
+  const maxIssuedSequence = docsInSeries.reduce((m, d) => Math.max(m, d.sequenceNumber), 0);
+  const rawSaved = book.customStartSequences?.[storageKey];
+  const isConfigured = typeof rawSaved === 'number' && Number.isFinite(rawSaved) && rawSaved >= 1;
+  const customStartSequence = isConfigured ? Math.floor(rawSaved) : null;
+  const minAllowedStartSequence = maxIssuedSequence + 1;
+  const nextExpectedSeq = Math.max(customStartSequence ?? 1, minAllowedStartSequence);
+
+  const sampleTypeCode =
+    canonicalType === 'SHARED'
+      ? canonicalInput && canonicalInput !== 'SHARED'
+        ? canonicalInput
+        : book.enabledTypeCodes?.[0] || db.documentTypes[0]?.code || 'KH'
+      : canonicalType;
+  const seqStr = formatSequenceNumber(nextExpectedSeq);
+  const previewNumber = renderFullDocNumber(book.numberFormat, seqStr, sampleTypeCode, book.unitCode);
+
+  return {
+    seriesKey,
+    storageKey,
+    bookId: book.id,
+    bookCode: book.code,
+    year: targetYear,
+    typeCode: canonicalType,
+    isConfigured,
+    customStartSequence,
+    maxIssuedSequence,
+    minAllowedStartSequence,
+    nextExpectedSeq,
+    previewNumber,
+    sampleTypeCode,
+    configVersion: book.configVersion || 1,
+    customStartSequences: { ...(book.customStartSequences || {}) },
+  };
+}
+
+function bumpBookVersion(book: RegistryBook) {
+  const nowIso = new Date().toISOString();
+  book.configVersion = (book.configVersion || 1) + 1;
+  book.updatedAt = nowIso;
+  if (book.id === DEFAULT_BOOK_ID) {
+    db.settings.configVersion = book.configVersion;
+    db.settings.updatedAt = nowIso;
+  } else {
+    db.settings.updatedAt = nowIso;
+  }
+}
+
+function checkVersionConflict(req: Request, res: Response, targetBook: RegistryBook, currentUser: User): boolean {
+  const { expectedVersion, forceOverwrite } = req.body || {};
+  if (forceOverwrite) return false;
+  if (expectedVersion === undefined || expectedVersion === null || expectedVersion === '') return false;
+  const parsedExpected = Number(expectedVersion);
+  if (!Number.isFinite(parsedExpected)) return false;
+  const serverVersion = targetBook.configVersion || 1;
+  if (parsedExpected !== serverVersion) {
+    res.status(409).json({
+      code: 'SETTINGS_CONFLICT',
+      error: 'Cài đặt đã thay đổi trên thiết bị khác. Vui lòng làm mới dữ liệu và đối chiếu trước khi lưu.',
+      serverVersion,
+      serverBook: sanitizeBookForUser(targetBook, currentUser),
+    });
+    return true;
+  }
+  return false;
+}
+
+function toSafeUser(u: User & { passwordHash?: string }): User {
+  const { passwordHash: _, ...rest } = u;
+  const trimmedDisplayName =
+    typeof rest.displayName === 'string' ? rest.displayName.trim() : '';
+  const safe: User = {
+    ...rest,
+    fullName: typeof rest.fullName === 'string' ? rest.fullName : '',
+    bookPermissions:
+      rest.role === 'admin' ? undefined : sanitizeBookPermissionsMap(rest.bookPermissions || {}),
+  };
+  if (trimmedDisplayName) {
+    safe.displayName = trimmedDisplayName;
+  } else {
+    delete safe.displayName;
+  }
+  return safe;
+}
+
+function refreshUserSessions(updatedUser: User) {
+  for (const [token, sess] of tokenStore.entries()) {
+    if (sess.user.id === updatedUser.id) {
+      if (!updatedUser.isActive) {
+        tokenStore.delete(token);
+      } else {
+        sess.user = updatedUser;
+      }
+    }
+  }
+}
+
+// --- Durable Staged PDF Store for Preview & Retry (2-hour TTL = 7200s) ---
+interface StagedPdfEntry {
+  token: string;
+  bookId: string;
+  buffer: Buffer;
+  sha256: string;
+  originalFileName: string;
+  sourceType: 'pdf_url' | 'pdf_upload';
+  sourceUrl?: string;
+  userId: string;
+  createdAt: number;
+  pageTexts?: PdfPageContent[];
+}
+
+interface SerializedStagedPdfEntry {
+  token: string;
+  bookId: string;
+  bufferBase64: string;
+  sha256: string;
+  originalFileName: string;
+  sourceType: 'pdf_url' | 'pdf_upload';
+  sourceUrl?: string;
+  userId: string;
+  createdAt: number;
+  pageTexts?: PdfPageContent[];
+}
+
+const STAGED_PDF_TTL_SEC = 2 * 60 * 60; // 7200s (2 giờ)
+const STAGED_PDF_TTL_MS = STAGED_PDF_TTL_SEC * 1000;
+const STAGED_PDF_MEM_MAX = 24;
+const stagedPdfsMem = new Map<string, StagedPdfEntry>();
+const STAGED_PDF_DIR = path.join(DATA_DIR, 'staged-pdfs');
+
+function touchStagedMem(token: string, entry: StagedPdfEntry) {
+  stagedPdfsMem.delete(token);
+  stagedPdfsMem.set(token, entry);
+  while (stagedPdfsMem.size > STAGED_PDF_MEM_MAX) {
+    const oldestKey = stagedPdfsMem.keys().next().value;
+    if (oldestKey) stagedPdfsMem.delete(oldestKey);
+    else break;
+  }
+}
+
+function getStagedPdfDiskPath(token: string): string {
+  const safe = token.replace(/[^a-zA-Z0-9_-]/g, '');
+  return path.join(STAGED_PDF_DIR, `${safe}.json`);
+}
+
+function serializeStagedPdfEntry(entry: StagedPdfEntry): string {
+  const payload: SerializedStagedPdfEntry = {
+    token: entry.token,
+    bookId: entry.bookId,
+    bufferBase64: entry.buffer.toString('base64'),
+    sha256: entry.sha256,
+    originalFileName: entry.originalFileName,
+    sourceType: entry.sourceType,
+    sourceUrl: entry.sourceUrl,
+    userId: entry.userId,
+    createdAt: entry.createdAt,
+    pageTexts: entry.pageTexts,
+  };
+  return JSON.stringify(payload);
+}
+
+function deserializeStagedPdfEntry(raw: string): StagedPdfEntry | null {
+  try {
+    const parsed = JSON.parse(raw) as SerializedStagedPdfEntry;
+    if (!parsed || !parsed.token || !parsed.bufferBase64 || !parsed.sha256) return null;
+    if (Date.now() - (Number(parsed.createdAt) || 0) > STAGED_PDF_TTL_MS) return null;
+    return {
+      token: parsed.token,
+      bookId: parsed.bookId,
+      buffer: Buffer.from(parsed.bufferBase64, 'base64'),
+      sha256: parsed.sha256,
+      originalFileName: parsed.originalFileName,
+      sourceType: parsed.sourceType,
+      sourceUrl: parsed.sourceUrl,
+      userId: parsed.userId,
+      createdAt: parsed.createdAt,
+      pageTexts: parsed.pageTexts,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function saveStagedPdfEntry(entry: StagedPdfEntry): Promise<void> {
+  touchStagedMem(entry.token, entry);
+  const serialized = serializeStagedPdfEntry(entry);
+  const cfg = getStorageAdapterConfig();
+
+  // 1. Upstash Redis / Vercel KV (bền vững qua nhiều instance & serverless cold-start)
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    try {
+      await executeUpstashCommand(
+        cfg,
+        ['SET', `nct_staged_pdf:${entry.token}`, serialized, 'EX', String(STAGED_PDF_TTL_SEC)],
+        12000
+      );
+      return;
+    } catch (err) {
+      console.warn('[Staged PDF] Không lưu được vào Upstash Redis, fallback ổ đĩa cục bộ:', sanitizeErrorForLog(err));
+    }
+  }
+
+  // 2. Vercel Blob (nếu dùng Blob store)
+  if (cfg.mode === 'vercel_blob' && cfg.blobToken) {
+    try {
+      const blobPath = `nct-staged-pdfs/${entry.token.replace(/[^a-zA-Z0-9_-]/g, '')}.json`;
+      await fetchRemoteWithTimeout(
+        `https://blob.vercel-storage.com/${encodeURIComponent(blobPath)}`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${cfg.blobToken}`,
+            'x-api-version': '7',
+            'x-add-random-suffix': '0',
+            'content-type': 'application/json',
+          },
+          body: serialized,
+        },
+        15000
+      );
+      return;
+    } catch (err) {
+      console.warn('[Staged PDF] Không lưu được vào Vercel Blob, fallback ổ đĩa cục bộ:', sanitizeErrorForLog(err));
+    }
+  }
+
+  // 3. Ổ đĩa cục bộ (DATA_DIR hoặc /tmp)
+  try {
+    if (!fs.existsSync(STAGED_PDF_DIR)) {
+      fs.mkdirSync(STAGED_PDF_DIR, { recursive: true });
+    }
+    fs.writeFileSync(getStagedPdfDiskPath(entry.token), serialized, 'utf-8');
+  } catch (err) {
+    console.warn('[Staged PDF] Không ghi được cache ổ đĩa cục bộ:', sanitizeErrorForLog(err));
+  }
+}
+
+async function getStagedPdfEntry(token: string): Promise<StagedPdfEntry | null> {
+  const cleanToken = (token || '').trim();
+  if (!cleanToken) return null;
+
+  const mem = stagedPdfsMem.get(cleanToken);
+  if (mem) {
+    if (Date.now() - mem.createdAt <= STAGED_PDF_TTL_MS) {
+      touchStagedMem(cleanToken, mem);
+      return mem;
+    }
+    stagedPdfsMem.delete(cleanToken);
+  }
+
+  const cfg = getStorageAdapterConfig();
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    try {
+      const result = await executeUpstashCommand<any>(cfg, ['GET', `nct_staged_pdf:${cleanToken}`], 10000);
+      if (result) {
+        const rawStr = typeof result === 'string' ? result : JSON.stringify(result);
+        const hydrated = deserializeStagedPdfEntry(rawStr);
+        if (hydrated) {
+          touchStagedMem(cleanToken, hydrated);
+          return hydrated;
+        }
+      }
+    } catch (err) {
+      console.warn('[Staged PDF] Lỗi đọc từ Upstash Redis:', sanitizeErrorForLog(err));
+    }
+  }
+
+  if (cfg.mode === 'vercel_blob' && cfg.blobToken) {
+    try {
+      const blobPrefix = `nct-staged-pdfs/${cleanToken.replace(/[^a-zA-Z0-9_-]/g, '')}.json`;
+      const listRes = await fetchRemoteWithTimeout(
+        `https://blob.vercel-storage.com?prefix=${encodeURIComponent(blobPrefix)}&limit=2`,
+        {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${cfg.blobToken}`, 'x-api-version': '7' },
+        },
+        10000
+      );
+      if (listRes.ok) {
+        const listData = (await listRes.json()) as { blobs?: Array<{ pathname: string; url: string; downloadUrl?: string }> };
+        const match = listData.blobs?.find((b) => b.pathname === blobPrefix);
+        if (match) {
+          const fRes = await fetchRemoteWithTimeout(
+            match.downloadUrl || match.url,
+            { method: 'GET', headers: { Authorization: `Bearer ${cfg.blobToken}` } },
+            12000
+          );
+          if (fRes.ok) {
+            const hydrated = deserializeStagedPdfEntry(await fRes.text());
+            if (hydrated) {
+              touchStagedMem(cleanToken, hydrated);
+              return hydrated;
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore blob fallback errors
+    }
+  }
+
+  try {
+    const diskPath = getStagedPdfDiskPath(cleanToken);
+    if (fs.existsSync(diskPath)) {
+      const raw = fs.readFileSync(diskPath, 'utf-8');
+      const hydrated = deserializeStagedPdfEntry(raw);
+      if (hydrated) {
+        touchStagedMem(cleanToken, hydrated);
+        return hydrated;
+      }
+      fs.unlinkSync(diskPath);
+    }
+  } catch {
+    // ignore disk read errors
+  }
+
+  return null;
+}
+
+async function deleteStagedPdfEntry(token: string): Promise<void> {
+  const cleanToken = (token || '').trim();
+  if (!cleanToken) return;
+  stagedPdfsMem.delete(cleanToken);
+
+  const cfg = getStorageAdapterConfig();
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    void executeUpstashCommand(cfg, ['DEL', `nct_staged_pdf:${cleanToken}`], 6000).catch(() => {});
+  }
+  try {
+    const diskPath = getStagedPdfDiskPath(cleanToken);
+    if (fs.existsSync(diskPath)) {
+      fs.unlinkSync(diskPath);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+if (!IS_SERVERLESS) {
+  setInterval(() => {
+    const cutoff = Date.now() - STAGED_PDF_TTL_MS;
+    for (const [k, v] of stagedPdfsMem.entries()) {
+      if (v.createdAt < cutoff) stagedPdfsMem.delete(k);
+    }
+    try {
+      if (fs.existsSync(STAGED_PDF_DIR)) {
+        for (const f of fs.readdirSync(STAGED_PDF_DIR)) {
+          if (!f.endsWith('.json')) continue;
+          const p = path.join(STAGED_PDF_DIR, f);
+          const stat = fs.statSync(p);
+          if (stat.mtimeMs < cutoff) {
+            fs.unlinkSync(p);
+          }
+        }
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+  }, 10 * 60 * 1000).unref();
+}
+
+function findConflictingDocumentByDriveFileName(
+  targetFileName: string,
+  excludeDocId?: string,
+  bookId?: string
+): DocumentRecord | null {
+  const lower = (targetFileName || '').trim().toLowerCase();
+  if (!lower) return null;
+  return (
+    db.documents.find(
+      (d) =>
+        d.id !== excludeDocId &&
+        (!bookId || getDocBookId(d) === bookId) &&
+        d.status !== 'cancelled' &&
+        d.status !== 'deleted' &&
+        d.driveFileName &&
+        d.driveFileName.trim().toLowerCase() === lower
+    ) || null
+  );
+}
+
+function resolveUniqueDriveFileName(baseFileName: string, excludeDocId?: string, bookId?: string): string {
+  let candidate = baseFileName;
+  let idx = 2;
+  while (findConflictingDocumentByDriveFileName(candidate, excludeDocId, bookId)) {
+    candidate = appendConflictSuffix(baseFileName, idx);
+    idx++;
+  }
+  return candidate;
+}
+
+function findSuspectedDuplicateDocument(
+  bookId: string,
+  fullDocNumber: string,
+  issuingAgency?: string,
+  year?: number,
+  excludeDocId?: string
+): DocumentRecord | null {
+  const normNum = normalizeDocNumberForCompare(fullDocNumber);
+  if (!normNum) return null;
+  const normAgency = normalizeCompareText(issuingAgency || '');
+
+  return (
+    db.documents.find((d) => {
+      if (d.id === excludeDocId) return false;
+      if (d.status === 'cancelled' || d.status === 'deleted') return false;
+      if (getDocBookId(d) !== bookId) return false;
+
+      if (normalizeDocNumberForCompare(d.fullDocNumber) !== normNum) return false;
+      if (year && d.year !== year) return false;
+
+      const dAgency = normalizeCompareText(d.issuingAgency || d.signerRole || '');
+      if (normAgency && dAgency) {
+        if (normAgency === dAgency) return true;
+        if (
+          normAgency.length >= 8 &&
+          dAgency.length >= 8 &&
+          (normAgency.includes(dAgency) || dAgency.includes(normAgency))
+        ) {
+          return true;
+        }
+        return false;
+      }
+      return true;
+    }) || null
+  );
+}
+
+function findNearDuplicateDocuments(
+  bookId: string,
+  docNameInput: string,
+  titleInput: string,
+  excludeDocId?: string
+): DocumentRecord[] {
+  const normInput = normalizeCompareText(docNameInput || titleInput || '');
+  if (!normInput || normInput.length < 6) return [];
+
+  const inputTokens = new Set(normInput.split(/\s+/).filter((t) => t.length >= 2));
+  const matches: Array<{ doc: DocumentRecord; score: number }> = [];
+
+  for (const d of db.documents) {
+    if (d.id === excludeDocId) continue;
+    if (d.status === 'cancelled' || d.status === 'deleted') continue;
+    if (getDocBookId(d) !== bookId) continue;
+
+    const targetText = normalizeCompareText(d.docName || d.title || '');
+    if (!targetText || targetText.length < 6) continue;
+
+    if (targetText === normInput) {
+      matches.push({ doc: d, score: 1 });
+      continue;
+    }
+    if (
+      (normInput.length >= 12 && targetText.includes(normInput)) ||
+      (targetText.length >= 12 && normInput.includes(targetText))
+    ) {
+      matches.push({ doc: d, score: 0.9 });
+      continue;
+    }
+
+    const targetTokens = new Set(targetText.split(/\s+/).filter((t) => t.length >= 2));
+    if (inputTokens.size >= 3 && targetTokens.size >= 3) {
+      let overlap = 0;
+      for (const tok of inputTokens) {
+        if (targetTokens.has(tok)) overlap++;
+      }
+      const union = inputTokens.size + targetTokens.size - overlap;
+      const jaccard = union > 0 ? overlap / union : 0;
+      if (jaccard >= 0.6) {
+        matches.push({ doc: d, score: jaccard });
+      }
+    }
+  }
+
+  return matches
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5)
+    .map((m) => m.doc);
+}
+
+function stripLargeIndexFieldsForList(doc: DocumentRecord): DocumentRecord {
+  if (!Array.isArray(doc.pdfPageContents) || doc.pdfPageContents.length === 0) {
+    return doc;
+  }
+  const { pdfPageContents: _omitted, ...rest } = doc;
+  return {
+    ...rest,
+    pdfIndexedPagesCount:
+      doc.pdfIndexedPagesCount ?? doc.pdfPageContents.filter((p) => (p.text || '').trim().length > 0).length,
+    pdfTextStatus: doc.pdfTextStatus || 'indexed',
+  };
+}
+
+function resolveDocumentDriveYearLabel(doc: {
+  docCategory?: 'outgoing' | 'incoming';
+  year?: number;
+  issueDate?: string;
+  pendingDateConfirmation?: boolean;
+  receivedDate?: string;
+  createdAt?: string;
+}): string {
+  if (doc.docCategory === 'incoming') {
+    if (doc.pendingDateConfirmation) {
+      return UNKNOWN_DRIVE_YEAR_FOLDER;
+    }
+    const cleanIssue = normalizeDateOnlyDdMmYyyy(doc.issueDate || '');
+    if (cleanIssue) {
+      const parts = cleanIssue.split('/');
+      if (parts.length === 3 && /^\d{4}$/.test(parts[2])) {
+        const y = parseInt(parts[2], 10);
+        if (Number.isFinite(y) && y >= 1900 && y <= 2100) {
+          return String(y);
+        }
+      }
+    }
+    return UNKNOWN_DRIVE_YEAR_FOLDER;
+  }
+
+  // Văn bản đi: dùng năm cấp số chính thức (doc.year) theo giờ Việt Nam
+  if (typeof doc.year === 'number' && Number.isFinite(doc.year) && doc.year >= 1900 && doc.year <= 2100) {
+    return String(Math.trunc(doc.year));
+  }
+  const cleanRec = normalizeDateOnlyDdMmYyyy(doc.receivedDate || '');
+  if (cleanRec) {
+    const parts = cleanRec.split('/');
+    if (parts.length === 3 && /^\d{4}$/.test(parts[2])) {
+      const y = parseInt(parts[2], 10);
+      if (Number.isFinite(y) && y >= 1900 && y <= 2100) {
+        return String(y);
+      }
+    }
+  }
+  if (doc.createdAt) {
+    const d = new Date(doc.createdAt);
+    if (!Number.isNaN(d.getTime())) {
+      return String(getVietnamTimeInfo(d).year);
+    }
+  }
+  return String(getVietnamTimeInfo(new Date()).year);
+}
+
+async function uploadDocumentWithFolderCache(params: {
+  driveCfg: ResolvedGoogleDriveConfig;
+  book: RegistryBook;
+  doc: Pick<
+    DocumentRecord,
+    'id' | 'docCategory' | 'year' | 'issueDate' | 'pendingDateConfirmation' | 'receivedDate' | 'createdAt' | 'fullDocNumber' | 'docName' | 'title'
+  >;
+  docCategoryOverride?: 'outgoing' | 'incoming';
+  originalFileName: string;
+  mimeType: string;
+  buffer: Buffer;
+  overrideFileName?: string;
+  replaceMode?: boolean;
+  isRetry?: boolean;
+  previousFileId?: string;
+  keepPreviousFile?: boolean;
+}): Promise<DriveUploadResult> {
+  const { driveCfg, book, doc, docCategoryOverride, ...rest } = params;
+  const effectiveCategory: 'outgoing' | 'incoming' = docCategoryOverride || doc.docCategory || 'outgoing';
+  const yearLabel = resolveDocumentDriveYearLabel({ ...doc, docCategory: effectiveCategory });
+  const cacheKey = `${book.id}::${driveCfg.folderId}::${yearLabel}::${effectiveCategory}`;
+  if (!db.driveFolderCache) {
+    db.driveFolderCache = {};
+  }
+
+  return uploadWordToGoogleDrive({
+    config: driveCfg,
+    docId: doc.id,
+    bookName: book.name,
+    bookCode: book.code,
+    unit: book.code,
+    year: yearLabel,
+    docCategory: effectiveCategory,
+    fullDocNumber: doc.fullDocNumber,
+    docName: doc.docName || doc.title,
+    cacheKey,
+    folderCache: db.driveFolderCache,
+    onFolderCacheUpdate: (key, entry) => {
+      if (!db.driveFolderCache) db.driveFolderCache = {};
+      db.driveFolderCache[key] = entry;
+    },
+    ...rest,
+  });
+}
+
+async function generateAndUploadWordFromTemplate(params: {
+  doc: DocumentRecord;
+  book: RegistryBook;
+  template: WordTemplate;
+  actor: User;
+  customValues?: Record<string, string>;
+  isRetry?: boolean;
+}): Promise<{ ok: boolean; error?: string; document?: DocumentRecord; driveUploadedUnpersisted?: boolean }> {
+  const { doc, book, template, actor, customValues, isRetry = false } = params;
+  const docxBuffer = Buffer.from(template.base64Docx, 'base64');
+  const filled = fillDocxTemplate(
+    docxBuffer,
+    {
+      so_ky_hieu: doc.fullDocNumber,
+      don_vi: book.unitName || book.name,
+      ten_van_ban: doc.docName || doc.title,
+      trich_yeu: doc.title || doc.docName || '',
+      ngay_ban_hanh: doc.issueDate || '',
+      nguoi_ky: doc.signer || '',
+      chuc_vu: doc.signerRole || '',
+      ...(customValues || {}),
+    },
+    { isDraft: false }
+  );
+
+  const generatedFileName = buildStandardDriveFileName(
+    doc.fullDocNumber,
+    doc.docName || doc.title,
+    '.docx'
+  );
+  const sha256 = crypto.createHash('sha256').update(filled.outputBuffer).digest('hex');
+  const nowIso = new Date().toISOString();
+  const driveCfg = resolveDriveForBook(book);
+
+  if (!driveCfg.isConfigured) {
+    const errMsg = driveCfg.missingReason || 'Thư mục Google Drive chưa được cấu hình hợp lệ.';
+    const updated = await mutateDocumentInDb(
+      doc.id,
+      (liveDoc) => {
+        liveDoc.templateId = template.id;
+        liveDoc.wordGenerationStatus = 'failed';
+        liveDoc.wordGenerationError = errMsg;
+        const existingList = getEffectiveAttachments(liveDoc);
+        const wordAttIdx = existingList.findIndex((a) => a.group === 'word_draft');
+        const hasAnyOfficial = existingList.some((a) => a.isOfficial && a.driveStatus === 'saved');
+        const attId =
+          wordAttIdx !== -1 ? existingList[wordAttIdx].id : `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+        const nextVersionNum =
+          wordAttIdx !== -1 ? (existingList[wordAttIdx].currentVersion || existingList[wordAttIdx].versions.length) + 1 : 1;
+        const prevVersions = wordAttIdx !== -1 ? [...existingList[wordAttIdx].versions] : [];
+        const failedAtt: DocumentAttachment = {
+          id: attId,
+          group: 'word_draft',
+          label: `Word từ mẫu (${template.name})`,
+          isOfficial: !hasAnyOfficial,
+          currentVersion: nextVersionNum,
+          fileName: generatedFileName,
+          originalFileName: template.originalFileName,
+          mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          fileSize: filled.outputBuffer.length,
+          sha256,
+          driveStatus: 'failed',
+          driveError: errMsg,
+          uploadedBy: actor.fullName,
+          uploadedByUsername: actor.username,
+          uploadedAt: nowIso,
+          versions: [
+            ...prevVersions,
+            {
+              version: nextVersionNum,
+              fileName: generatedFileName,
+              originalFileName: template.originalFileName,
+              mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              fileSize: filled.outputBuffer.length,
+              sha256,
+              driveStatus: 'failed',
+              driveError: errMsg,
+              uploadedBy: actor.fullName,
+              uploadedByUsername: actor.username,
+              uploadedAt: nowIso,
+            },
+          ],
+        };
+        if (wordAttIdx !== -1) existingList[wordAttIdx] = failedAtt;
+        else existingList.push(failedAtt);
+        liveDoc.attachments = existingList;
+        liveDoc.driveStatus = 'failed';
+        liveDoc.driveFileName = generatedFileName;
+        liveDoc.driveFileSize = filled.outputBuffer.length;
+        liveDoc.driveError = errMsg;
+        delete liveDoc.driveUploadStartedAt;
+        return true;
+      },
+      { verifyWrite: true }
+    ).catch(() => null);
+    return { ok: false, error: errMsg, document: updated || doc };
+  }
+
+  let uploadResult: DriveUploadResult | null = null;
+  try {
+    uploadResult = await uploadDocumentWithFolderCache({
+      driveCfg,
+      book,
+      doc,
+      docCategoryOverride: 'outgoing',
+      originalFileName: generatedFileName,
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      buffer: filled.outputBuffer,
+      overrideFileName: generatedFileName,
+      keepPreviousFile: false,
+      isRetry,
+    });
+
+    if (!uploadResult?.fileId || !uploadResult.fileId.trim()) {
+      throw new Error('Google Drive không trả về mã tệp (fileId) hợp lệ.');
+    }
+  } catch (err: any) {
+    const errMsg = err?.message || 'Lỗi tải tệp Word tự động lên Google Drive.';
+    const updated = await mutateDocumentInDb(
+      doc.id,
+      (liveDoc) => {
+        if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) {
+          return false;
+        }
+        liveDoc.templateId = template.id;
+        liveDoc.wordGenerationStatus = 'failed';
+        liveDoc.wordGenerationError = errMsg;
+        const existingList = getEffectiveAttachments(liveDoc);
+        const wordAttIdx = existingList.findIndex((a) => a.group === 'word_draft');
+        const hasAnyOfficial = existingList.some((a) => a.isOfficial && a.driveStatus === 'saved');
+        const attId =
+          wordAttIdx !== -1 ? existingList[wordAttIdx].id : `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+        const nextVersionNum =
+          wordAttIdx !== -1 ? (existingList[wordAttIdx].currentVersion || existingList[wordAttIdx].versions.length) + 1 : 1;
+        const prevVersions = wordAttIdx !== -1 ? [...existingList[wordAttIdx].versions] : [];
+        const failedAtt: DocumentAttachment = {
+          id: attId,
+          group: 'word_draft',
+          label: `Word từ mẫu (${template.name})`,
+          isOfficial: !hasAnyOfficial,
+          currentVersion: nextVersionNum,
+          fileName: generatedFileName,
+          originalFileName: template.originalFileName,
+          mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          fileSize: filled.outputBuffer.length,
+          sha256,
+          driveStatus: 'failed',
+          driveError: errMsg,
+          uploadedBy: actor.fullName,
+          uploadedByUsername: actor.username,
+          uploadedAt: nowIso,
+          versions: [
+            ...prevVersions,
+            {
+              version: nextVersionNum,
+              fileName: generatedFileName,
+              originalFileName: template.originalFileName,
+              mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              fileSize: filled.outputBuffer.length,
+              sha256,
+              driveStatus: 'failed',
+              driveError: errMsg,
+              uploadedBy: actor.fullName,
+              uploadedByUsername: actor.username,
+              uploadedAt: nowIso,
+            },
+          ],
+        };
+        if (wordAttIdx !== -1) existingList[wordAttIdx] = failedAtt;
+        else existingList.push(failedAtt);
+        liveDoc.attachments = existingList;
+        liveDoc.driveStatus = 'failed';
+        liveDoc.driveFileName = generatedFileName;
+        liveDoc.driveFileSize = filled.outputBuffer.length;
+        liveDoc.driveError = errMsg;
+        delete liveDoc.driveUploadStartedAt;
+        return true;
+      },
+      { verifyWrite: true }
+    ).catch(() => null);
+    return { ok: false, error: errMsg, document: updated || doc };
+  }
+
+  // Chỉ chuyển sang trạng thái 'saved' sau khi cơ sở dữ liệu ghi nhận thành công fileId hợp lệ
+  try {
+    const savedAtIso = new Date().toISOString();
+    const persistedDoc = await mutateDocumentInDb(
+      doc.id,
+      (liveDoc) => {
+        liveDoc.templateId = template.id;
+        liveDoc.wordGenerationStatus = 'generated';
+        delete liveDoc.wordGenerationError;
+        const existingList = getEffectiveAttachments(liveDoc);
+        const wordAttIdx = existingList.findIndex((a) => a.group === 'word_draft');
+        const hasAnyOfficial = existingList.some((a) => a.isOfficial && a.driveStatus === 'saved');
+        const attId =
+          wordAttIdx !== -1 ? existingList[wordAttIdx].id : `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+        const nextVersionNum =
+          wordAttIdx !== -1 ? (existingList[wordAttIdx].currentVersion || existingList[wordAttIdx].versions.length) + 1 : 1;
+        const prevVersions = wordAttIdx !== -1 ? [...existingList[wordAttIdx].versions] : [];
+        const savedAtt: DocumentAttachment = {
+          id: attId,
+          group: 'word_draft',
+          label: `Word từ mẫu (${template.name})`,
+          isOfficial: !hasAnyOfficial,
+          currentVersion: nextVersionNum,
+          fileName: uploadResult!.fileName,
+          originalFileName: template.originalFileName,
+          mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          fileSize: filled.outputBuffer.length,
+          sha256,
+          driveFileId: uploadResult!.fileId,
+          driveFileUrl: uploadResult!.webViewLink,
+          driveFolderId: uploadResult!.folderId || driveCfg.folderId,
+          driveFolderPath: uploadResult!.folderPath,
+          driveStatus: 'saved',
+          uploadedBy: actor.fullName,
+          uploadedByUsername: actor.username,
+          uploadedAt: savedAtIso,
+          versions: [
+            ...prevVersions,
+            {
+              version: nextVersionNum,
+              fileName: uploadResult!.fileName,
+              originalFileName: template.originalFileName,
+              mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              fileSize: filled.outputBuffer.length,
+              sha256,
+              driveFileId: uploadResult!.fileId,
+              driveFileUrl: uploadResult!.webViewLink,
+              driveFolderId: uploadResult!.folderId || driveCfg.folderId,
+              driveFolderPath: uploadResult!.folderPath,
+              driveStatus: 'saved',
+              uploadedBy: actor.fullName,
+              uploadedByUsername: actor.username,
+              uploadedAt: savedAtIso,
+            },
+          ],
+        };
+        if (wordAttIdx !== -1) existingList[wordAttIdx] = savedAtt;
+        else existingList.push(savedAtt);
+        liveDoc.attachments = existingList;
+        liveDoc.driveLastVerifiedAt = savedAtIso;
+        delete liveDoc.driveUploadStartedAt;
+        delete liveDoc.driveReconcileNote;
+        syncRootDriveFieldsFromAttachments(liveDoc);
+        clearDriveOnlyReviewReasons(liveDoc);
+
+        recordDocumentHistoryEntry({
+          doc: liveDoc,
+          book,
+          actor,
+          action: 'word_generate',
+          changes: {
+            driveFileName: { old: null, new: uploadResult!.fileName },
+            driveFileId: { old: null, new: uploadResult!.fileId },
+          },
+          reason: `Tạo văn bản Word tự động từ mẫu "${template.name}" và lưu lên Google Drive`,
+        });
+        return true;
+      },
+      { verifyWrite: true }
+    );
+    if (!persistedDoc) {
+      return {
+        ok: false,
+        error: 'Tệp đã tải lên Drive nhưng không tìm thấy bản ghi để cập nhật trạng thái trong cơ sở dữ liệu.',
+        driveUploadedUnpersisted: true,
+      };
+    }
+    return { ok: true, document: persistedDoc };
+  } catch (dbErr: any) {
+    console.error('[Word Template Drive] Tải lên Drive thành công nhưng ghi DB thất bại:', sanitizeErrorForLog(dbErr));
+    return {
+      ok: false,
+      error: `Tệp đã tải lên Google Drive nhưng chưa ghi nhận được vào cơ sở dữ liệu (${sanitizeErrorForLog(dbErr)}). Hệ thống sẽ đối soát lại tệp trước khi thử lại.`,
+      driveUploadedUnpersisted: true,
+    };
+  }
+}
+
+// --- Server-Sent Events (SSE) Multi-Device Broadcast (Authenticated & RBAC-Filtered) ---
+type SSEClient = { id: string; userId: string; res: Response };
+const MAX_SSE_CLIENTS = 500;
+const sseClients: SSEClient[] = [];
+
+function canUserReceiveSSEEvent(user: User, event: string, payload: any): boolean {
+  if (user.isActive === false) return false;
+  if (isSystemAdmin(user)) return true;
+
+  if (event === 'user_permissions_updated') {
+    return Boolean(payload?.userId && payload.userId === user.id);
+  }
+
+  if (
+    event === 'document_issued' ||
+    event === 'document_updated' ||
+    event === 'document_deleted' ||
+    event === 'document_restored' ||
+    event === 'document_cancelled' ||
+    event === 'documents_deleted_archived' ||
+    event === 'document_history_cleaned'
+  ) {
+    const bookId = payload?.document ? getDocBookId(payload.document) : payload?.bookId;
+    if (!bookId) return false;
+    return (
+      hasBookPermission(user, bookId, 'view') ||
+      ((event === 'document_deleted' || event === 'document_restored') &&
+        hasBookPermission(user, bookId, 'delete'))
+    );
+  }
+
+  if (event === 'tasks_updated') {
+    const doc = payload?.docId ? db.documents.find((d) => d.id === payload.docId) : undefined;
+    const bookId = doc ? getDocBookId(doc) : payload?.task?.bookId;
+    if (!bookId) return false;
+    return hasBookPermission(user, bookId, 'view');
+  }
+
+  if (
+    event === 'number_requests_updated' ||
+    event === 'templates_updated' ||
+    event === 'book_updated' ||
+    event === 'books_updated'
+  ) {
+    const bookId = payload?.bookId || payload?.book?.id;
+    if (!bookId) return true;
+    return getUserBookPermissions(user, bookId).length > 0;
+  }
+
+  return true;
+}
+
+function broadcastSSE(event: string, payload: any) {
+  if (sseClients.length === 0) return;
+  const message = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (let i = sseClients.length - 1; i >= 0; i--) {
+    const client = sseClients[i];
+    const liveUser = db.users.find((u) => u.id === client.userId);
+    if (!liveUser || liveUser.isActive === false) {
+      try {
+        client.res.end();
+      } catch {
+        // ignore
+      }
+      sseClients.splice(i, 1);
+      continue;
+    }
+    if (!canUserReceiveSSEEvent(liveUser, event, payload)) {
+      continue;
+    }
+    try {
+      client.res.write(message);
+    } catch {
+      sseClients.splice(i, 1);
+    }
+  }
+}
+
+// Heartbeat for SSE to keep connections open (12s for mobile networks)
+if (!IS_SERVERLESS) {
+  setInterval(() => {
+    for (let i = sseClients.length - 1; i >= 0; i--) {
+      try {
+        sseClients[i].res.write(': heartbeat\n\n');
+      } catch {
+        sseClients.splice(i, 1);
+      }
+    }
+  }, 12000).unref();
+}
+
+// --- Timezone Asia/Ho_Chi_Minh Helpers (cached Intl formatters) ---
+const VN_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Ho_Chi_Minh',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+const VN_DATETIME_FORMATTER = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Asia/Ho_Chi_Minh',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
+function getVietnamTimeInfo(d = new Date()) {
+  const parts = VN_DATE_FORMATTER.format(d).split('-'); // YYYY-MM-DD
+  const year = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10);
+  const day = parseInt(parts[2], 10);
+  const formattedDate = `${parts[2]}/${parts[1]}/${parts[0]}`; // dd/mm/yyyy
+  return { year, month, day, formattedDate };
+}
+
+function getVietnamDateKey(d = new Date()): string {
+  return VN_DATE_FORMATTER.format(d);
+}
+
+function formatVietnamDateTime(d = new Date()): string {
+  const parts = VN_DATETIME_FORMATTER.formatToParts(d);
+  let day = '00';
+  let month = '00';
+  let year = '0000';
+  let hour = '00';
+  let minute = '00';
+  let second = '00';
+  for (const p of parts) {
+    if (p.type === 'day') day = p.value;
+    else if (p.type === 'month') month = p.value;
+    else if (p.type === 'year') year = p.value;
+    else if (p.type === 'hour') hour = p.value;
+    else if (p.type === 'minute') minute = p.value;
+    else if (p.type === 'second') second = p.value;
+  }
+  return `${day}/${month}/${year} ${hour}:${minute}:${second}`;
+}
+
+function getRequestVietnamTimeInfo(req?: Request) {
+  if (
+    req &&
+    process.env.ALLOW_TIME_SIMULATION === 'true' &&
+    process.env.NODE_ENV !== 'production'
+  ) {
+    const rawHeader = req.headers['x-test-vietnam-now'];
+    if (typeof rawHeader === 'string' && rawHeader.trim()) {
+      const parsed = new Date(rawHeader.trim());
+      if (!Number.isNaN(parsed.getTime())) {
+        return getVietnamTimeInfo(parsed);
+      }
+    }
+  }
+  return getVietnamTimeInfo(new Date());
+}
+
+// --- Signed Session & HttpOnly Cookie Store (tương thích cả Node lẫn Vercel Serverless) ---
+const SESSION_COOKIE_NAME = 'nct_session';
+const STANDARD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 ngày (thời hạn thông thường)
+const REMEMBER_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 ngày (Duy trì đăng nhập)
+const REMEMBER_COOKIE_MAX_AGE_SEC = 30 * 24 * 60 * 60;
+
+const tokenStore = new Map<string, { user: User; expiresAt: number; sid?: string }>();
+const revokedSessionCache = new Map<string, number>();
+
+function getSessionSecret(): string {
+  const envSecret = (process.env.SESSION_SECRET || process.env.AUTH_SECRET || '').trim();
+  if (envSecret) return envSecret;
+  const seed = process.env.VERCEL_PROJECT_ID || process.env.APP_URL || 'nct-thpt-2026-session-key';
+  return crypto.createHash('sha256').update(`nct-hmac-v1:${seed}`).digest('hex');
+}
+
+function signPayloadB64(payloadB64: string): string {
+  return crypto.createHmac('sha256', getSessionSecret()).update(payloadB64).digest('base64url');
+}
+
+function isSessionRevoked(sid: string): boolean {
+  const now = Date.now();
+  const cachedExp = revokedSessionCache.get(sid);
+  if (cachedExp && cachedExp > now) return true;
+  const persistedExp = db.revokedSessions?.[sid];
+  if (persistedExp && persistedExp > now) {
+    revokedSessionCache.set(sid, persistedExp);
+    return true;
+  }
+  return false;
+}
+
+function revokeSessionById(sid: string, expiresAt: number) {
+  const exp = Math.max(expiresAt, Date.now() + 60_000);
+  revokedSessionCache.set(sid, exp);
+  if (!db.revokedSessions) db.revokedSessions = {};
+  db.revokedSessions[sid] = exp;
+  const now = Date.now();
+  for (const [k, v] of Object.entries(db.revokedSessions)) {
+    if (v <= now) delete db.revokedSessions[k];
+  }
+  for (const [k, v] of revokedSessionCache.entries()) {
+    if (v <= now) revokedSessionCache.delete(k);
+  }
+}
+
+interface SignedSessionPayload {
+  sid: string;
+  uid: string;
+  iat: number;
+  exp: number;
+  rem: boolean;
+}
+
+function generateToken(user: User, rememberMe = false): { token: string; expiresAt: number; sid: string } {
+  const sid = crypto.randomBytes(16).toString('hex');
+  const iat = Date.now();
+  const ttl = rememberMe ? REMEMBER_SESSION_TTL_MS : STANDARD_SESSION_TTL_MS;
+  const exp = iat + ttl;
+  const payload: SignedSessionPayload = {
+    sid,
+    uid: user.id,
+    iat,
+    exp,
+    rem: Boolean(rememberMe),
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sigB64 = signPayloadB64(payloadB64);
+  const token = `${payloadB64}.${sigB64}`;
+
+  tokenStore.set(token, {
+    user,
+    expiresAt: exp,
+    sid,
+  });
+  return { token, expiresAt: exp, sid };
+}
+
+function parseSignedToken(token: string): SignedSessionPayload | null {
+  const dotIdx = token.indexOf('.');
+  if (dotIdx <= 0) return null;
+  const payloadB64 = token.slice(0, dotIdx);
+  const sigB64 = token.slice(dotIdx + 1);
+  if (!payloadB64 || !sigB64) return null;
+
+  const expectedSig = signPayloadB64(payloadB64);
+  const bufA = Buffer.from(sigB64);
+  const bufB = Buffer.from(expectedSig);
+  if (bufA.length !== bufB.length || !crypto.timingSafeEqual(bufA, bufB)) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as SignedSessionPayload;
+    if (!parsed || !parsed.sid || !parsed.uid || typeof parsed.exp !== 'number') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function parseCookies(req: Request): Record<string, string> {
+  const header = req.headers.cookie;
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const key = part.slice(0, eqIdx).trim();
+    const val = part.slice(eqIdx + 1).trim();
+    if (!key) continue;
+    try {
+      out[key] = decodeURIComponent(val);
+    } catch {
+      out[key] = val;
+    }
+  }
+  return out;
+}
+
+function extractTokenFromRequest(req: Request): string | undefined {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const bearer = authHeader.slice(7).trim();
+    if (bearer) return bearer;
+  }
+  const cookies = parseCookies(req);
+  if (cookies[SESSION_COOKIE_NAME]) {
+    return cookies[SESSION_COOKIE_NAME];
+  }
+  if (req.query.token && typeof req.query.token === 'string' && req.query.token.trim()) {
+    return req.query.token.trim();
+  }
+  return undefined;
+}
+
+function buildSessionCookieHeader(
+  req: Request,
+  value: string,
+  opts: { maxAgeSeconds?: number; clear?: boolean } = {}
+): string {
+  const protoHeader = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  const isHttps = req.secure || protoHeader === 'https' || Boolean(process.env.VERCEL);
+
+  const originHeader = String(req.headers.origin || '');
+  const reqHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim().toLowerCase();
+  let isCrossOrigin = false;
+  if (originHeader && reqHost) {
+    try {
+      const originHost = new URL(originHeader).host.toLowerCase();
+      if (originHost && originHost !== reqHost) {
+        isCrossOrigin = true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  if (req.headers['sec-fetch-site'] === 'cross-site') {
+    isCrossOrigin = true;
+  }
+
+  const sameSite = isHttps && isCrossOrigin ? 'None' : 'Lax';
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${opts.clear ? '' : encodeURIComponent(value)}`,
+    'Path=/',
+    'HttpOnly',
+    `SameSite=${sameSite}`,
+  ];
+  if (isHttps) {
+    parts.push('Secure');
+  }
+  if (opts.clear) {
+    parts.push('Max-Age=0');
+    parts.push('Expires=Thu, 01 Jan 1970 00:00:00 GMT');
+  } else if (typeof opts.maxAgeSeconds === 'number' && opts.maxAgeSeconds > 0) {
+    parts.push(`Max-Age=${opts.maxAgeSeconds}`);
+    parts.push(`Expires=${new Date(Date.now() + opts.maxAgeSeconds * 1000).toUTCString()}`);
+  }
+  return parts.join('; ');
+}
+
+function revokeTokenSession(token: string) {
+  const parsed = parseSignedToken(token);
+  if (parsed) {
+    revokeSessionById(parsed.sid, parsed.exp);
+  }
+  const cached = tokenStore.get(token);
+  if (cached?.sid) {
+    revokeSessionById(cached.sid, cached.expiresAt);
+  }
+  tokenStore.delete(token);
+}
+
+// Auth Middleware (luôn nạp quyền mới nhất từ db.users để áp dụng thu hồi/cấp quyền tức thì)
+function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const token = extractTokenFromRequest(req);
+
+  if (!token) {
+    return res.status(401).json({ error: 'Yêu cầu đăng nhập để truy cập' });
+  }
+
+  let userId: string | null = null;
+  const parsed = parseSignedToken(token);
+  if (parsed) {
+    if (parsed.exp < Date.now()) {
+      return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn, vui lòng đăng nhập lại' });
+    }
+    if (isSessionRevoked(parsed.sid)) {
+      return res.status(401).json({ error: 'Phiên đăng nhập đã kết thúc, vui lòng đăng nhập lại' });
+    }
+    userId = parsed.uid;
+  } else {
+    const session = tokenStore.get(token);
+    if (!session || session.expiresAt < Date.now()) {
+      return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn, vui lòng đăng nhập lại' });
+    }
+    if (session.sid && isSessionRevoked(session.sid)) {
+      return res.status(401).json({ error: 'Phiên đăng nhập đã kết thúc, vui lòng đăng nhập lại' });
+    }
+    userId = session.user.id;
+  }
+
+  let freshUser = db.users.find((u) => u.id === userId);
+  const normAuthPath = req.path.replace(/^\/api/, '') || '/';
+  const allowBootstrapAdmin =
+    normAuthPath === '/auth/me' ||
+    normAuthPath === '/auth/logout' ||
+    normAuthPath.startsWith('/storage/');
+  if (!freshUser && allowBootstrapAdmin) {
+    const bundled = getBundledLegacySnapshot();
+    const bootstrapAdmins = [...(bundled?.users || []), ...DEFAULT_USERS].filter(
+      (u) => u.role === 'admin'
+    );
+    freshUser = bootstrapAdmins.find((u) => u.id === userId);
+  }
+  if (!freshUser || !freshUser.isActive) {
+    tokenStore.delete(token);
+    return res.status(401).json({ error: 'Tài khoản đã bị khóa hoặc không còn hiệu lực' });
+  }
+
+  const safeUser = toSafeUser(freshUser);
+  const cached = tokenStore.get(token);
+  if (cached) cached.user = safeUser;
+  (req as any).user = safeUser;
+  (req as any).authToken = token;
+  next();
+}
+
+function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  const user = (req as any).user as User;
+  if (!user || user.role !== 'admin') {
+    return res.status(403).json({ error: 'Chỉ Quản trị viên mới có quyền thực hiện thao tác này' });
+  }
+  next();
+}
+
+// --- Number Formatting Logic ---
+function formatSequenceNumber(seq: number): string {
+  if (seq < 10) return `0${seq}`;
+  return `${seq}`;
+}
+
+function renderFullDocNumber(format: string, seqStr: string, typeCode: string, unitCode: string): string {
+  let result = format;
+  result = result.replace(/\{so\}/g, seqStr);
+  result = result.replace(/\{loai\}/g, typeCode);
+  result = result.replace(/\{don_vi\}/g, unitCode);
+  return result;
+}
+
+// --- API ROUTES ---
+
+// 1. Health check (kiểm tra kết nối thực tế tới nguồn lưu trữ)
+app.get('/api/health', async (req, res) => {
+  const cfg = getStorageAdapterConfig();
+  let redisReachable = cfg.mode === 'local_disk';
+
+  if (cfg.configConflictError) {
+    lastStorageDiagnostic = { state: 'conflict', error: cfg.configConflictError };
+  } else if (cfg.mode === 'ephemeral_tmp') {
+    lastStorageDiagnostic = { state: 'missing_config', error: cfg.missingConfigError };
+  } else if (cfg.mode === 'upstash_kv' || cfg.mode === 'vercel_blob' || cfg.mode === 'remote_webhook') {
+    try {
+      const check = await readRawFromPrimaryRemote(cfg, 6000);
+      redisReachable = true;
+      if (check.raw === null || check.parsed === null) {
+        lastRemoteRawPayload = null;
+        lastStorageDiagnostic = {
+          state: 'awaiting_migration',
+          error: `Kết nối Redis thành công nhưng khóa "${cfg.kvKey}" chưa tồn tại.`,
+        };
+      } else {
+        lastRemoteRawPayload = check.raw;
+        db = migrateDatabaseIdempotent(check.parsed);
+        remoteHydrated = true;
+        lastRemoteSyncMs = Date.now();
+        lastVerifiedAt = new Date().toISOString();
+        lastStorageDiagnostic = { state: 'connected' };
+      }
+    } catch (err: any) {
+      redisReachable = false;
+      const msg = sanitizeErrorForLog(err);
+      if (err instanceof StorageError && err.code === 'STORAGE_CORRUPT_DATA') {
+        lastStorageDiagnostic = { state: 'corrupt_data', error: msg };
+      } else {
+        lastStorageDiagnostic = { state: 'connection_error', error: msg };
+      }
+    }
+  } else {
+    lastStorageDiagnostic = { state: 'connected' };
+  }
+
+  const statusPayload = getPersistenceStatus();
+  res.json({
+    status: statusPayload.durable ? 'ok' : 'degraded',
+    app: 'Sổ Cấp Số Văn Bản Đoàn Trường THPT Nguyễn Chí Thanh',
+    timeVietnam: getRequestVietnamTimeInfo(req),
+    durable: statusPayload.durable,
+    storageMode: statusPayload.storageMode,
+    connectionState: statusPayload.connectionState,
+    redisReachable,
+    persistenceStatus: statusPayload,
+  });
+});
+
+// 1b. Storage diagnostics, connection test & migration/initialization endpoints
+app.get('/api/storage/status', requireAuth, requireAdmin, async (_req, res) => {
+  const cfg = getStorageAdapterConfig();
+  if (!cfg.configConflictError && (cfg.mode === 'upstash_kv' || cfg.mode === 'vercel_blob' || cfg.mode === 'remote_webhook')) {
+    try {
+      await ensureLatestDb({ maxAgeMs: 0 });
+    } catch {
+      // diagnostic state is captured cleanly in lastStorageDiagnostic
+    }
+  }
+  res.json({
+    persistenceStatus: getPersistenceStatus(),
+  });
+});
+
+app.post('/api/storage/test-connection', requireAuth, requireAdmin, async (_req, res) => {
+  const result = await testUpstashRedisConnection();
+  res.json(result);
+});
+
+app.get('/api/storage/export-legacy-snapshot', requireAuth, requireAdmin, (_req, res) => {
+  const bundled = getBundledLegacySnapshot();
+  const source = bundled || db;
+  const migrated = migrateDatabaseIdempotent(source);
+  const sanitized = {
+    meta: migrated.meta,
+    settings: sanitizeSettingsForUser(migrated.settings),
+    documentTypes: migrated.documentTypes,
+    signers: migrated.signers,
+    books: migrated.books.map((b) => sanitizeBookForUser(b)),
+    users: migrated.users.map((u) => toSafeUser(u)),
+    documents: migrated.documents,
+    numberRequests: migrated.numberRequests,
+    systemAuditLogs: migrated.systemAuditLogs,
+    documentHistoryLogs: migrated.documentHistoryLogs,
+  };
+  res.json({
+    summary: summarizeDatabaseObject(migrated),
+    snapshot: sanitized,
+  });
+});
+
+app.post('/api/storage/import-bundled-legacy', requireAuth, requireAdmin, async (req, res) => {
+  const cfg = getStorageAdapterConfig();
+  if (cfg.configConflictError || !cfg.durable) {
+    return res.status(503).json({
+      code: 'DURABLE_STORAGE_NOT_CONFIGURED',
+      error: cfg.configConflictError || cfg.missingConfigError || 'Chưa kết nối lưu trữ bền vững Upstash Redis.',
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
+  const bundled = getBundledLegacySnapshot();
+  if (!bundled) {
+    return res.status(404).json({ error: 'Không tìm thấy bản sao dữ liệu cũ sẵn có trên máy chủ.' });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    const existing = await readRawFromPrimaryRemote(cfg);
+    if (existing.raw !== null && !req.body?.forceOverwrite) {
+      return res.status(409).json({
+        code: 'KEY_ALREADY_EXISTS',
+        error: `Khóa "${cfg.kvKey}" trên Redis đã có dữ liệu. Không ghi đè tự động để bảo vệ dữ liệu hiện hành.`,
+        persistenceStatus: getPersistenceStatus(),
+      });
+    }
+
+    const migrated = migrateDatabaseIdempotent(bundled);
+    const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    migrated.meta = { revision, updatedAt: new Date().toISOString(), schemaVersion: CURRENT_SCHEMA_VERSION };
+    const serialized = JSON.stringify(migrated, null, 2);
+
+    if (existing.raw === null) {
+      lastRemoteRawPayload = await writeToPrimaryRemoteNX(cfg, serialized, revision);
+    } else {
+      lastRemoteRawPayload = await writeToPrimaryRemoteCAS(cfg, existing.raw, serialized, revision);
+    }
+
+    db = migrated;
+    remoteHydrated = true;
+    lastRemoteSyncMs = Date.now();
+    lastPersistedAt = migrated.meta.updatedAt;
+    lastVerifiedAt = new Date().toISOString();
+    lastStorageDiagnostic = { state: 'connected' };
+
+    res.json({
+      success: true,
+      summary: summarizeDatabaseObject(db),
+      persistenceStatus: getPersistenceStatus(),
+      message: 'Đã chuyển và xác nhận dữ liệu cũ vào Upstash Redis thành công.',
+    });
+  } catch (err: any) {
+    const statusCode = err?.statusCode || 503;
+    return res.status(statusCode).json({
+      code: err?.code || 'PRIMARY_STORAGE_UNAVAILABLE',
+      error: sanitizeErrorForLog(err),
+      persistenceStatus: getPersistenceStatus(),
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+app.post('/api/storage/import', requireAuth, requireAdmin, async (req, res) => {
+  const cfg = getStorageAdapterConfig();
+  if (cfg.configConflictError || !cfg.durable) {
+    return res.status(503).json({
+      code: 'DURABLE_STORAGE_NOT_CONFIGURED',
+      error: cfg.configConflictError || cfg.missingConfigError || 'Chưa kết nối lưu trữ bền vững Upstash Redis.',
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
+
+  const rawPayload = req.body?.snapshot || req.body?.data || req.body;
+  if (!validateRegistryPayloadShape(rawPayload)) {
+    return res.status(400).json({
+      error: 'Tệp sao lưu không hợp lệ (thiếu cấu trúc books / documents / settings / users).',
+    });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    const existing = await readRawFromPrimaryRemote(cfg);
+    if (existing.raw !== null && !req.body?.forceOverwrite) {
+      return res.status(409).json({
+        code: 'KEY_ALREADY_EXISTS',
+        error: `Khóa "${cfg.kvKey}" trên Redis đã có dữ liệu. Vui lòng kiểm tra trước khi ghi đè.`,
+        persistenceStatus: getPersistenceStatus(),
+      });
+    }
+
+    // Bảo toàn passwordHash nếu bản sao nhập vào không kèm passwordHash (từ bản xuất an toàn)
+    const bundled = getBundledLegacySnapshot();
+    const hashByUserId = new Map<string, string>();
+    for (const u of [...(bundled?.users || []), ...db.users, ...DEFAULT_USERS]) {
+      if (u?.id && (u as any).passwordHash) hashByUserId.set(u.id, (u as any).passwordHash);
+      if (u?.username && (u as any).passwordHash) hashByUserId.set(u.username.toLowerCase(), (u as any).passwordHash);
+    }
+
+    const cloned = JSON.parse(JSON.stringify(rawPayload)) as Partial<DatabaseSchema>;
+    if (Array.isArray(cloned.users)) {
+      cloned.users = cloned.users.map((u: any) => ({
+        ...u,
+        passwordHash:
+          u.passwordHash ||
+          hashByUserId.get(u.id) ||
+          hashByUserId.get(String(u.username || '').toLowerCase()) ||
+          hashPassword('123456'),
+      }));
+    }
+
+    const migrated = migrateDatabaseIdempotent(cloned);
+    const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    migrated.meta = { revision, updatedAt: new Date().toISOString(), schemaVersion: CURRENT_SCHEMA_VERSION };
+    const serialized = JSON.stringify(migrated, null, 2);
+
+    if (cfg.mode === 'local_disk') {
+      saveDatabaseSync(migrated);
+      db = migrated;
+    } else if (existing.raw === null) {
+      lastRemoteRawPayload = await writeToPrimaryRemoteNX(cfg, serialized, revision);
+      db = migrated;
+    } else {
+      lastRemoteRawPayload = await writeToPrimaryRemoteCAS(cfg, existing.raw, serialized, revision);
+      db = migrated;
+    }
+
+    remoteHydrated = true;
+    lastRemoteSyncMs = Date.now();
+    lastPersistedAt = migrated.meta.updatedAt;
+    lastVerifiedAt = new Date().toISOString();
+    lastStorageDiagnostic = { state: 'connected' };
+
+    res.json({
+      success: true,
+      summary: summarizeDatabaseObject(db),
+      persistenceStatus: getPersistenceStatus(),
+      message: 'Đã nhập bản sao dữ liệu vào Upstash Redis và xác nhận toàn vẹn thành công.',
+    });
+  } catch (err: any) {
+    const statusCode = err?.statusCode || 503;
+    return res.status(statusCode).json({
+      code: err?.code || 'PRIMARY_STORAGE_UNAVAILABLE',
+      error: sanitizeErrorForLog(err),
+      persistenceStatus: getPersistenceStatus(),
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+app.post('/api/storage/initialize-new', requireAuth, requireAdmin, async (req, res) => {
+  const cfg = getStorageAdapterConfig();
+  if (cfg.configConflictError || !cfg.durable) {
+    return res.status(503).json({
+      code: 'DURABLE_STORAGE_NOT_CONFIGURED',
+      error: cfg.configConflictError || cfg.missingConfigError || 'Chưa kết nối lưu trữ bền vững Upstash Redis.',
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
+  if (req.body?.confirmationText !== 'XÁC NHẬN HỆ THỐNG MỚI') {
+    return res.status(400).json({
+      error: 'Vui lòng nhập chính xác cụm từ xác nhận "XÁC NHẬN HỆ THỐNG MỚI" trước khi khởi tạo.',
+    });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    const existing = await readRawFromPrimaryRemote(cfg);
+    if (existing.raw !== null) {
+      lastRemoteRawPayload = existing.raw;
+      db = migrateDatabaseIdempotent(existing.parsed!);
+      lastStorageDiagnostic = { state: 'connected' };
+      return res.status(409).json({
+        code: 'KEY_ALREADY_EXISTS',
+        error: `Khóa "${cfg.kvKey}" trên Redis đã có dữ liệu nên không khởi tạo đè. Đang sử dụng dữ liệu hiện có.`,
+        persistenceStatus: getPersistenceStatus(),
+      });
+    }
+
+    const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const freshDb = migrateDatabaseIdempotent({
+      meta: { revision, updatedAt: new Date().toISOString(), schemaVersion: CURRENT_SCHEMA_VERSION },
+      settings: DEFAULT_SETTINGS,
+      documentTypes: DEFAULT_DOC_TYPES,
+      signers: DEFAULT_SIGNERS,
+      users: DEFAULT_USERS.map((u) => ({ ...u })),
+      documents: [],
+      books: [],
+      numberRequests: [],
+      idempotencyKeys: {},
+      systemAuditLogs: [],
+      revokedSessions: {},
+    });
+    const serialized = JSON.stringify(freshDb, null, 2);
+
+    if (cfg.mode === 'local_disk') {
+      saveDatabaseSync(freshDb);
+    } else {
+      lastRemoteRawPayload = await writeToPrimaryRemoteNX(cfg, serialized, revision);
+    }
+
+    db = freshDb;
+    remoteHydrated = true;
+    lastRemoteSyncMs = Date.now();
+    lastPersistedAt = freshDb.meta!.updatedAt;
+    lastVerifiedAt = new Date().toISOString();
+    lastStorageDiagnostic = { state: 'connected' };
+
+    res.json({
+      success: true,
+      summary: summarizeDatabaseObject(db),
+      persistenceStatus: getPersistenceStatus(),
+      message: 'Đã khởi tạo hệ thống mới vào Upstash Redis thành công.',
+    });
+  } catch (err: any) {
+    const statusCode = err?.statusCode || 503;
+    return res.status(statusCode).json({
+      code: err?.code || 'PRIMARY_STORAGE_UNAVAILABLE',
+      error: sanitizeErrorForLog(err),
+      persistenceStatus: getPersistenceStatus(),
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+// 2. Authentication
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password, rememberMe } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Vui lòng nhập tên đăng nhập và mật khẩu' });
+  }
+
+  let storageBlockedErr: StorageError | null = null;
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+  } catch (err: any) {
+    storageBlockedErr =
+      err instanceof StorageError
+        ? err
+        : new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, sanitizeErrorForLog(err));
+  }
+
+  const cleanUsername = String(username).trim().toLowerCase();
+  const hash = hashPassword(String(password));
+
+  let foundUser = !storageBlockedErr
+    ? db.users.find((u) => u.username.toLowerCase() === cleanUsername && u.passwordHash === hash)
+    : undefined;
+
+  // Nếu Redis chưa khởi tạo / lỗi / thiếu cấu hình, chỉ cho phép Quản trị viên đăng nhập để vào Cài đặt Lưu trữ xử lý
+  if (!foundUser && storageBlockedErr) {
+    const bundled = getBundledLegacySnapshot();
+    const bootstrapAdmins = [...(bundled?.users || []), ...DEFAULT_USERS].filter((u) => u.role === 'admin');
+    foundUser = bootstrapAdmins.find((u) => u.username.toLowerCase() === cleanUsername && u.passwordHash === hash);
+
+    if (!foundUser) {
+      const nonAdminAttempt = (bundled?.users || []).some(
+        (u) => u.username.toLowerCase() === cleanUsername && u.passwordHash === hash
+      );
+      if (nonAdminAttempt) {
+        return res.status(storageBlockedErr.statusCode).json({
+          code: storageBlockedErr.code,
+          error: `${storageBlockedErr.message} Vui lòng liên hệ Quản trị viên.`,
+          persistenceStatus: getPersistenceStatus(),
+        });
+      }
+      return res.status(401).json({ error: 'Sai tên đăng nhập hoặc mật khẩu' });
+    }
+  }
+
+  if (!foundUser) {
+    return res.status(401).json({ error: 'Sai tên đăng nhập hoặc mật khẩu' });
+  }
+
+  if (!foundUser.isActive) {
+    return res.status(403).json({ error: 'Tài khoản đã bị tạm khóa, vui lòng liên hệ Quản trị viên' });
+  }
+
+  const remember = Boolean(rememberMe);
+  const userSafe = toSafeUser(foundUser);
+  const { token, expiresAt } = generateToken(userSafe, remember);
+
+  res.setHeader(
+    'Set-Cookie',
+    buildSessionCookieHeader(req, token, {
+      maxAgeSeconds: remember ? REMEMBER_COOKIE_MAX_AGE_SEC : undefined,
+    })
+  );
+
+  res.json({
+    user: userSafe,
+    token,
+    rememberMe: remember,
+    expiresAt,
+    persistenceStatus: getPersistenceStatus(),
+  });
+});
+
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+  } catch {
+    // Nếu đang ở trạng thái chờ chuyển dữ liệu / lỗi lưu trữ, vẫn cho phép Admin kiểm tra phiên và vào Cài đặt Lưu trữ
+    const sessionUser = (req as any).user as User;
+    if (sessionUser.role !== 'admin') {
+      return res.status(503).json({
+        code: 'PRIMARY_STORAGE_UNAVAILABLE',
+        error: 'Hệ thống lưu trữ chưa sẵn sàng. Vui lòng liên hệ Quản trị viên.',
+        persistenceStatus: getPersistenceStatus(),
+      });
+    }
+    return res.json({
+      user: sessionUser,
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
+
+  const sessionUser = (req as any).user as User;
+  const freshUser = db.users.find((u) => u.id === sessionUser.id);
+  if (!freshUser || !freshUser.isActive) {
+    return res.status(401).json({ error: 'Tài khoản không còn hiệu lực' });
+  }
+  const userSafe = toSafeUser(freshUser);
+  refreshUserSessions(userSafe);
+  res.json({ user: userSafe, persistenceStatus: getPersistenceStatus() });
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  const bearer = req.headers.authorization?.startsWith('Bearer ')
+    ? req.headers.authorization.slice(7).trim()
+    : undefined;
+  const cookieToken = parseCookies(req)[SESSION_COOKIE_NAME];
+
+  let changed = false;
+  if (bearer) {
+    revokeTokenSession(bearer);
+    changed = true;
+  }
+  if (cookieToken && cookieToken !== bearer) {
+    revokeTokenSession(cookieToken);
+    changed = true;
+  }
+  if (changed && getPersistenceStatus().durable) {
+    try {
+      await ensureLatestDb({ maxAgeMs: 500 });
+      if (bearer) revokeTokenSession(bearer);
+      if (cookieToken && cookieToken !== bearer) revokeTokenSession(cookieToken);
+      await saveDatabasePersistent(db);
+    } catch (err) {
+      console.error('Lỗi lưu trạng thái hủy phiên:', sanitizeErrorForLog(err));
+    }
+  }
+
+  res.setHeader('Set-Cookie', buildSessionCookieHeader(req, '', { clear: true }));
+  res.json({ success: true });
+});
+
+// 3. User Management (Admin only)
+app.get('/api/users', requireAuth, requireAdmin, (req, res) => {
+  const safeUsers = db.users.map((u) => toSafeUser(u));
+  res.json({ users: safeUsers });
+});
+
+app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
+  const actor = (req as any).user as User;
+  const { username, fullName, displayName, password, bookPermissions } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Vui lòng điền đầy đủ: Tên đăng nhập và Mật khẩu' });
+  }
+  const cleanFullName = typeof fullName === 'string' ? fullName.trim() : '';
+  const cleanDisplayName =
+    typeof displayName === 'string' ? displayName.trim().slice(0, 80) : '';
+  if (!cleanFullName && !cleanDisplayName) {
+    return res.status(400).json({ error: 'Vui lòng điền Họ và tên hoặc Tên hiển thị cho tài khoản' });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const cleanUser = String(username).trim().toLowerCase();
+    if (!cleanUser) {
+      return res.status(400).json({ error: 'Tên đăng nhập không hợp lệ' });
+    }
+    if (db.users.some((u) => u.username.toLowerCase() === cleanUser)) {
+      return res.status(400).json({ error: 'Tên đăng nhập đã tồn tại trong hệ thống' });
+    }
+
+    const cleanedPermissions =
+      bookPermissions && typeof bookPermissions === 'object'
+        ? sanitizeBookPermissionsMap(bookPermissions)
+        : { [DEFAULT_BOOK_ID]: ['view', 'request_number'] as BookPermission[] };
+
+    // Tài khoản do Admin tạo cố định vai trò non-admin ('issuer'), quyền chi tiết phân theo từng sổ văn bản
+    const newUser: User & { passwordHash: string } = {
+      id: `user-${Date.now()}`,
+      username: cleanUser,
+      fullName: cleanFullName,
+      ...(cleanDisplayName ? { displayName: cleanDisplayName } : {}),
+      role: 'issuer',
+      isActive: true,
+      createdAt: new Date().toISOString(),
+      bookPermissions: cleanedPermissions,
+      passwordHash: hashPassword(String(password)),
+    };
+
+    const actorLabel = `${actor.fullName || actor.username} (${actor.username})`;
+    const targetIdentity = newUser.fullName || `@${newUser.username}`;
+
+    db.users.push(newUser);
+    appendSystemAuditLog({
+      actorUserId: actor.id,
+      actorName: actorLabel,
+      action: 'user_create',
+      targetUserId: newUser.id,
+      targetUsername: newUser.username,
+      details: cleanDisplayName
+        ? `Tạo tài khoản ${targetIdentity} (@${newUser.username}, tên hiển thị "${cleanDisplayName}") và phân quyền cho ${Object.keys(cleanedPermissions).length} sổ`
+        : `Tạo tài khoản ${targetIdentity} (@${newUser.username}) và phân quyền cho ${Object.keys(cleanedPermissions).length} sổ`,
+      changes: {
+        bookPermissions: { old: null, new: JSON.stringify(cleanedPermissions) },
+        ...(cleanDisplayName ? { displayName: { old: null, new: cleanDisplayName } } : {}),
+      },
+    });
+    await saveDatabasePersistent(db);
+
+    res.json({ user: toSafeUser(newUser) });
+  } finally {
+    releaseLock();
+  }
+});
+
+app.put('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
+  const actor = (req as any).user as User;
+  const { id } = req.params;
+  const { fullName, isActive, password, bookPermissions } = req.body || {};
+  const hasDisplayNameField = Object.prototype.hasOwnProperty.call(req.body || {}, 'displayName');
+
+  if (
+    hasDisplayNameField &&
+    req.body.displayName !== undefined &&
+    req.body.displayName !== null &&
+    typeof req.body.displayName !== 'string'
+  ) {
+    return res.status(400).json({ error: 'Tên hiển thị phải là chuỗi văn bản hợp lệ' });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const target = db.users.find((u) => u.id === id);
+    if (!target) return res.status(404).json({ error: 'Không tìm thấy người dùng' });
+
+    const prevPermissions = target.bookPermissions ? { ...target.bookPermissions } : {};
+    const prevActive = target.isActive;
+    const changes: Record<string, { old: string | null; new: string | null }> = {};
+
+    if (target.username === 'admin' || target.role === 'admin') {
+      target.role = 'admin';
+      if (isActive === false) {
+        return res.status(400).json({ error: 'Không thể vô hiệu hóa tài khoản quản trị viên cố định' });
+      }
+    } else {
+      target.role = 'issuer';
+      if (bookPermissions && typeof bookPermissions === 'object') {
+        const nextPerms = sanitizeBookPermissionsMap(bookPermissions);
+        if (JSON.stringify(prevPermissions) !== JSON.stringify(nextPerms)) {
+          changes.bookPermissions = {
+            old: JSON.stringify(prevPermissions),
+            new: JSON.stringify(nextPerms),
+          };
+        }
+        target.bookPermissions = nextPerms;
+      }
+    }
+
+    if (typeof fullName === 'string' && fullName.trim() && fullName.trim() !== target.fullName) {
+      changes.fullName = { old: target.fullName || null, new: fullName.trim() };
+      target.fullName = fullName.trim();
+    }
+
+    if (hasDisplayNameField) {
+      const nextDisplay =
+        typeof req.body.displayName === 'string' ? req.body.displayName.trim().slice(0, 80) : '';
+      const prevDisplay = typeof target.displayName === 'string' ? target.displayName.trim() : '';
+      if (nextDisplay !== prevDisplay) {
+        changes.displayName = {
+          old: prevDisplay || null,
+          new: nextDisplay || null,
+        };
+        if (nextDisplay) {
+          target.displayName = nextDisplay;
+        } else {
+          delete target.displayName;
+        }
+      }
+    }
+
+    if (typeof isActive === 'boolean' && target.username !== 'admin' && isActive !== prevActive) {
+      changes.isActive = { old: String(prevActive), new: String(isActive) };
+      target.isActive = isActive;
+    }
+    if (typeof password === 'string' && password.trim().length >= 6) {
+      target.passwordHash = hashPassword(password.trim());
+      changes.password = { old: '******', new: 'Đã đặt lại mật khẩu' };
+    }
+
+    if (Object.keys(changes).length > 0) {
+      const actorLabel = `${actor.fullName || actor.username} (${actor.username})`;
+      const targetIdentity = target.fullName || target.username;
+      let details = `Cập nhật thông tin tài khoản ${targetIdentity} (@${target.username})`;
+      if (changes.bookPermissions) {
+        details = `Cập nhật phân quyền sổ cho ${targetIdentity} (@${target.username})`;
+      } else if (changes.displayName && Object.keys(changes).length === 1) {
+        details = changes.displayName.new
+          ? `Cập nhật tên hiển thị cho @${target.username} thành "${changes.displayName.new}"`
+          : `Đặt lại tên hiển thị mặc định theo Họ và tên cho @${target.username}`;
+      }
+      appendSystemAuditLog({
+        actorUserId: actor.id,
+        actorName: actorLabel,
+        action: changes.bookPermissions ? 'permission_change' : 'user_update',
+        targetUserId: target.id,
+        targetUsername: target.username,
+        details,
+        changes,
+      });
+    }
+
+    await saveDatabasePersistent(db);
+    const safeUser = toSafeUser(target);
+    refreshUserSessions(safeUser);
+    broadcastSSE('user_permissions_updated', { userId: target.id, user: safeUser });
+    res.json({ user: safeUser });
+  } finally {
+    releaseLock();
+  }
+});
+
+app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
+  const actor = (req as any).user as User;
+  const { id } = req.params;
+  const target = db.users.find((u) => u.id === id);
+  if (!target) return res.status(404).json({ error: 'Không tìm thấy người dùng' });
+
+  if (target.username === 'admin') {
+    return res.status(400).json({ error: 'Không thể xóa tài khoản Quản trị viên cố định' });
+  }
+
+  db.users = db.users.filter((u) => u.id !== id);
+  for (const [token, sess] of tokenStore.entries()) {
+    if (sess.user.id === id) tokenStore.delete(token);
+  }
+  appendSystemAuditLog({
+    actorUserId: actor.id,
+    actorName: `${actor.fullName} (${actor.username})`,
+    action: 'user_delete',
+    targetUserId: target.id,
+    targetUsername: target.username,
+    details: `Xóa tài khoản ${target.fullName} (@${target.username})`,
+  });
+  await saveDatabasePersistent(db);
+  broadcastSSE('user_permissions_updated', { userId: id, deleted: true });
+  res.json({ success: true, message: `Đã xóa tài khoản ${target.username}` });
+});
+
+app.get('/api/audit-logs', requireAuth, (req, res) => {
+  const currentUser = (req as any).user as User;
+  const bookId = (req.query.bookId as string) || '';
+  const canView =
+    isSystemAdmin(currentUser) ||
+    (bookId && hasBookPermission(currentUser, bookId, 'manage_book')) ||
+    (!bookId && db.books.some((b) => hasBookPermission(currentUser, b.id, 'manage_book')));
+  if (!canView) {
+    return res.status(403).json({ error: 'Bạn không có quyền xem nhật ký quản trị hệ thống.' });
+  }
+
+  let logs = db.systemAuditLogs || [];
+  if (bookId && bookId !== 'all') {
+    logs = logs.filter((l) => l.bookId === bookId);
+  } else if (!isSystemAdmin(currentUser)) {
+    const managedIds = new Set(
+      db.books.filter((b) => hasBookPermission(currentUser, b.id, 'manage_book')).map((b) => b.id)
+    );
+    logs = logs.filter((l) => l.bookId && managedIds.has(l.bookId));
+  }
+  res.json({ logs: logs.slice(0, 150) });
+});
+
+app.get('/api/document-history', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const {
+    bookId = '',
+    username = '',
+    userId = '',
+    fromDate = '',
+    toDate = '',
+    docId = '',
+    action = '',
+    search = '',
+    page,
+    pageSize,
+  } = req.query as Record<string, string>;
+
+  if (bookId && bookId !== 'all') {
+    const targetBook = getBookById(bookId);
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'view')) {
+      return res.status(403).json({
+        error: `Bạn chưa được cấp quyền "Xem" trong ${targetBook.name} để xem lịch sử thao tác.`,
+      });
+    }
+  } else if (
+    !isSystemAdmin(currentUser) &&
+    !db.books.some((b) => hasBookPermission(currentUser, b.id, 'view'))
+  ) {
+    return res.status(403).json({
+      error: 'Bạn chưa được phân quyền xem lịch sử thao tác trên bất kỳ sổ nào.',
+    });
+  }
+
+  let logs = (db.documentHistoryLogs || []).filter((entry) => {
+    const bId = entry.bookId || DEFAULT_BOOK_ID;
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, bId, 'view')) {
+      return false;
+    }
+    if (bookId && bookId !== 'all' && bId !== bookId) return false;
+    return true;
+  });
+
+  // Collect distinct actors within user's permitted book scope for filter dropdown
+  const actorMap = new Map<string, { userId: string; username: string; userName: string }>();
+  for (const l of logs) {
+    const key = l.username || l.userId;
+    if (key && !actorMap.has(key)) {
+      actorMap.set(key, {
+        userId: l.userId,
+        username: l.username || l.userId,
+        userName: l.userName,
+      });
+    }
+  }
+
+  if (docId) {
+    logs = logs.filter((l) => l.docId === docId);
+  }
+  if (username && username !== 'all') {
+    const lowerU = username.trim().toLowerCase();
+    logs = logs.filter(
+      (l) =>
+        (l.username || '').toLowerCase() === lowerU ||
+        l.userId === username
+    );
+  } else if (userId && userId !== 'all') {
+    logs = logs.filter((l) => l.userId === userId);
+  }
+  if (action && action !== 'all') {
+    logs = logs.filter((l) => l.action === action);
+  }
+  if (fromDate && /^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
+    logs = logs.filter((l) => (l.dateKeyVietnam || getVietnamDateKey(new Date(l.timestamp))) >= fromDate);
+  }
+  if (toDate && /^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+    logs = logs.filter((l) => (l.dateKeyVietnam || getVietnamDateKey(new Date(l.timestamp))) <= toDate);
+  }
+  if (search && search.trim()) {
+    const term = search.trim().toLowerCase();
+    logs = logs.filter(
+      (l) =>
+        (l.fullDocNumber || '').toLowerCase().includes(term) ||
+        (l.docName || '').toLowerCase().includes(term) ||
+        (l.docId || '').toLowerCase().includes(term) ||
+        (l.userName || '').toLowerCase().includes(term) ||
+        (l.reason || '').toLowerCase().includes(term)
+    );
+  }
+
+  const total = logs.length;
+  let slicedLogs = logs;
+  if (page || pageSize) {
+    const pSizeNum = Math.min(200, Math.max(1, parseInt(pageSize || '20', 10) || 20));
+    const totalPages = Math.max(1, Math.ceil(total / pSizeNum));
+    const pNum = Math.min(totalPages, Math.max(1, parseInt(page || '1', 10) || 1));
+    const start = (pNum - 1) * pSizeNum;
+    slicedLogs = logs.slice(start, start + pSizeNum);
+  }
+
+  res.json({
+    total,
+    logs: slicedLogs,
+    actors: Array.from(actorMap.values()),
+  });
+});
+
+function shiftVietnamDateKey(dateKey: string, deltaDays: number): string {
+  const [y, m, d] = dateKey.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
+  return dt.toISOString().slice(0, 10);
+}
+
+function isValidIsoDateKey(dateKey: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return false;
+  const [y, m, d] = dateKey.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.toISOString().slice(0, 10) === dateKey;
+}
+
+function formatVnDateFromKey(dateKey: string): string {
+  const [y, m, d] = dateKey.split('-');
+  return `${d}/${m}/${y}`;
+}
+
+function resolveHistoryCleanupSpec(
+  params: { bookId?: string; scope?: string; beforeDate?: string },
+  req: Request
+): {
+  error?: string;
+  statusCode?: number;
+  targetBook?: RegistryBook;
+  scope?: HistoryCleanupScope;
+  beforeDate?: string;
+  rangeLabel?: string;
+  fromDateKey?: string | null;
+  toDateKey?: string | null;
+  matchesEntry?: (bookId: string, timestampIso: string, dateKeyVietnam?: string) => boolean;
+} {
+  const rawBookId = typeof params.bookId === 'string' ? params.bookId.trim() : '';
+  if (!rawBookId || rawBookId === 'all') {
+    return {
+      error: 'Vui lòng chọn một sổ văn bản cụ thể để dọn lịch sử thao tác.',
+      statusCode: 400,
+    };
+  }
+  const targetBook = findBookExplicitly(rawBookId);
+  if (!targetBook) {
+    return { error: 'Không tìm thấy sổ văn bản đã chọn.', statusCode: 404 };
+  }
+
+  const rawScope = typeof params.scope === 'string' ? params.scope.trim() : '';
+  if (!['today', 'last_10_days', 'before_date', 'all'].includes(rawScope)) {
+    return {
+      error: 'Phạm vi dọn lịch sử không hợp lệ (chỉ chấp nhận today, last_10_days, before_date, all).',
+      statusCode: 400,
+    };
+  }
+  const scope = rawScope as HistoryCleanupScope;
+
+  const vnNow = getRequestVietnamTimeInfo(req);
+  const todayKey = `${vnNow.year}-${String(vnNow.month).padStart(2, '0')}-${String(vnNow.day).padStart(2, '0')}`;
+
+  if (scope === 'today') {
+    const rangeLabel = `Hôm nay (${formatVnDateFromKey(todayKey)})`;
+    return {
+      targetBook,
+      scope,
+      rangeLabel,
+      fromDateKey: todayKey,
+      toDateKey: todayKey,
+      matchesEntry: (bId, tsIso, dk) => {
+        if (bId !== targetBook.id) return false;
+        const entryKey = dk && isValidIsoDateKey(dk) ? dk : getVietnamDateKey(new Date(tsIso));
+        return entryKey === todayKey;
+      },
+    };
+  }
+
+  if (scope === 'last_10_days') {
+    const startKey = shiftVietnamDateKey(todayKey, -9);
+    const rangeLabel = `10 ngày gần nhất (${formatVnDateFromKey(startKey)} – ${formatVnDateFromKey(todayKey)})`;
+    return {
+      targetBook,
+      scope,
+      rangeLabel,
+      fromDateKey: startKey,
+      toDateKey: todayKey,
+      matchesEntry: (bId, tsIso, dk) => {
+        if (bId !== targetBook.id) return false;
+        const entryKey = dk && isValidIsoDateKey(dk) ? dk : getVietnamDateKey(new Date(tsIso));
+        return entryKey >= startKey && entryKey <= todayKey;
+      },
+    };
+  }
+
+  if (scope === 'before_date') {
+    const cleanBefore = typeof params.beforeDate === 'string' ? params.beforeDate.trim() : '';
+    if (!isValidIsoDateKey(cleanBefore)) {
+      return {
+        error: 'Vui lòng chọn ngày hợp lệ (YYYY-MM-DD) cho mốc "Xóa lịch sử trước ngày".',
+        statusCode: 400,
+      };
+    }
+    const cutoffMs = Date.parse(`${cleanBefore}T00:00:00+07:00`);
+    const rangeLabel = `Trước 00:00 ngày ${formatVnDateFromKey(cleanBefore)} (giờ Việt Nam)`;
+    return {
+      targetBook,
+      scope,
+      beforeDate: cleanBefore,
+      rangeLabel,
+      fromDateKey: null,
+      toDateKey: shiftVietnamDateKey(cleanBefore, -1),
+      matchesEntry: (bId, tsIso, dk) => {
+        if (bId !== targetBook.id) return false;
+        const parsedMs = tsIso ? Date.parse(tsIso) : NaN;
+        if (Number.isFinite(parsedMs) && Number.isFinite(cutoffMs)) {
+          return parsedMs < cutoffMs;
+        }
+        const entryKey = dk && isValidIsoDateKey(dk) ? dk : getVietnamDateKey(new Date(tsIso));
+        return entryKey < cleanBefore;
+      },
+    };
+  }
+
+  // scope === 'all'
+  const rangeLabel = `Toàn bộ lịch sử của sổ "${targetBook.name}"`;
+  return {
+    targetBook,
+    scope,
+    rangeLabel,
+    fromDateKey: null,
+    toDateKey: null,
+    matchesEntry: (bId) => bId === targetBook.id,
+  };
+}
+
+// Xem trước số bản ghi lịch sử thao tác sẽ xóa (CHỈ Admin toàn quyền hệ thống)
+app.post('/api/document-history/cleanup/preview', requireAuth, requireAdmin, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const { bookId, scope, beforeDate } = req.body || {};
+  const spec = resolveHistoryCleanupSpec({ bookId, scope, beforeDate }, req);
+  if (spec.error || !spec.targetBook || !spec.matchesEntry) {
+    return res.status(spec.statusCode || 400).json({ error: spec.error || 'Yêu cầu không hợp lệ.' });
+  }
+
+  const matchCount = (db.documentHistoryLogs || []).filter((entry) =>
+    spec.matchesEntry!(entry.bookId || DEFAULT_BOOK_ID, entry.timestamp, entry.dateKeyVietnam)
+  ).length;
+
+  res.json({
+    bookId: spec.targetBook.id,
+    bookCode: spec.targetBook.code,
+    bookName: spec.targetBook.name,
+    scope: spec.scope,
+    beforeDate: spec.beforeDate,
+    rangeLabel: spec.rangeLabel,
+    fromDateKey: spec.fromDateKey ?? null,
+    toDateKey: spec.toDateKey ?? null,
+    matchCount,
+    requiresTypedConfirmation: spec.scope === 'all',
+    confirmationPhrase: 'XÓA LỊCH SỬ',
+  });
+});
+
+// Xóa lịch sử thao tác theo thời gian (CHỈ Admin toàn quyền hệ thống; giữ nguyên hồ sơ & số chống cấp lại)
+app.post('/api/document-history/cleanup', requireAuth, requireAdmin, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { bookId, scope, beforeDate, confirmationText } = req.body || {};
+
+  const preCheck = resolveHistoryCleanupSpec({ bookId, scope, beforeDate }, req);
+  if (preCheck.error) {
+    return res.status(preCheck.statusCode || 400).json({ error: preCheck.error });
+  }
+  if (preCheck.scope === 'all' && String(confirmationText || '').trim() !== 'XÓA LỊCH SỬ') {
+    return res.status(400).json({
+      error: 'Khi xóa toàn bộ lịch sử của sổ, vui lòng nhập chính xác cụm từ xác nhận: XÓA LỊCH SỬ',
+    });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const spec = resolveHistoryCleanupSpec({ bookId, scope, beforeDate }, req);
+    if (spec.error || !spec.targetBook || !spec.matchesEntry) {
+      return res.status(spec.statusCode || 400).json({ error: spec.error || 'Yêu cầu không hợp lệ.' });
+    }
+
+    const targetBook = spec.targetBook;
+    const removedIds = new Set<string>();
+    const keptHistory: DocumentHistoryEntry[] = [];
+
+    for (const entry of db.documentHistoryLogs || []) {
+      const bId = entry.bookId || DEFAULT_BOOK_ID;
+      if (spec.matchesEntry(bId, entry.timestamp, entry.dateKeyVietnam)) {
+        if (entry.id) removedIds.add(entry.id);
+      } else {
+        keptHistory.push(entry);
+      }
+    }
+
+    const deletedCount = (db.documentHistoryLogs || []).length - keptHistory.length;
+    db.documentHistoryLogs = keptHistory;
+
+    // Đồng bộ dọn các mục tương ứng trong doc.auditLogs của đúng sổ đó để không tự phục hồi khi migrate lại DB,
+    // nhưng KHÔNG thay đổi bất kỳ thông tin hồ sơ văn bản hay số thứ tự nào.
+    for (const doc of db.documents) {
+      if (getDocBookId(doc) !== targetBook.id || !Array.isArray(doc.auditLogs) || doc.auditLogs.length === 0) {
+        continue;
+      }
+      doc.auditLogs = doc.auditLogs.filter((log) => {
+        if (log.id && removedIds.has(log.id)) return false;
+        return !spec.matchesEntry!(targetBook.id, log.timestamp, log.dateKeyVietnam);
+      });
+    }
+
+    appendSystemAuditLog({
+      actorUserId: currentUser.id,
+      actorName: `${currentUser.fullName} (${currentUser.username})`,
+      action: 'history_cleanup',
+      bookId: targetBook.id,
+      bookCode: targetBook.code,
+      details: `Dọn lịch sử thao tác sổ "${targetBook.name}" (${targetBook.code}) · Phạm vi: ${spec.rangeLabel} · Đã xóa ${deletedCount} bản ghi lịch sử.`,
+      changes: {
+        scope: { old: null, new: spec.scope! },
+        range: { old: null, new: spec.rangeLabel! },
+        deletedCount: { old: null, new: String(deletedCount) },
+      },
+    });
+
+    await saveDatabasePersistent(db);
+    broadcastSSE('document_history_cleaned', {
+      bookId: targetBook.id,
+      deletedCount,
+      scope: spec.scope,
+    });
+
+    const remainingCount = (db.documentHistoryLogs || []).filter(
+      (e) => (e.bookId || DEFAULT_BOOK_ID) === targetBook.id
+    ).length;
+
+    res.json({
+      success: true,
+      bookId: targetBook.id,
+      bookCode: targetBook.code,
+      bookName: targetBook.name,
+      scope: spec.scope,
+      beforeDate: spec.beforeDate,
+      rangeLabel: spec.rangeLabel,
+      fromDateKey: spec.fromDateKey ?? null,
+      toDateKey: spec.toDateKey ?? null,
+      matchCount: deletedCount,
+      deletedCount,
+      remainingCount,
+      requiresTypedConfirmation: spec.scope === 'all',
+      confirmationPhrase: 'XÓA LỊCH SỬ',
+      message:
+        deletedCount > 0
+          ? `Đã dọn ${deletedCount} bản ghi lịch sử thao tác thuộc ${targetBook.name}.`
+          : `Không có bản ghi lịch sử nào thuộc phạm vi đã chọn trong ${targetBook.name}.`,
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+// 4. SSE Subscription for Real-Time Updates (Yêu cầu đăng nhập & lọc sự kiện theo quyền từng sổ)
+app.get('/api/events', requireAuth, (req, res) => {
+  const currentUser = (req as any).user as User;
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  if (typeof (res as any).flushHeaders === 'function') {
+    (res as any).flushHeaders();
+  }
+
+  while (sseClients.length >= MAX_SSE_CLIENTS) {
+    const oldest = sseClients.shift();
+    if (oldest) {
+      try {
+        oldest.res.end();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  sseClients.push({ id: clientId, userId: currentUser.id, res });
+
+  // Gửi thông báo kết nối thành công
+  res.write(`event: connected\ndata: ${JSON.stringify({ clientId, timestamp: Date.now() })}\n\n`);
+
+  req.on('close', () => {
+    const idx = sseClients.findIndex((c) => c.id === clientId);
+    if (idx !== -1) sseClients.splice(idx, 1);
+  });
+});
+
+// 5. System Settings, Books, Document Types, Signers
+app.get('/api/books', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 250 });
+  const currentUser = (req as any).user as User;
+  const accessible = db.books.filter(
+    (b) => isSystemAdmin(currentUser) || (b.isActive && getUserBookPermissions(currentUser, b.id).length > 0)
+  );
+  res.json({
+    books: accessible.map((b) => sanitizeBookForUser(b, currentUser)),
+    serverTimeVietnam: getRequestVietnamTimeInfo(req),
+    persistenceStatus: getPersistenceStatus(),
+  });
+});
+
+app.post('/api/books', requireAuth, requireAdmin, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { code, name, unitName, unitCode, isShared, numberMode, numberFormat, enabledTypeCodes } = req.body || {};
+
+  const cleanName = (name || '').trim();
+  const cleanUnitName = (unitName || '').trim();
+  const cleanUnitCode = (unitCode || '').trim().toUpperCase();
+  const cleanCode = normalizeBookCode(typeof code === 'string' && code.trim() ? code.trim() : cleanName);
+
+  if (!cleanName || !cleanUnitName || !cleanUnitCode || !cleanCode) {
+    return res.status(400).json({
+      error: 'Vui lòng nhập đầy đủ Mã sổ nội bộ, Tên sổ, Tên đơn vị/bộ phận và Ký hiệu viết tắt đơn vị.',
+    });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    if (db.books.some((b) => b.code.toUpperCase() === cleanCode.toUpperCase())) {
+      return res.status(400).json({
+        error: `Mã sổ nội bộ "${cleanCode}" đã tồn tại. Vui lòng chọn mã cố định khác.`,
+      });
+    }
+
+    const validTypeCodes = Array.isArray(enabledTypeCodes)
+      ? Array.from(
+          new Set(
+            enabledTypeCodes
+              .filter((c: any) => typeof c === 'string' && c.trim())
+              .map((c: string) => c.trim().toUpperCase())
+          )
+        )
+      : undefined;
+
+    const newBook: RegistryBook = {
+      id: `book-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      code: cleanCode,
+      name: cleanName,
+      unitName: cleanUnitName,
+      unitCode: cleanUnitCode,
+      isShared: Boolean(isShared),
+      numberMode: numberMode === 'shared' ? 'shared' : 'separate',
+      numberFormat: (numberFormat || '{so}-{loai}/{don_vi}').trim(),
+      customStartSequences: {},
+      enabledTypeCodes: validTypeCodes && validTypeCodes.length > 0 ? validTypeCodes : undefined,
+      signers: db.signers.map((s) => ({ ...s })),
+      isActive: true,
+      createdAt: new Date().toISOString(),
+    };
+
+    db.books.push(newBook);
+    appendSystemAuditLog({
+      actorUserId: currentUser.id,
+      actorName: `${currentUser.fullName} (${currentUser.username})`,
+      action: 'book_create',
+      bookId: newBook.id,
+      bookCode: newBook.code,
+      details: `Tạo sổ mới "${newBook.name}" (Mã cố định: ${newBook.code}, Ký hiệu: ${newBook.unitCode})`,
+    });
+    await saveDatabasePersistent(db);
+    broadcastSSE('books_updated', { bookId: newBook.id });
+    res.json({ book: sanitizeBookForUser(newBook, currentUser) });
+  } finally {
+    releaseLock();
+  }
+});
+
+app.put('/api/books/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+  const target = db.books.find((b) => b.id === id);
+  if (!target) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản.' });
+  }
+
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, target.id, 'manage_book')) {
+    return res.status(403).json({
+      error: 'Bạn cần quyền "Quản trị sổ" hoặc Quản trị viên hệ thống để cập nhật sổ này.',
+    });
+  }
+
+  if (checkVersionConflict(req, res, target, currentUser)) return;
+
+  const { name, unitName, unitCode, isShared, numberMode, numberFormat, signers, isActive, enabledTypeCodes } = req.body || {};
+  const changes: Record<string, { old: string | null; new: string | null }> = {};
+
+  if (typeof name === 'string' && name.trim() && name.trim() !== target.name) {
+    changes.name = { old: target.name, new: name.trim() };
+    target.name = name.trim();
+  }
+  if (typeof unitName === 'string' && unitName.trim() && unitName.trim() !== target.unitName) {
+    changes.unitName = { old: target.unitName, new: unitName.trim() };
+    target.unitName = unitName.trim();
+  }
+  if (typeof unitCode === 'string' && unitCode.trim() && unitCode.trim().toUpperCase() !== target.unitCode) {
+    changes.unitCode = { old: target.unitCode, new: unitCode.trim().toUpperCase() };
+    target.unitCode = unitCode.trim().toUpperCase();
+  }
+  if (typeof isShared === 'boolean' && isShared !== target.isShared) {
+    changes.isShared = { old: String(target.isShared), new: String(isShared) };
+    target.isShared = isShared;
+  }
+  if ((numberMode === 'separate' || numberMode === 'shared') && numberMode !== target.numberMode) {
+    changes.numberMode = { old: target.numberMode, new: numberMode };
+    target.numberMode = numberMode;
+  }
+  if (typeof numberFormat === 'string' && numberFormat.trim() && numberFormat.trim() !== target.numberFormat) {
+    changes.numberFormat = { old: target.numberFormat, new: numberFormat.trim() };
+    target.numberFormat = numberFormat.trim();
+  }
+  if (Array.isArray(enabledTypeCodes)) {
+    const cleanedTypes = Array.from(
+      new Set(
+        enabledTypeCodes
+          .filter((c: any) => typeof c === 'string' && c.trim())
+          .map((c: string) => c.trim().toUpperCase())
+      )
+    );
+    if (cleanedTypes.length === 0) {
+      return res.status(400).json({ error: 'Mỗi sổ phải cho phép ít nhất 01 loại văn bản.' });
+    }
+    changes.enabledTypeCodes = {
+      old: JSON.stringify(target.enabledTypeCodes || []),
+      new: JSON.stringify(cleanedTypes),
+    };
+    target.enabledTypeCodes = cleanedTypes;
+  }
+  if (Array.isArray(signers)) {
+    target.signers = signers
+      .filter((s: any) => s && typeof s.name === 'string' && s.name.trim())
+      .map((s: any, idx: number) => ({
+        id: s.id || `sig-${Date.now()}-${idx}`,
+        name: s.name.trim(),
+        role: typeof s.role === 'string' ? s.role.trim() : '',
+      }));
+  }
+  if (typeof isActive === 'boolean' && target.id !== DEFAULT_BOOK_ID) {
+    changes.isActive = { old: String(target.isActive), new: String(isActive) };
+    target.isActive = isActive;
+  }
+
+  if (Object.keys(changes).length > 0) {
+    appendSystemAuditLog({
+      actorUserId: currentUser.id,
+      actorName: `${currentUser.fullName} (${currentUser.username})`,
+      action: 'book_update',
+      bookId: target.id,
+      bookCode: target.code,
+      details: `Cập nhật cấu hình sổ "${target.name}" (${target.code})`,
+      changes,
+    });
+  }
+
+  bumpBookVersion(target);
+  syncDefaultBookToLegacySettings(target);
+  await saveDatabasePersistent(db);
+  broadcastSSE('books_updated', {
+    bookId: target.id,
+    configVersion: target.configVersion,
+    updatedAt: target.updatedAt,
+  });
+  if (target.id === DEFAULT_BOOK_ID) {
+    broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
+  }
+  res.json({ book: sanitizeBookForUser(target, currentUser) });
+});
+
+app.get('/api/bootstrap', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 250 });
+  const currentUser = (req as any).user as User;
+  const admin = isSystemAdmin(currentUser);
+
+  // Refresh user state from latest DB (keeps permissions & active flag authoritative)
+  const latestUser = db.users.find((u) => u.id === currentUser.id) || currentUser;
+  const { passwordHash: _pw, ...safeUser } = latestUser as User & { passwordHash?: string };
+
+  const accessibleBooks = db.books.filter(
+    (b) => admin || (b.isActive && getUserBookPermissions(latestUser, b.id).length > 0)
+  );
+  const viewableBookIds = new Set(
+    accessibleBooks
+      .filter((b) => admin || hasBookPermission(latestUser, b.id, 'view'))
+      .map((b) => b.id)
+  );
+
+  // Reconcile any stale uploading docs once for all accessible docs
+  const staleDocs = db.documents.filter((d) => {
+    const bId = getDocBookId(d);
+    return (admin || viewableBookIds.has(bId)) && isDocumentStaleUploading(d);
+  });
+  if (staleDocs.length > 0) {
+    await reconcileStaleUploadingDocuments(staleDocs, 5).catch(() => {});
+  }
+
+  const activeDocs: DocumentRecord[] = [];
+  const deletedDocs: DocumentRecord[] = [];
+  for (const d of db.documents) {
+    const bId = getDocBookId(d);
+    if (!admin && !viewableBookIds.has(bId)) continue;
+    if (d.status === 'deleted') {
+      if (!d.deletedListArchived) {
+        deletedDocs.push(stripLargeIndexFieldsForList(d));
+      }
+    } else {
+      activeDocs.push(stripLargeIndexFieldsForList(d));
+    }
+  }
+
+  activeDocs.sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
+  deletedDocs.sort(
+    (a, b) =>
+      new Date(b.deletedAt || b.createdAt).getTime() -
+      new Date(a.deletedAt || a.createdAt).getTime()
+  );
+
+  const visibleRequests = admin
+    ? [...db.numberRequests]
+    : db.numberRequests.filter(
+        (r) =>
+          r.requestedByUserId === latestUser.id ||
+          hasBookPermission(latestUser, r.bookId, 'issue_number') ||
+          hasBookPermission(latestUser, r.bookId, 'manage_book')
+      );
+
+  res.json({
+    user: safeUser,
+    settings: sanitizeSettingsForUser(db.settings, latestUser),
+    documentTypes: db.documentTypes,
+    signers: db.signers,
+    books: accessibleBooks.map((b) => sanitizeBookForUser(b, latestUser)),
+    documents: activeDocs,
+    deletedDocuments: deletedDocs,
+    numberRequests: visibleRequests,
+    serverTimeVietnam: getRequestVietnamTimeInfo(req),
+    persistenceStatus: getPersistenceStatus(),
+    legacyReconciliationWarnings: [...currentReconciliationWarnings],
+  });
+});
+
+app.get('/api/settings', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 250 });
+  const currentUser = (req as any).user as User;
+  res.json({
+    settings: sanitizeSettingsForUser(db.settings, currentUser),
+    documentTypes: db.documentTypes,
+    signers: db.signers,
+    serverTimeVietnam: getRequestVietnamTimeInfo(req),
+    persistenceStatus: getPersistenceStatus(),
+    legacyReconciliationWarnings: [...currentReconciliationWarnings],
+  });
+});
+
+app.put('/api/settings', requireAuth, requireAdmin, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { unitName, unitCode, numberFormat, customStartSequences, bookId } = req.body;
+
+  const initialBook = findBookExplicitly(bookId);
+  if (!initialBook) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản cần cấu hình.' });
+  }
+  if (customStartSequences && !getPersistenceStatus().durable) {
+    return res.status(503).json({
+      code: 'DURABLE_STORAGE_NOT_CONFIGURED',
+      persistenceStatus: getPersistenceStatus(),
+      error:
+        'Máy chủ Vercel Production chưa cấu hình nguồn lưu trữ bền vững (KV_REST_API_URL/TOKEN, BLOB_READ_WRITE_TOKEN hoặc PERSISTENT_DB_WEBHOOK_URL).',
+    });
+  }
+  if (checkVersionConflict(req, res, initialBook, currentUser)) return;
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const targetBook = findBookExplicitly(initialBook.id);
+    if (!targetBook) {
+      return res.status(404).json({ error: 'Không tìm thấy sổ văn bản cần cấu hình.' });
+    }
+    if (checkVersionConflict(req, res, targetBook, currentUser)) return;
+
+    if (unitName) targetBook.unitName = unitName.trim();
+    if (unitCode) targetBook.unitCode = unitCode.trim();
+    if (numberFormat) targetBook.numberFormat = numberFormat.trim();
+    if (customStartSequences && typeof customStartSequences === 'object') {
+      const normalizedPatch = normalizeCustomStartSequencesMap(
+        customStartSequences,
+        targetBook.code,
+        targetBook.id,
+        db.documentTypes
+      );
+      targetBook.customStartSequences = {
+        ...targetBook.customStartSequences,
+        ...normalizedPatch,
+      };
+    }
+
+    bumpBookVersion(targetBook);
+    syncDefaultBookToLegacySettings(targetBook);
+    const persistenceStatus = await saveDatabasePersistent(db, { verifyWrite: true });
+    broadcastSSE('books_updated', {
+      bookId: targetBook.id,
+      configVersion: targetBook.configVersion,
+      updatedAt: targetBook.updatedAt,
+    });
+    broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
+    res.json({
+      settings: sanitizeSettingsForUser(db.settings, currentUser),
+      book: sanitizeBookForUser(targetBook, currentUser),
+      persistenceStatus,
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+// Chuyển đổi chế độ cấp số (riêng vs chung) theo từng sổ
+app.post('/api/settings/number-mode', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { newMode, confirmationText, bookId } = req.body;
+  const initialBook = getBookById(bookId || DEFAULT_BOOK_ID);
+
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, initialBook.id, 'manage_book')) {
+    return res.status(403).json({
+      error: 'Bạn cần quyền "Quản trị sổ" hoặc Quản trị viên để thay đổi chế độ dãy số.',
+    });
+  }
+
+  if (newMode !== 'separate' && newMode !== 'shared') {
+    return res.status(400).json({ error: 'Chế độ dãy số không hợp lệ' });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const targetBook = getBookById(initialBook.id);
+    if (checkVersionConflict(req, res, targetBook, currentUser)) return;
+
+    const { year: currentYear } = getRequestVietnamTimeInfo(req);
+    const currentYearDocs = db.documents.filter(
+      (d) => getDocBookId(d) === targetBook.id && d.year === currentYear && d.docCategory !== 'incoming'
+    );
+
+    if (currentYearDocs.length > 0) {
+      if (confirmationText !== 'XÁC NHẬN CHUYỂN ĐỔI') {
+        return res.status(400).json({
+          error:
+            `Sổ "${targetBook.name}" trong năm ${currentYear} đã phát sinh ${currentYearDocs.length} văn bản. ` +
+            `Để tránh trùng số hoặc sai lệch thứ tự, bạn phải nhập chính xác dòng chữ "XÁC NHẬN CHUYỂN ĐỔI" để xác nhận.`,
+        });
+      }
+    }
+
+    targetBook.numberMode = newMode;
+    bumpBookVersion(targetBook);
+    syncDefaultBookToLegacySettings(targetBook);
+    await saveDatabasePersistent(db, { verifyWrite: true });
+    broadcastSSE('books_updated', {
+      bookId: targetBook.id,
+      configVersion: targetBook.configVersion,
+      updatedAt: targetBook.updatedAt,
+    });
+    broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
+    res.json({
+      success: true,
+      settings: sanitizeSettingsForUser(db.settings, currentUser),
+      book: sanitizeBookForUser(targetBook, currentUser),
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+// Quản lý loại văn bản
+app.post('/api/document-types', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { name, code, color, bookId, enableExistingForBook } = req.body || {};
+
+  const targetBook =
+    typeof bookId === 'string' && bookId.trim() ? findBookExplicitly(bookId.trim()) : null;
+  if (typeof bookId === 'string' && bookId.trim() && !targetBook) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản đang chọn.' });
+  }
+
+  const canManageCatalog =
+    isSystemAdmin(currentUser) ||
+    (targetBook
+      ? hasBookPermission(currentUser, targetBook.id, 'manage_book')
+      : db.books.some((b) => hasBookPermission(currentUser, b.id, 'manage_book')));
+
+  if (!canManageCatalog) {
+    return res.status(403).json({
+      error: 'Bạn không có quyền thêm hoặc quản lý danh mục loại văn bản.',
+    });
+  }
+
+  const cleanName = String(name || '').trim().replace(/\s+/g, ' ');
+  const cleanCode = String(code || '').trim().replace(/\s+/g, '').toUpperCase();
+  if (!cleanName || !cleanCode) {
+    return res.status(400).json({ error: 'Vui lòng nhập đầy đủ tên loại văn bản và ký hiệu' });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const scopedBook = targetBook ? findBookExplicitly(targetBook.id) : null;
+    const existingType = db.documentTypes.find(
+      (t) => t.code.trim().replace(/\s+/g, '').toUpperCase() === cleanCode
+    );
+
+    if (existingType) {
+      const bookHasCustomFilter = Boolean(
+        scopedBook && Array.isArray(scopedBook.enabledTypeCodes) && scopedBook.enabledTypeCodes.length > 0
+      );
+      const alreadyEnabledInBook = scopedBook
+        ? isTypeEnabledInBook(scopedBook, existingType.code) && existingType.isActive
+        : true;
+
+      if (scopedBook && (!alreadyEnabledInBook || !existingType.isActive)) {
+        if (enableExistingForBook) {
+          existingType.isActive = true;
+          if (bookHasCustomFilter) {
+            const currentCodes = scopedBook.enabledTypeCodes || [];
+            if (!currentCodes.some((c) => c.trim().toUpperCase() === existingType.code.toUpperCase())) {
+              scopedBook.enabledTypeCodes = [...currentCodes, existingType.code];
+            }
+          }
+          bumpBookVersion(scopedBook);
+          await saveDatabasePersistent(db);
+          broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
+          broadcastSSE('books_updated', {
+            bookId: scopedBook.id,
+            configVersion: scopedBook.configVersion,
+            updatedAt: scopedBook.updatedAt,
+          });
+          return res.json({
+            documentType: existingType,
+            book: sanitizeBookForUser(scopedBook, currentUser),
+            enabledExisting: true,
+          });
+        }
+
+        return res.status(409).json({
+          code: 'TYPE_EXISTS_IN_CATALOG_NOT_ENABLED',
+          documentType: existingType,
+          bookId: scopedBook.id,
+          bookName: scopedBook.name,
+          error: `Ký hiệu "${existingType.code}" (${existingType.name}) đã có trong danh mục chung nhưng chưa bật cho sổ "${scopedBook.name}". Bạn có thể bật loại này cho sổ hiện tại.`,
+        });
+      }
+
+      return res.status(400).json({
+        error: `Ký hiệu viết tắt "${existingType.code}" đã tồn tại (${existingType.name})`,
+      });
+    }
+
+    const newType: DocumentTypeConfig = {
+      id: cleanCode,
+      name: cleanName,
+      code: cleanCode,
+      color: color || DEFAULT_TYPE_COLORS[cleanCode] || 'blue',
+      isActive: true,
+    };
+
+    db.documentTypes.push(newType);
+
+    let updatedBookPayload: RegistryBook | undefined;
+    if (scopedBook) {
+      if (Array.isArray(scopedBook.enabledTypeCodes) && scopedBook.enabledTypeCodes.length > 0) {
+        if (!scopedBook.enabledTypeCodes.some((c) => c.trim().toUpperCase() === cleanCode)) {
+          scopedBook.enabledTypeCodes = [...scopedBook.enabledTypeCodes, cleanCode];
+          bumpBookVersion(scopedBook);
+        }
+      }
+      updatedBookPayload = sanitizeBookForUser(scopedBook, currentUser);
+    }
+
+    await saveDatabasePersistent(db);
+    broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
+    if (scopedBook && updatedBookPayload) {
+      broadcastSSE('books_updated', {
+        bookId: scopedBook.id,
+        configVersion: scopedBook.configVersion,
+        updatedAt: scopedBook.updatedAt,
+      });
+    }
+    res.json({
+      documentType: newType,
+      ...(updatedBookPayload ? { book: updatedBookPayload } : {}),
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+app.delete('/api/document-types/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const idx = db.documentTypes.findIndex((t) => t.id === id || t.code === id);
+  if (idx === -1) return res.status(404).json({ error: 'Không tìm thấy loại văn bản cần xóa' });
+
+  db.documentTypes.splice(idx, 1);
+  await saveDatabasePersistent(db);
+  broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
+  res.json({ success: true });
+});
+
+app.put('/api/document-types/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, code, color, isActive } = req.body;
+
+  const target = db.documentTypes.find((t) => t.id === id);
+  if (!target) return res.status(404).json({ error: 'Không tìm thấy loại văn bản' });
+
+  if (name) target.name = name.trim();
+  if (code) {
+    const cleanCode = code.trim().toUpperCase();
+    if (cleanCode !== target.code && db.documentTypes.some((t) => t.code.toUpperCase() === cleanCode)) {
+      return res.status(400).json({ error: `Ký hiệu "${cleanCode}" đã được sử dụng` });
+    }
+    target.code = cleanCode;
+  }
+  if (color) target.color = color;
+  if (typeof isActive === 'boolean') target.isActive = isActive;
+
+  await saveDatabasePersistent(db);
+  broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
+  res.json({ documentType: target });
+});
+
+// Quản lý người ký
+app.post('/api/signers', requireAuth, requireAdmin, async (req, res) => {
+  const { name, role } = req.body;
+  if (!name || !role) {
+    return res.status(400).json({ error: 'Vui lòng nhập tên người ký và chức vụ' });
+  }
+
+  const newSigner: SignerConfig = {
+    id: `sig-${Date.now()}`,
+    name: name.trim(),
+    role: role.trim(),
+  };
+
+  db.signers.push(newSigner);
+  await saveDatabasePersistent(db);
+  broadcastSSE('settings_updated', { signers: db.signers });
+  res.json({ signer: newSigner });
+});
+
+app.put('/api/signers/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, role } = req.body;
+
+  const target = db.signers.find((s) => s.id === id);
+  if (!target) return res.status(404).json({ error: 'Không tìm thấy người ký' });
+
+  if (name) target.name = name.trim();
+  if (role) target.role = role.trim();
+
+  await saveDatabasePersistent(db);
+  broadcastSSE('settings_updated', { signers: db.signers });
+  res.json({ signer: target });
+});
+
+app.delete('/api/signers/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const idx = db.signers.findIndex((s) => s.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Không tìm thấy người ký' });
+
+  db.signers.splice(idx, 1);
+  await saveDatabasePersistent(db);
+  broadcastSSE('settings_updated', { signers: db.signers });
+  res.json({ success: true });
+});
+
+// Đọc cấu hình số bắt đầu theo khóa (mã sổ + năm áp dụng + mã loại văn bản)
+app.get('/api/settings/start-sequence', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const bookIdParam = typeof req.query.bookId === 'string' ? req.query.bookId : undefined;
+  const targetBook = findBookExplicitly(bookIdParam);
+  if (!targetBook) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản yêu cầu.' });
+  }
+
+  const canRead =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, targetBook.id, 'manage_book') ||
+    hasBookPermission(currentUser, targetBook.id, 'issue_number') ||
+    hasBookPermission(currentUser, targetBook.id, 'request_number') ||
+    hasBookPermission(currentUser, targetBook.id, 'view');
+  if (!canRead) {
+    return res.status(403).json({ error: 'Bạn không có quyền xem cấu hình số bắt đầu của sổ này.' });
+  }
+
+  const rawTypeCode = String(req.query.typeCode || '').trim();
+  const canonicalType =
+    targetBook.numberMode === 'shared'
+      ? 'SHARED'
+      : resolveCanonicalTypeCode(rawTypeCode, db.documentTypes);
+  if (!canonicalType) {
+    return res.status(400).json({ error: 'Thiếu mã loại văn bản.' });
+  }
+
+  const isSharedKey = canonicalType === 'SHARED' && targetBook.numberMode === 'shared';
+  if (!isSharedKey && !isTypeEnabledInBook(targetBook, canonicalType)) {
+    return res.status(400).json({
+      error: `Loại văn bản "${canonicalType}" chưa được bật sử dụng trong ${targetBook.name}.`,
+    });
+  }
+
+  const vietnamNow = getRequestVietnamTimeInfo(req);
+  const requestedYear = req.query.year ? parseInt(String(req.query.year), 10) : NaN;
+  const targetYear =
+    Number.isFinite(requestedYear) && requestedYear >= 2000 && requestedYear <= 2100
+      ? requestedYear
+      : vietnamNow.year;
+
+  const { sampleTypeCode: _, ...seriesState } = computeSeriesSequenceState(
+    targetBook,
+    targetYear,
+    canonicalType
+  );
+  res.json({
+    ...seriesState,
+    serverYear: vietnamNow.year,
+    persistenceStatus: getPersistenceStatus(),
+    legacyReconciliationWarnings: [...currentReconciliationWarnings],
+    verifiedFromPrimary: true,
+  });
+});
+
+// Cấu hình số bắt đầu tiếp theo theo sổ (Admin hoặc Quản trị sổ)
+app.post('/api/settings/start-sequence', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { year, typeCode, startSequence, bookId } = req.body || {};
+  const targetBook = findBookExplicitly(typeof bookId === 'string' ? bookId : undefined);
+  if (!targetBook) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản cần cấu hình.' });
+  }
+
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
+    return res.status(403).json({
+      error: 'Bạn cần quyền "Quản trị sổ" hoặc Quản trị viên để cấu hình số bắt đầu.',
+    });
+  }
+
+  const currentPersistence = getPersistenceStatus();
+  if (!currentPersistence.durable) {
+    return res.status(503).json({
+      code:
+        currentPersistence.connectionState === 'awaiting_migration'
+          ? 'STORAGE_AWAITING_INITIALIZATION'
+          : 'DURABLE_STORAGE_NOT_CONFIGURED',
+      persistenceStatus: currentPersistence,
+      error:
+        currentPersistence.errorDetail ||
+        'Máy chủ Vercel Production chưa sẵn sàng lưu trữ bền vững trên Upstash Redis. Đã chặn thao tác lưu để bảo vệ dữ liệu.',
+    });
+  }
+
+  const targetYear = parseInt(String(year), 10);
+  const nextSeq = parseInt(String(startSequence), 10);
+  const canonicalType =
+    targetBook.numberMode === 'shared'
+      ? 'SHARED'
+      : resolveCanonicalTypeCode(String(typeCode || ''), db.documentTypes);
+
+  if (
+    !Number.isFinite(targetYear) ||
+    targetYear < 2000 ||
+    targetYear > 2100 ||
+    !Number.isFinite(nextSeq) ||
+    nextSeq < 1 ||
+    !canonicalType
+  ) {
+    return res.status(400).json({ error: 'Năm áp dụng, loại văn bản hoặc số bắt đầu không hợp lệ.' });
+  }
+
+  const isSharedKey = canonicalType === 'SHARED' && targetBook.numberMode === 'shared';
+  if (!isSharedKey && !isTypeEnabledInBook(targetBook, canonicalType)) {
+    return res.status(400).json({
+      error: `Loại văn bản "${canonicalType}" chưa được bật sử dụng trong ${targetBook.name}.`,
+    });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    let verifiedBook: RegistryBook | undefined;
+    let persistenceAfter: PersistenceStatus | undefined;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await ensureLatestDb({ maxAgeMs: 0 });
+      const lockedBook = findBookExplicitly(targetBook.id);
+      if (!lockedBook) {
+        return res.status(404).json({ error: 'Không tìm thấy sổ văn bản cần cấu hình.' });
+      }
+
+      const beforeState = computeSeriesSequenceState(lockedBook, targetYear, canonicalType);
+      if (nextSeq <= beforeState.maxIssuedSequence) {
+        return res.status(400).json({
+          error: `Số bắt đầu (${nextSeq}) không được nhỏ hơn hoặc bằng số lớn nhất đã cấp/hủy trong dãy ${lockedBook.name} - ${targetYear} - ${canonicalType} (${beforeState.maxIssuedSequence}). Mức tối thiểu phải từ ${beforeState.minAllowedStartSequence} trở lên.`,
+        });
+      }
+
+      lockedBook.customStartSequences = {
+        ...(lockedBook.customStartSequences || {}),
+        [beforeState.storageKey]: nextSeq,
+      };
+      bumpBookVersion(lockedBook);
+      syncDefaultBookToLegacySettings(lockedBook);
+
+      try {
+        persistenceAfter = await saveDatabasePersistent(db, { verifyWrite: true });
+        await ensureLatestDb({ maxAgeMs: 0 });
+        verifiedBook = findBookExplicitly(lockedBook.id) || undefined;
+        break;
+      } catch (casErr: any) {
+        if (casErr instanceof StorageError && casErr.code === 'REVISION_CONFLICT' && attempt < 2) {
+          continue;
+        }
+        throw casErr;
+      }
+    }
+
+    if (!verifiedBook || !persistenceAfter) {
+      throw new Error('Không tìm thấy sổ văn bản khi đọc lại xác nhận từ nguồn dữ liệu chính.');
+    }
+
+    const { sampleTypeCode: _, ...afterState } = computeSeriesSequenceState(
+      verifiedBook,
+      targetYear,
+      canonicalType
+    );
+    if (!afterState.isConfigured || afterState.customStartSequence !== nextSeq) {
+      throw new Error('Dữ liệu đọc lại từ nguồn lưu trữ chính không khớp với mốc số vừa lưu.');
+    }
+
+    broadcastSSE('books_updated', {
+      bookId: verifiedBook.id,
+      configVersion: verifiedBook.configVersion,
+      updatedAt: verifiedBook.updatedAt,
+    });
+    broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
+
+    res.json({
+      success: true,
+      ...afterState,
+      verifiedFromPrimary: true,
+      persistenceStatus: persistenceAfter,
+      legacyReconciliationWarnings: [...currentReconciliationWarnings],
+      book: sanitizeBookForUser(verifiedBook, currentUser),
+    });
+  } catch (err: any) {
+    console.error('[StartSequence Save Error]:', sanitizeErrorForLog(err));
+    const statusCode = err?.statusCode || 503;
+    return res.status(statusCode).json({
+      code: err?.code || 'PRIMARY_PERSISTENCE_FAILED',
+      error: `Chưa xác nhận được lưu mốc số vào nguồn dữ liệu chính: ${sanitizeErrorForLog(err)}`,
+      persistenceStatus: getPersistenceStatus(),
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+function buildPreviewResponseForSeries(
+  book: RegistryBook,
+  targetYear: number,
+  typeCode: string,
+  vietnamNow: { year: number; formattedDate: string }
+): PreviewNumberResponse {
+  const seriesState = computeSeriesSequenceState(book, targetYear, typeCode);
+  return {
+    bookId: book.id,
+    bookCode: book.code,
+    typeCode: seriesState.typeCode,
+    seriesKey: seriesState.seriesKey,
+    storageKey: seriesState.storageKey,
+    previewNumber: seriesState.previewNumber,
+    sequenceNumber: seriesState.nextExpectedSeq,
+    year: targetYear,
+    serverYear: vietnamNow.year,
+    formattedDate: vietnamNow.formattedDate,
+    mode: book.numberMode,
+    customStartSequence: seriesState.customStartSequence,
+    maxIssuedSequence: seriesState.maxIssuedSequence,
+    configVersion: book.configVersion || 1,
+    serverTimeMs: Date.now(),
+    persistenceStatus: getPersistenceStatus(),
+  };
+}
+
+// 6. Tính toán số văn bản dự kiến theo sổ (Preview ONLY - Chưa lưu, chưa cấp)
+app.get('/api/documents/preview', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const book = findBookExplicitly(typeof req.query.bookId === 'string' ? req.query.bookId : undefined);
+  if (!book) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản.' });
+  }
+
+  const rawTypeCode = String(req.query.typeCode || '').trim();
+  const typeCode =
+    book.numberMode === 'shared' && rawTypeCode.toUpperCase() === 'SHARED'
+      ? 'SHARED'
+      : resolveCanonicalTypeCode(rawTypeCode, db.documentTypes);
+  if (!typeCode) {
+    return res.status(400).json({ error: 'Thiếu mã loại văn bản' });
+  }
+
+  const canPreview =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, book.id, 'request_number') ||
+    hasBookPermission(currentUser, book.id, 'issue_number') ||
+    hasBookPermission(currentUser, book.id, 'manage_book') ||
+    hasBookPermission(currentUser, book.id, 'view');
+  if (!canPreview) {
+    return res.status(403).json({ error: 'Bạn không có quyền truy cập sổ văn bản này.' });
+  }
+
+  const isSharedKey = typeCode === 'SHARED' && book.numberMode === 'shared';
+  if (!isSharedKey && !isTypeEnabledInBook(book, typeCode)) {
+    return res.status(400).json({
+      error: `Loại văn bản "${typeCode}" chưa được bật sử dụng trong ${book.name}.`,
+    });
+  }
+
+  const vietnamNow = getRequestVietnamTimeInfo(req);
+  const requestedYear = req.query.year ? parseInt(String(req.query.year), 10) : NaN;
+  const targetYear =
+    Number.isFinite(requestedYear) && requestedYear >= 2000 && requestedYear <= 2100
+      ? requestedYear
+      : vietnamNow.year;
+
+  res.json(buildPreviewResponseForSeries(book, targetYear, typeCode, vietnamNow));
+});
+
+// 6b. Kiểm tra trùng tên tệp trong sổ trước khi lưu lên Google Drive
+app.post('/api/documents/check-filename', requireAuth, (req, res) => {
+  const { fileName, excludeDocId, bookId } = req.body || {};
+  const targetBook = getBookById(bookId);
+  const cleanName = typeof fileName === 'string' ? fileName.trim() : '';
+  if (!cleanName) {
+    return res.json({ conflict: false, conflictingFileName: '', existingDocument: null });
+  }
+  const existing = findConflictingDocumentByDriveFileName(cleanName, excludeDocId, targetBook.id);
+  res.json({
+    conflict: Boolean(existing),
+    conflictingFileName: cleanName,
+    suggestedSuffixName: existing
+      ? resolveUniqueDriveFileName(cleanName, excludeDocId, targetBook.id)
+      : cleanName,
+    existingDocument: existing,
+  });
+});
+
+// 6c. Kiểm tra nghi trùng văn bản trong cùng sổ (SHA-256 + Cơ quan ban hành + Số/ký hiệu + Năm)
+app.post('/api/documents/check-duplicate', requireAuth, (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { bookId, fullDocNumber, issuingAgency, year, sha256, excludeDocId } = req.body || {};
+  const targetBook = getBookById(bookId);
+
+  if (
+    !isSystemAdmin(currentUser) &&
+    !hasBookPermission(currentUser, targetBook.id, 'import_incoming') &&
+    !hasBookPermission(currentUser, targetBook.id, 'view')
+  ) {
+    return res.status(403).json({ error: 'Bạn không có quyền kiểm tra trùng trên sổ này.' });
+  }
+
+  const exactDuplicate =
+    sha256 && typeof sha256 === 'string'
+      ? db.documents.find(
+          (d) =>
+            d.id !== excludeDocId &&
+            getDocBookId(d) === targetBook.id &&
+            d.fileSha256 === sha256 &&
+            d.status !== 'cancelled'
+        ) || null
+      : null;
+
+  const parsedYear = year ? parseInt(String(year), 10) : undefined;
+  const suspectedDuplicate = findSuspectedDuplicateDocument(
+    targetBook.id,
+    String(fullDocNumber || ''),
+    typeof issuingAgency === 'string' ? issuingAgency : '',
+    Number.isFinite(parsedYear) ? parsedYear : undefined,
+    excludeDocId || exactDuplicate?.id
+  );
+
+  res.json({
+    exactDuplicate,
+    suspectedDuplicate,
+  });
+});
+
+// 6d. YÊU CẦU XIN SỐ (Tách biệt hoàn toàn với Cấp số - Dành cho quyền "Xin số")
+app.get('/api/number-requests', requireAuth, (req, res) => {
+  const currentUser = (req as any).user as User;
+  const bookId = (req.query.bookId as string) || '';
+  const statusFilter = (req.query.status as string) || '';
+
+  let list = [...db.numberRequests];
+  if (bookId && bookId !== 'all') {
+    list = list.filter((r) => r.bookId === bookId);
+  }
+  if (statusFilter && statusFilter !== 'all') {
+    list = list.filter((r) => r.status === statusFilter);
+  }
+
+  if (!isSystemAdmin(currentUser)) {
+    list = list.filter(
+      (r) =>
+        r.requestedByUserId === currentUser.id ||
+        hasBookPermission(currentUser, r.bookId, 'issue_number') ||
+        hasBookPermission(currentUser, r.bookId, 'manage_book')
+    );
+  }
+
+  res.json({ requests: list });
+});
+
+app.post('/api/number-requests', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { bookId, bookCode, unit, typeCode, docName, title, signer, signerRole, notes } = req.body || {};
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const targetBook = findBookStrictly({ bookId, bookCode, unit });
+  if (!targetBook) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Thiếu hoặc sai sổ/đơn vị xin số (bookId/bookCode). Hệ thống không tự mặc định sang sổ khác.',
+    });
+  }
+
+  if (
+    !isSystemAdmin(currentUser) &&
+    !hasBookPermission(currentUser, targetBook.id, 'request_number') &&
+    !hasBookPermission(currentUser, targetBook.id, 'issue_number')
+  ) {
+    return res.status(403).json({
+      error: `Bạn chưa được phân quyền "Xin số" trong ${targetBook.name}.`,
+    });
+  }
+
+  const validDocName = (docName || '').trim();
+  if (!typeCode || !validDocName || !signer || !signerRole) {
+    return res.status(400).json({
+      error: 'Vui lòng điền đầy đủ: Loại văn bản, Tên văn bản, Người ký và Chức vụ để gửi yêu cầu xin số.',
+    });
+  }
+
+  if (!isTypeEnabledInBook(targetBook, typeCode)) {
+    return res.status(400).json({
+      error: `Loại văn bản "${typeCode}" chưa được kích hoạt trong ${targetBook.name}.`,
+    });
+  }
+
+  const docTypeConfig = db.documentTypes.find((t) => t.code.toUpperCase() === typeCode.toUpperCase());
+  const newReq: NumberRequest = {
+    id: `req-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+    bookId: targetBook.id,
+    bookName: targetBook.name,
+    typeCode: typeCode.trim().toUpperCase(),
+    typeName: docTypeConfig ? docTypeConfig.name : typeCode.trim().toUpperCase(),
+    docName: validDocName,
+    title: (title || '').trim(),
+    signer: signer.trim(),
+    signerRole: signerRole.trim(),
+    notes: typeof notes === 'string' ? notes.trim() : '',
+    requestedBy: currentUser.fullName,
+    requestedByUsername: currentUser.username,
+    requestedByUserId: currentUser.id,
+    requestedAt: new Date().toISOString(),
+    status: 'pending',
+  };
+
+  db.numberRequests.unshift(newReq);
+  await saveDatabasePersistent(db);
+  broadcastSSE('number_requests_updated', { bookId: targetBook.id, request: newReq });
+  res.json({ request: newReq, success: true });
+});
+
+app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const preReqItem = db.numberRequests.find((r) => r.id === id);
+  if (!preReqItem) {
+    return res.status(404).json({ error: 'Không tìm thấy yêu cầu xin số.' });
+  }
+
+  const preBook = findBookStrictly({ bookId: preReqItem.bookId });
+  if (!preBook) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Không xác định được sổ của yêu cầu xin số này.',
+    });
+  }
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, preBook.id, 'issue_number')) {
+    return res.status(403).json({
+      error: `Chỉ người có quyền "Cấp số" trong ${preBook.name} mới được duyệt và cấp số chính thức.`,
+    });
+  }
+
+  if (preReqItem.status !== 'pending') {
+    const existingDoc = preReqItem.issuedDocId
+      ? db.documents.find((d) => d.id === preReqItem.issuedDocId)
+      : undefined;
+    return res.status(409).json({
+      code: 'NUMBER_REQUEST_ALREADY_PROCESSED',
+      error: 'Yêu cầu xin số này đã được xử lý trước đó.',
+      ...(existingDoc ? { document: existingDoc } : {}),
+      request: preReqItem,
+    });
+  }
+
+  let issuedDocForSync: DocumentRecord | null = null;
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const reqItem = db.numberRequests.find((r) => r.id === id);
+    if (!reqItem) {
+      return res.status(404).json({ error: 'Không tìm thấy yêu cầu xin số.' });
+    }
+    if (reqItem.status !== 'pending') {
+      const existingDoc = reqItem.issuedDocId
+        ? db.documents.find((d) => d.id === reqItem.issuedDocId)
+        : undefined;
+      return res.status(409).json({
+        code: 'NUMBER_REQUEST_ALREADY_PROCESSED',
+        error: 'Yêu cầu xin số này vừa được duyệt/xử lý trước đó.',
+        ...(existingDoc ? { document: existingDoc } : {}),
+        request: reqItem,
+      });
+    }
+    const lockedBook = findBookStrictly({ bookId: reqItem.bookId });
+    if (!lockedBook) {
+      return res.status(400).json({
+        code: 'BOOK_NOT_FOUND',
+        error: 'Không xác định được sổ của yêu cầu xin số này.',
+      });
+    }
+    const { year, formattedDate } = getRequestVietnamTimeInfo(req);
+    const canonicalReqType = resolveCanonicalTypeCode(reqItem.typeCode, db.documentTypes);
+    const seriesState = computeSeriesSequenceState(lockedBook, year, canonicalReqType);
+    const nextSeq = seriesState.nextExpectedSeq;
+
+    const seqStr = formatSequenceNumber(nextSeq);
+    const fullDocNumber = renderFullDocNumber(
+      lockedBook.numberFormat,
+      seqStr,
+      canonicalReqType,
+      lockedBook.unitCode
+    );
+    const docId = `doc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const newDocument: DocumentRecord = {
+      id: docId,
+      bookId: lockedBook.id,
+      bookCode: lockedBook.code,
+      bookName: lockedBook.name,
+      requestId: reqItem.id,
+      stt: db.documents.length + 1,
+      year,
+      issueDate: formattedDate,
+      createdAt: new Date().toISOString(),
+      docCategory: 'outgoing',
+      typeCode: reqItem.typeCode,
+      typeName: reqItem.typeName,
+      sequenceNumber: nextSeq,
+      fullDocNumber,
+      docName: reqItem.docName,
+      title: reqItem.title,
+      signer: reqItem.signer,
+      signerRole: reqItem.signerRole,
+      issuedBy: reqItem.requestedBy,
+      issuedByUsername: reqItem.requestedByUsername,
+      issuedByUserId: reqItem.requestedByUserId,
+      status: 'active',
+      notes: reqItem.notes || '',
+      auditLogs: [],
+      syncStatus: getGoogleSheetsTargets(lockedBook).length > 0 ? 'pending' : 'not_configured',
+      idempotencyKey: `req-issue-${reqItem.id}`,
+      driveStatus: 'none',
+    };
+
+    recordDocumentHistoryEntry({
+      doc: newDocument,
+      book: lockedBook,
+      actor: {
+        id: reqItem.requestedByUserId,
+        username: reqItem.requestedByUsername,
+        fullName: reqItem.requestedBy,
+      },
+      action: 'request_number',
+      changes: {
+        docName: { old: null, new: reqItem.docName },
+      },
+      reason: `Gửi yêu cầu xin số vào ${lockedBook.name}`,
+      timestampIso: reqItem.requestedAt,
+    });
+    recordDocumentHistoryEntry({
+      doc: newDocument,
+      book: lockedBook,
+      actor: currentUser,
+      action: 'create',
+      changes: {
+        fullDocNumber: { old: null, new: fullDocNumber },
+        docName: { old: null, new: reqItem.docName },
+      },
+      reason: `Duyệt yêu cầu xin số của ${reqItem.requestedBy} và cấp số chính thức`,
+    });
+
+    reqItem.status = 'issued';
+    reqItem.issuedDocId = docId;
+    reqItem.issuedDocNumber = fullDocNumber;
+    reqItem.reviewedBy = currentUser.fullName;
+    reqItem.reviewedAt = new Date().toISOString();
+
+    db.documents.unshift(newDocument);
+    db.idempotencyKeys[newDocument.idempotencyKey] = docId;
+    await saveDatabasePersistent(db, { verifyWrite: true });
+
+    broadcastSSE('document_issued', { document: newDocument });
+    broadcastSSE('number_requests_updated', { bookId: lockedBook.id, request: reqItem });
+    issuedDocForSync = newDocument;
+    res.json({ document: newDocument, request: reqItem, success: true });
+  } finally {
+    releaseLock();
+  }
+
+  if (issuedDocForSync) {
+    const syncDoc = issuedDocForSync;
+    void syncToGoogleSheets(syncDoc, 'create')
+      .then((syncRes) => {
+        if (syncRes.attempted) {
+          broadcastSSE('document_updated', { document: syncDoc });
+        }
+      })
+      .catch((err) => {
+        console.error('Lỗi đồng bộ Google Sheets nền sau khi duyệt xin số:', err);
+      });
+  }
+});
+
+app.post('/api/number-requests/:id/reject', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { reason } = req.body || {};
+  const currentUser = (req as any).user as User;
+  const reqItem = db.numberRequests.find((r) => r.id === id);
+  if (!reqItem) {
+    return res.status(404).json({ error: 'Không tìm thấy yêu cầu xin số.' });
+  }
+
+  const targetBook = getBookById(reqItem.bookId);
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'issue_number')) {
+    return res.status(403).json({
+      error: 'Bạn cần quyền "Cấp số" để từ chối yêu cầu xin số này.',
+    });
+  }
+
+  if (reqItem.status !== 'pending') {
+    return res.status(400).json({ error: 'Yêu cầu này đã được xử lý trước đó.' });
+  }
+
+  reqItem.status = 'rejected';
+  reqItem.rejectReason = typeof reason === 'string' && reason.trim() ? reason.trim() : 'Không được duyệt';
+  reqItem.reviewedBy = currentUser.fullName;
+  reqItem.reviewedAt = new Date().toISOString();
+  await saveDatabasePersistent(db);
+  broadcastSSE('number_requests_updated', { bookId: targetBook.id, request: reqItem });
+  res.json({ request: reqItem, success: true });
+});
+
+// 6e. KIỂM TRA TRƯỚC KHI CẤP SỐ (Số dự kiến mới nhất, cảnh báo gần trùng tên, trùng SHA-256 tệp)
+app.post('/api/documents/pre-issue-check', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const { bookId, typeCode, docName, title, fileSha256 } = req.body || {};
+  const targetBook = findBookExplicitly(typeof bookId === 'string' ? bookId : undefined);
+  if (!targetBook) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản.' });
+  }
+
+  const canAccess =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, targetBook.id, 'issue_number') ||
+    hasBookPermission(currentUser, targetBook.id, 'request_number');
+  if (!canAccess) {
+    return res.status(403).json({
+      error: `Bạn chưa được phân quyền cấp số hoặc xin số trong ${targetBook.name}.`,
+    });
+  }
+
+  const canonicalType = resolveCanonicalTypeCode(String(typeCode || ''), db.documentTypes);
+  if (!canonicalType || !isTypeEnabledInBook(targetBook, canonicalType)) {
+    return res.status(400).json({
+      error: `Loại văn bản "${canonicalType || ''}" chưa được bật trong ${targetBook.name}.`,
+    });
+  }
+
+  const vnNow = getRequestVietnamTimeInfo(req);
+  const seriesState = computeSeriesSequenceState(targetBook, vnNow.year, canonicalType);
+  const canViewBook = isSystemAdmin(currentUser) || hasBookPermission(currentUser, targetBook.id, 'view');
+
+  const nearMatches = findNearDuplicateDocuments(
+    targetBook.id,
+    typeof docName === 'string' ? docName : '',
+    typeof title === 'string' ? title : ''
+  );
+
+  const cleanSha = typeof fileSha256 === 'string' ? fileSha256.trim().toLowerCase() : '';
+  const sameFileMatches = cleanSha
+    ? db.documents.filter((d) => {
+        if (d.status === 'cancelled' || d.status === 'deleted') return false;
+        if (getDocBookId(d) !== targetBook.id) return false;
+        if ((d.fileSha256 || '').toLowerCase() === cleanSha) return true;
+        return getEffectiveAttachments(d).some((a) => (a.sha256 || '').toLowerCase() === cleanSha);
+      })
+    : [];
+
+  const result: PreIssueCheckResult = {
+    bookId: targetBook.id,
+    bookName: targetBook.name,
+    year: vnNow.year,
+    formattedDate: vnNow.formattedDate,
+    previewNumber: seriesState.previewNumber,
+    sequenceNumber: seriesState.nextExpectedSeq,
+    nearDuplicateDocs: nearMatches.map((d) => ({
+      id: d.id,
+      fullDocNumber: d.fullDocNumber,
+      docName: d.docName || d.title,
+      issueDate: d.issueDate,
+      signer: d.signer,
+      status: d.status,
+      canView: canViewBook,
+    })),
+    sameFileDocs: sameFileMatches.slice(0, 5).map((d) => ({
+      id: d.id,
+      fullDocNumber: d.fullDocNumber,
+      docName: d.docName || d.title,
+      issueDate: d.issueDate,
+      driveFileName: d.driveFileName,
+      status: d.status,
+      canView: canViewBook,
+    })),
+  };
+
+  res.json(result);
+});
+
+// 7. CẤP SỐ CHÍNH THỨC VÀ LƯU (Atomic Transaction with Mutex & Idempotency Key - Yêu cầu quyền "Cấp số")
+app.post('/api/documents/issue', requireAuth, async (req, res) => {
+  const {
+    bookId,
+    typeCode,
+    docName,
+    title,
+    signer,
+    signerRole,
+    notes,
+    idempotencyKey,
+    hasAttachment,
+    attachmentName,
+    attachmentSize,
+    fileSha256,
+    conflictAction,
+    customFileName,
+    expectedYear,
+    expectedNextSeq,
+    confirmUpdatedSequence,
+    templateId,
+    templateCustomValues,
+  } = req.body;
+  const currentUser = (req as any).user as User;
+
+  const validDocName = (docName || '').trim();
+  if (!typeCode || !validDocName || !signer || !signerRole) {
+    return res.status(400).json({ error: 'Vui lòng điền đầy đủ: Loại văn bản, Tên văn bản (bắt buộc), Người ký và Chức vụ' });
+  }
+
+  if (!idempotencyKey) {
+    return res.status(400).json({ error: 'Thiếu mã chống lặp (idempotency key)' });
+  }
+
+  // Khóa giao dịch nguyên tử tại máy chủ - ngăn chặn 100% việc trùng số khi nhiều người cùng bấm
+  const issueStartMs = Date.now();
+  let issuedDocForPostActions: DocumentRecord | null = null;
+  let issuedBookForPostActions: RegistryBook | null = null;
+  let issuedActorForPostActions: User | null = null;
+  let selectedTemplateForPost: WordTemplate | null = null;
+  let issuedNextPreview: PreviewNumberResponse | null = null;
+
+  const releaseLock = await atomicLock.acquire();
+
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+
+    const targetBook = findBookStrictly({
+      bookId: typeof bookId === 'string' ? bookId : undefined,
+      bookCode: typeof req.body?.bookCode === 'string' ? req.body.bookCode : undefined,
+      unit: typeof req.body?.unit === 'string' ? req.body.unit : undefined,
+    });
+    if (!targetBook) {
+      return res.status(400).json({
+        error: 'Thiếu hoặc sai mã sổ/đơn vị (bookId/bookCode). Hệ thống không tự mặc định sang Đoàn trường.',
+      });
+    }
+    const freshUser = db.users.find((u) => u.id === currentUser.id);
+    if (!freshUser || !freshUser.isActive) {
+      return res.status(401).json({ error: 'Tài khoản không còn hiệu lực' });
+    }
+    const latestActor = toSafeUser(freshUser);
+
+    if (!isSystemAdmin(latestActor) && !hasBookPermission(latestActor, targetBook.id, 'issue_number')) {
+      return res.status(403).json({
+        error: `Tài khoản của bạn không có quyền "Cấp số" trong ${targetBook.name}. Vui lòng dùng chức năng "Xin số" hoặc liên hệ Quản trị viên.`,
+      });
+    }
+
+    const preCanonicalType = resolveCanonicalTypeCode(String(typeCode || ''), db.documentTypes);
+    if (!isTypeEnabledInBook(targetBook, preCanonicalType)) {
+      return res.status(400).json({
+        error: `Loại văn bản "${preCanonicalType}" chưa được bật sử dụng trong ${targetBook.name}.`,
+      });
+    }
+
+    // 1. Kiểm tra mã chống lặp trước mọi kiểm tra số để retry mạng luôn trả về đúng bản ghi đã tạo
+    if (db.idempotencyKeys[idempotencyKey]) {
+      const existingDocId = db.idempotencyKeys[idempotencyKey];
+      const existingDoc = db.documents.find((d) => d.id === existingDocId);
+      if (existingDoc) {
+        const vnNow = getRequestVietnamTimeInfo(req);
+        const existingBook = getBookById(getDocBookId(existingDoc));
+        const existingCanonType = resolveCanonicalTypeCode(existingDoc.typeCode, db.documentTypes);
+        const nextPreview = buildPreviewResponseForSeries(
+          existingBook,
+          existingDoc.year || vnNow.year,
+          existingCanonType,
+          vnNow
+        );
+        return res.json({
+          document: existingDoc,
+          nextPreview,
+          duplicatePrevented: true,
+          message: 'Yêu cầu đã được xử lý trước đó (đã chống gửi lặp)',
+        });
+      }
+    }
+
+    if (templateId && typeof templateId === 'string') {
+      const tpl = (db.wordTemplates || []).find((t) => t.id === templateId && t.bookId === targetBook.id);
+      if (!tpl) {
+        return res.status(400).json({ error: 'Mẫu Word đã chọn không còn tồn tại trong sổ này.' });
+      }
+      selectedTemplateForPost = tpl;
+    }
+
+    // Kiểm tra tệp và cấu hình Drive nếu có đính kèm thủ công
+    let attachmentExt: '.doc' | '.docx' | null = null;
+    if (hasAttachment) {
+      attachmentExt = getWordFileExtension(String(attachmentName || ''));
+      if (!attachmentExt) {
+        return res.status(400).json({
+          error: 'Định dạng tệp đính kèm không hợp lệ. Chỉ chấp nhận tệp Word (.doc hoặc .docx).',
+        });
+      }
+      const sizeNum = Number(attachmentSize);
+      if (!Number.isFinite(sizeNum) || sizeNum <= 0) {
+        return res.status(400).json({
+          error: 'Tệp Word đính kèm không hợp lệ hoặc bị rỗng.',
+        });
+      }
+      if (sizeNum > getMaxWordFileSizeBytes()) {
+        return res.status(400).json({
+          error: `Dung lượng tệp vượt quá giới hạn tối đa ${getMaxWordFileSizeMB()} MB.`,
+        });
+      }
+      const driveCfg = resolveDriveForBook(targetBook);
+      if (!driveCfg.isConfigured) {
+        return res.status(400).json({
+          error: `${driveCfg.missingReason || 'Chưa cấu hình thư mục Google Drive hợp lệ cho sổ này.'} Vui lòng bỏ chọn tệp để tiếp tục cấp số hoặc liên hệ Quản trị viên.`,
+        });
+      }
+    }
+
+    // 2. Tính toán năm và ngày theo giờ Việt Nam (Asia/Ho_Chi_Minh)
+    const vietnamNow = getRequestVietnamTimeInfo(req);
+    const { year, formattedDate } = vietnamNow;
+
+    // 3. Kiểm tra loại văn bản hợp lệ theo mã ổn định từ danh mục
+    const canonicalTypeCode = resolveCanonicalTypeCode(typeCode, db.documentTypes);
+    const docTypeConfig = db.documentTypes.find(
+      (t) => t.code.trim().toUpperCase() === canonicalTypeCode
+    );
+    const typeName = docTypeConfig ? docTypeConfig.name : canonicalTypeCode;
+
+    // 4. Cấp số thứ tự nguyên tử trong phạm vi sổ mục tiêu (dùng chung logic với Cài đặt & Preview)
+    const seriesState = computeSeriesSequenceState(targetBook, year, canonicalTypeCode);
+    const nextSeq = seriesState.nextExpectedSeq;
+
+    const seqStr = formatSequenceNumber(nextSeq);
+    const fullDocNumber = renderFullDocNumber(
+      targetBook.numberFormat,
+      seqStr,
+      canonicalTypeCode,
+      targetBook.unitCode
+    );
+
+    // Nếu người dùng mở biểu mẫu từ năm cũ và đồng hồ vừa chuyển sang năm mới (00:00 01/01 Asia/Ho_Chi_Minh),
+    // yêu cầu người dùng xác nhận lại trước khi ghi nhận vào dãy số năm mới (vẫn giữ nguyên dữ liệu đã nhập).
+    const parsedExpectedYear =
+      expectedYear !== undefined && expectedYear !== null && expectedYear !== ''
+        ? parseInt(String(expectedYear), 10)
+        : NaN;
+    if (Number.isFinite(parsedExpectedYear) && parsedExpectedYear !== year) {
+      return res.status(409).json({
+        code: 'YEAR_CHANGED',
+        previousYear: parsedExpectedYear,
+        currentYear: year,
+        formattedDate,
+        previewNumber: fullDocNumber,
+        sequenceNumber: nextSeq,
+        error: `Hệ thống đã bước sang năm mới ${year} (giờ Việt Nam). Số dự kiến mới là ${fullDocNumber}. Vui lòng xác nhận lại trước khi cấp số.`,
+      });
+    }
+
+    // Nếu số thực tế trên nguồn dữ liệu chính vừa thay đổi so với số dự kiến người dùng đang thấy,
+    // trả về số mới nhất để người dùng xác nhận trước khi cấp (tránh cấp nhầm số ngoài dự kiến).
+    if (
+      !confirmUpdatedSequence &&
+      expectedNextSeq !== undefined &&
+      expectedNextSeq !== null &&
+      expectedNextSeq !== ''
+    ) {
+      const parsedExpectedSeq = Number(expectedNextSeq);
+      if (Number.isFinite(parsedExpectedSeq) && parsedExpectedSeq !== nextSeq) {
+        return res.status(409).json({
+          code: 'SEQUENCE_CHANGED',
+          expectedNextSeq: parsedExpectedSeq,
+          currentNextSeq: nextSeq,
+          sequenceNumber: nextSeq,
+          previewNumber: fullDocNumber,
+          formattedDate,
+          error: `Số dự kiến vừa thay đổi từ ${formatSequenceNumber(parsedExpectedSeq)} sang ${fullDocNumber} (do có văn bản mới được cấp hoặc mốc số vừa cập nhật). Vui lòng xác nhận số mới trước khi cấp.`,
+        });
+      }
+    }
+
+    // 4b. Nếu có tệp Word đính kèm, luôn tính lại tên tệp chuẩn theo SỐ CHÍNH THỨC vừa cấp
+    let resolvedDriveFileName: string | undefined;
+    if (hasAttachment && attachmentExt) {
+      let targetFileName = buildStandardDriveFileName(fullDocNumber, validDocName, attachmentExt);
+      if (typeof customFileName === 'string' && customFileName.trim()) {
+        const cleanCustom = sanitizeCustomDriveFileName(customFileName, attachmentExt);
+        const prefixOfficial = fullDocNumber.replace(/\//g, '.');
+        if (cleanCustom.startsWith(prefixOfficial)) {
+          targetFileName = cleanCustom;
+        }
+      }
+
+      const conflictDoc = findConflictingDocumentByDriveFileName(targetFileName, undefined, targetBook.id);
+      if (conflictDoc) {
+        if (conflictAction === 'suffix') {
+          targetFileName = resolveUniqueDriveFileName(targetFileName, undefined, targetBook.id);
+        } else if (conflictAction !== 'overwrite') {
+          return res.status(409).json({
+            code: 'FILENAME_CONFLICT',
+            error: `Tên tệp "${targetFileName}" đã trùng với hồ sơ ${conflictDoc.fullDocNumber} (${conflictDoc.docName || conflictDoc.title}). Vui lòng chọn cách xử lý trước khi cấp số.`,
+            conflictingFileName: targetFileName,
+            suggestedSuffixName: resolveUniqueDriveFileName(targetFileName, undefined, targetBook.id),
+            existingDocument: conflictDoc,
+            officialDocNumberPreview: fullDocNumber,
+          });
+        }
+      }
+      resolvedDriveFileName = targetFileName;
+    } else if (selectedTemplateForPost) {
+      resolvedDriveFileName = buildStandardDriveFileName(fullDocNumber, validDocName, '.docx');
+    }
+
+    const docId = `doc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const globalStt = db.documents.length + 1;
+    const finalTitle = (title || '').trim();
+
+    const newDocument: DocumentRecord = {
+      id: docId,
+      bookId: targetBook.id,
+      bookCode: targetBook.code,
+      bookName: targetBook.name,
+      stt: globalStt,
+      year,
+      issueDate: formattedDate,
+      createdAt: new Date().toISOString(),
+      docCategory: 'outgoing',
+      typeCode: canonicalTypeCode,
+      typeName,
+      sequenceNumber: nextSeq,
+      fullDocNumber,
+      docName: validDocName,
+      title: finalTitle,
+      signer: signer.trim(),
+      signerRole: signerRole.trim(),
+      issuedBy: latestActor.fullName,
+      issuedByUsername: latestActor.username,
+      issuedByUserId: latestActor.id,
+      status: 'active',
+      notes: notes ? notes.trim() : '',
+      auditLogs: [],
+      syncStatus: getGoogleSheetsTargets(targetBook).length > 0 ? 'pending' : 'not_configured',
+      idempotencyKey,
+      driveStatus: hasAttachment || selectedTemplateForPost ? 'uploading' : 'none',
+      driveUploadStartedAt:
+        hasAttachment || selectedTemplateForPost ? new Date().toISOString() : undefined,
+      driveFileName: resolvedDriveFileName,
+      driveOriginalFileName: hasAttachment ? String(attachmentName || '') : undefined,
+      driveFileSize: hasAttachment ? Number(attachmentSize) : undefined,
+      fileSha256: typeof fileSha256 === 'string' && fileSha256.trim() ? fileSha256.trim() : undefined,
+      templateId: selectedTemplateForPost?.id,
+      wordGenerationStatus: selectedTemplateForPost ? 'none' : undefined,
+    };
+
+    recordDocumentHistoryEntry({
+      doc: newDocument,
+      book: targetBook,
+      actor: latestActor,
+      action: 'create',
+      changes: {
+        bookCode: { old: null, new: targetBook.code },
+        bookName: { old: null, new: targetBook.name },
+        fullDocNumber: { old: null, new: fullDocNumber },
+        docName: { old: null, new: validDocName },
+        title: { old: null, new: finalTitle },
+        signer: { old: null, new: signer.trim() },
+      },
+    });
+
+    // Lưu vào database (không bao giờ ghi đè customStartSequences)
+    db.documents.unshift(newDocument);
+    db.idempotencyKeys[idempotencyKey] = docId;
+
+    await saveDatabasePersistent(db, { verifyWrite: true });
+
+    const nextPreview = buildPreviewResponseForSeries(
+      targetBook,
+      year,
+      canonicalTypeCode,
+      vietnamNow
+    );
+
+    issuedDocForPostActions = newDocument;
+    issuedBookForPostActions = targetBook;
+    issuedActorForPostActions = latestActor;
+    issuedNextPreview = nextPreview;
+  } catch (err: any) {
+    // Roll back uncommitted in-memory document mutation if persistence failed
+    db.documents = db.documents.filter((d) => d.idempotencyKey !== idempotencyKey);
+    if (db.idempotencyKeys && db.idempotencyKeys[idempotencyKey]) {
+      delete db.idempotencyKeys[idempotencyKey];
+    }
+    console.error('Lỗi khi cấp số:', sanitizeErrorForLog(err));
+    if (!res.headersSent) {
+      const statusCode = err?.statusCode || 500;
+      res.status(statusCode).json({
+        ...(err?.code ? { code: err.code } : {}),
+        persistenceStatus: getPersistenceStatus(),
+        error:
+          err instanceof StorageError
+            ? err.message
+            : 'Lỗi máy chủ khi cấp số: ' + sanitizeErrorForLog(err),
+      });
+    }
+  } finally {
+    releaseLock();
+  }
+
+  if (issuedDocForPostActions && issuedBookForPostActions && issuedActorForPostActions) {
+    const issueMs = Date.now() - issueStartMs;
+    const issuedDoc = issuedDocForPostActions;
+    const issuedBook = issuedBookForPostActions;
+    const issuedActor = issuedActorForPostActions;
+
+    broadcastSSE('document_issued', {
+      document: issuedDoc,
+      nextPreview: issuedNextPreview,
+    });
+
+    // Tách hoàn toàn bước tạo tệp Word từ mẫu + lưu Google Drive ra khỏi phản hồi cấp số (trên serverless đợi hoàn tất để không bỏ rơi trạng thái 'uploading')
+    let finalIssuedDoc = issuedDoc;
+    if (selectedTemplateForPost && !hasAttachment) {
+      const tplForBg = selectedTemplateForPost;
+      const runTemplateBg = async (): Promise<DocumentRecord> => {
+        try {
+          const genRes = await generateAndUploadWordFromTemplate({
+            doc: issuedDoc,
+            book: issuedBook,
+            template: tplForBg,
+            actor: issuedActor,
+            customValues: templateCustomValues,
+            isRetry: false,
+          });
+          const latest = genRes.document || db.documents.find((d) => d.id === issuedDoc.id) || issuedDoc;
+          broadcastSSE('document_updated', { document: latest });
+          if (genRes.ok) {
+            void syncToGoogleSheets(latest, 'update').catch(() => {});
+          }
+          return latest;
+        } catch (tplErr: any) {
+          const errMsg = tplErr?.message || 'Không thể tạo văn bản từ mẫu Word đã chọn.';
+          const updated = await mutateDocumentInDb(
+            issuedDoc.id,
+            (liveDoc) => {
+              if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) {
+                return false;
+              }
+              liveDoc.wordGenerationStatus = 'failed';
+              liveDoc.wordGenerationError = errMsg;
+              liveDoc.driveStatus = 'failed';
+              liveDoc.driveError = errMsg;
+              delete liveDoc.driveUploadStartedAt;
+              return true;
+            },
+            { verifyWrite: true }
+          ).catch(() => null);
+          const latest = updated || issuedDoc;
+          broadcastSSE('document_updated', { document: latest });
+          return latest;
+        }
+      };
+
+      const bgPromise = runTemplateBg().finally(() => {
+        if (inFlightDocUploads.get(issuedDoc.id) === bgPromise) {
+          inFlightDocUploads.delete(issuedDoc.id);
+        }
+      });
+      inFlightDocUploads.set(issuedDoc.id, bgPromise);
+      if (IS_SERVERLESS) {
+        finalIssuedDoc = await bgPromise;
+      }
+    }
+
+    if (!res.headersSent) {
+      res.json({
+        document: finalIssuedDoc,
+        nextPreview: issuedNextPreview,
+        success: true,
+        timings: { issueMs },
+      });
+    }
+
+    void syncToGoogleSheets(finalIssuedDoc, 'create')
+      .then((syncRes) => {
+        if (syncRes.attempted) {
+          const liveAfterSync = db.documents.find((d) => d.id === finalIssuedDoc.id) || finalIssuedDoc;
+          broadcastSSE('document_updated', { document: liveAfterSync });
+        }
+      })
+      .catch((err) => {
+        console.error('Lỗi đồng bộ Google Sheets nền sau khi cấp số:', err);
+      });
+  }
+});
+
+// 7a2. THỬ TẠO LẠI WORD TỪ MẪU & LƯU LÊN DRIVE (Không cấp lại số)
+app.post('/api/documents/:id/retry-word-drive', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+  await ensureLatestDb({ maxAgeMs: 0 });
+
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) {
+    return res.status(404).json({ error: 'Không tìm thấy hồ sơ văn bản.' });
+  }
+  const book = resolveStrictBookForDocument(doc);
+  if (!book) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản này. Hệ thống từ chối tự động mặc định sang đơn vị khác.',
+    });
+  }
+  const canRetry =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, book.id, 'issue_number') ||
+    hasBookPermission(currentUser, book.id, 'replace_file') ||
+    (hasBookPermission(currentUser, book.id, 'edit') && doc.issuedByUserId === currentUser.id);
+  if (!canRetry) {
+    return res.status(403).json({ error: `Bạn không có quyền thử tạo/lưu lại tệp Word trong ${book.name}.` });
+  }
+
+  // Nếu tiến trình tạo Word từ mẫu đang chạy nền cho chính hồ sơ này, chờ hoàn tất để không tạo trùng tệp
+  const pending = inFlightDocUploads.get(doc.id);
+  if (pending) {
+    try {
+      const finished = await pending;
+      if (finished.driveStatus === 'saved' && finished.driveFileId && finished.driveFileUrl) {
+        return res.json({ success: true, document: finished, deduplicated: true });
+      }
+    } catch {
+      // fall through to explicit retry below
+    }
+  }
+
+  if (doc.driveStatus === 'saved' && doc.driveFileId && doc.driveFileUrl) {
+    return res.json({ success: true, document: doc, deduplicated: true });
+  }
+
+  // Trước khi tạo và tải lại: đối soát xem tệp của hồ sơ này đã tồn tại trên Drive theo mã bản ghi chưa
+  if (doc.driveStatus === 'uploading' || doc.driveStatus === 'failed' || doc.driveStatus === 'needs_reconcile') {
+    const existingCheck = await reconcileSingleDocumentDriveStatus(doc.id, {
+      actor: currentUser,
+      forceCheck: true,
+      allowNotFoundTransitionToFailed: false,
+      auditReason: 'Đối soát tệp Word đã tồn tại trên Google Drive trước khi thử lưu lại',
+    });
+    if (existingCheck.outcome === 'verified_saved' && existingCheck.document) {
+      return res.json({
+        success: true,
+        document: existingCheck.document,
+        deduplicated: true,
+      });
+    }
+  }
+
+  const tplId = (req.body?.templateId as string) || doc.templateId;
+  const template = (db.wordTemplates || []).find((t) => t.id === tplId && t.bookId === book.id);
+  if (!template) {
+    return res.status(404).json({ error: 'Không tìm thấy mẫu Word gắn với văn bản này.' });
+  }
+
+  let genError: string | undefined;
+  let driveUploadedUnpersisted = false;
+  const task = (async (): Promise<DocumentRecord> => {
+    const resGen = await generateAndUploadWordFromTemplate({
+      doc,
+      book,
+      template,
+      actor: currentUser,
+      isRetry: true,
+    });
+    genError = resGen.error;
+    driveUploadedUnpersisted = Boolean(resGen.driveUploadedUnpersisted);
+    const latest = resGen.document || db.documents.find((d) => d.id === doc.id) || doc;
+    broadcastSSE('document_updated', { document: latest });
+    if (resGen.ok) {
+      void syncToGoogleSheets(latest, 'update').catch(() => {});
+    }
+    return latest;
+  })();
+
+  inFlightDocUploads.set(doc.id, task);
+  try {
+    const updated = await task;
+    if (updated.driveStatus === 'saved' && updated.driveFileId && updated.driveFileUrl && !driveUploadedUnpersisted) {
+      return res.json({ success: true, document: updated });
+    }
+    return res.status(driveUploadedUnpersisted ? 503 : 502).json({
+      success: false,
+      driveUploadedUnpersisted,
+      document: updated,
+      error: genError || updated.driveError || 'Chưa lưu được tệp Word lên Google Drive.',
+    });
+  } finally {
+    if (inFlightDocUploads.get(doc.id) === task) {
+      inFlightDocUploads.delete(doc.id);
+    }
+  }
+});
+
+// 7b. TẢI LÊN / THỬ LƯU LẠI / THAY TỆP WORD ĐÍNH KÈM VÀO GOOGLE DRIVE CHO VĂN BẢN ĐÃ CẤP SỐ
+app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, async (req, res) => {
+  const uploadStartMs = Date.now();
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+  const file = req.file;
+  const requestedFileName = typeof req.body?.fileName === 'string' ? req.body.fileName.trim() : '';
+  const rawMode = req.body?.mode;
+  const mode: 'initial' | 'retry' | 'replace' =
+    rawMode === 'replace' ? 'replace' : rawMode === 'initial' ? 'initial' : 'retry';
+
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) {
+    return res.status(404).json({ error: 'Không tìm thấy bản ghi văn bản để gắn tệp Word.' });
+  }
+
+  const targetBook = resolveStrictBookForDocument(doc);
+  if (!targetBook) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản này. Hệ thống từ chối tự động mặc định sang đơn vị khác.',
+    });
+  }
+
+  if (doc.status === 'cancelled' || doc.status === 'deleted') {
+    return res.status(400).json({
+      error:
+        doc.status === 'deleted'
+          ? 'Văn bản này đã bị xóa, không thể đính kèm hoặc thay tệp Word.'
+          : 'Văn bản này đã bị hủy, không thể đính kèm hoặc thay tệp Word.',
+    });
+  }
+
+  const canAttach =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, targetBook.id, 'replace_file') ||
+    hasBookPermission(currentUser, targetBook.id, 'issue_number') ||
+    (hasBookPermission(currentUser, targetBook.id, 'edit') && doc.issuedByUserId === currentUser.id);
+
+  const alreadySavedOnDrive = doc.driveStatus === 'saved' && Boolean(doc.driveFileId && doc.driveFileUrl);
+  if (mode !== 'replace' && alreadySavedOnDrive) {
+    if (!canAttach) {
+      return res.status(403).json({
+        error: `Bạn không có quyền tải tệp Word cho văn bản trong ${targetBook.name}.`,
+      });
+    }
+    return res.json({
+      document: doc,
+      deduplicated: true,
+      success: true,
+      message: 'Tệp đã được lưu trên Google Drive trước đó.',
+      timings: { driveUploadMs: 0 },
+    });
+  }
+
+  const isReplacing = mode === 'replace' && alreadySavedOnDrive;
+  if (mode === 'replace' || alreadySavedOnDrive) {
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'replace_file')) {
+      return res.status(403).json({
+        error: `Bạn cần quyền "Thay tệp" trong ${targetBook.name} để thay thế tệp trên Google Drive.`,
+      });
+    }
+  } else if (!canAttach) {
+    return res.status(403).json({
+      error: `Bạn không có quyền tải tệp Word cho văn bản trong ${targetBook.name}.`,
+    });
+  }
+
+  if (!file) {
+    return res.status(400).json({
+      error: 'Vui lòng chọn tệp Word (.doc hoặc .docx) để tải lên.',
+    });
+  }
+
+  const validation = validateWordFileBuffer(file.originalname, file.mimetype, file.buffer);
+  if (!validation.valid) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  // Nếu đang có tiến trình tải lên cho chính bản ghi này, đợi kết quả để tránh tạo bản sao
+  const pendingUpload = inFlightDocUploads.get(doc.id);
+  if (pendingUpload) {
+    try {
+      const finishedDoc = await pendingUpload;
+      return res.json({
+        document: finishedDoc,
+        deduplicated: true,
+        success: true,
+        message: 'Yêu cầu tải tệp trước đó đã hoàn tất.',
+        timings: { driveUploadMs: Date.now() - uploadStartMs },
+      });
+    } catch (err: any) {
+      const latestDoc = db.documents.find((d) => d.id === doc.id) || doc;
+      return res.status(err?.driveUploadedUnpersisted ? 503 : 502).json({
+        error: `Đã cấp số ${latestDoc.fullDocNumber}, chưa lưu được tệp Word: ${err.message}`,
+        document: latestDoc,
+        ...(err?.driveUploadedUnpersisted ? { driveUploadedUnpersisted: true } : {}),
+      });
+    }
+  }
+
+  // Nếu bản ghi đang ở trạng thái dở dang/lỗi/cần đối soát và không phải thao tác thay tệp,
+  // đối soát trước trên Drive theo fileId / mã bản ghi (KHÔNG theo tên tệp) để không tạo tệp trùng lặp.
+  if (
+    !isReplacing &&
+    (mode === 'retry' || doc.driveStatus === 'failed' || doc.driveStatus === 'needs_reconcile')
+  ) {
+    const preCheck = await reconcileSingleDocumentDriveStatus(doc.id, {
+      actor: currentUser,
+      forceCheck: true,
+      allowNotFoundTransitionToFailed: false,
+      auditReason: 'Đối soát tệp Word đã tồn tại trên Google Drive trước khi thử tải lại',
+    });
+    if (preCheck.outcome === 'verified_saved' && preCheck.document) {
+      return res.json({
+        document: preCheck.document,
+        deduplicated: true,
+        success: true,
+        message: 'Đã xác nhận tệp Word đã tồn tại trên Google Drive.',
+        timings: { driveUploadMs: Date.now() - uploadStartMs },
+      });
+    }
+  }
+
+  const prevFileName = doc.driveFileName || null;
+  const prevFileId = doc.driveFileId || null;
+  const isRetryUpload =
+    !isReplacing &&
+    (mode === 'retry' || doc.driveStatus === 'failed' || doc.driveStatus === 'needs_reconcile');
+  const targetOverrideName =
+    requestedFileName
+      ? sanitizeCustomDriveFileName(requestedFileName, validation.extension!)
+      : buildStandardDriveFileName(doc.fullDocNumber, doc.docName || doc.title, validation.extension!);
+
+  const uploadTask = (async (): Promise<DocumentRecord> => {
+    const driveCfg = resolveDriveForBook(targetBook);
+    if (!driveCfg.isConfigured) {
+      const errMsg = driveCfg.missingReason || 'Thư mục Google Drive chưa được cấu hình hợp lệ.';
+      if (!isReplacing) {
+        const failedDoc = await mutateDocumentInDb(
+          doc.id,
+          (liveDoc) => {
+            if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) {
+              return false;
+            }
+            liveDoc.driveStatus = 'failed';
+            liveDoc.driveFileName = targetOverrideName;
+            liveDoc.driveOriginalFileName = file.originalname;
+            liveDoc.driveFileSize = file.size;
+            liveDoc.driveError = errMsg;
+            delete liveDoc.driveUploadStartedAt;
+            return true;
+          },
+          { verifyWrite: true }
+        ).catch(() => null);
+        if (failedDoc) {
+          broadcastSSE('document_updated', { document: failedDoc });
+        }
+      }
+      throw new Error(errMsg);
+    }
+
+    if (!isReplacing) {
+      const uploadingStartedIso = new Date().toISOString();
+      await mutateDocumentInDb(
+        doc.id,
+        (liveDoc) => {
+          if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) {
+            return false;
+          }
+          liveDoc.driveStatus = 'uploading';
+          liveDoc.driveUploadStartedAt = uploadingStartedIso;
+          liveDoc.driveFileName = targetOverrideName;
+          liveDoc.driveOriginalFileName = file.originalname;
+          liveDoc.driveFileSize = file.size;
+          delete liveDoc.driveError;
+          delete liveDoc.driveReconcileNote;
+          return true;
+        },
+        { verifyWrite: false }
+      );
+    }
+
+    let uploadResult: DriveUploadResult;
+    try {
+      uploadResult = await uploadDocumentWithFolderCache({
+        driveCfg,
+        book: targetBook,
+        doc,
+        docCategoryOverride: doc.docCategory || 'outgoing',
+        originalFileName: file.originalname,
+        mimeType: validation.normalizedMimeType || file.mimetype,
+        buffer: file.buffer,
+        overrideFileName: targetOverrideName,
+        replaceMode: isReplacing,
+        isRetry: isRetryUpload,
+        previousFileId: isReplacing ? prevFileId || undefined : undefined,
+      });
+      if (!uploadResult?.fileId || !uploadResult.fileId.trim()) {
+        throw new Error('Google Drive không trả về mã tệp (fileId) hợp lệ.');
+      }
+    } catch (err: any) {
+      if (!isReplacing) {
+        const failMsg = err.message || 'Lỗi không xác định khi tải tệp lên Google Drive.';
+        const failNowIso = new Date().toISOString();
+        const shaFail = crypto.createHash('sha256').update(file.buffer).digest('hex');
+        const failedDoc = await mutateDocumentInDb(
+          doc.id,
+          (liveDoc) => {
+            if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) {
+              return false;
+            }
+            const existingWordAtts = getEffectiveAttachments(liveDoc);
+            const wordIdx = existingWordAtts.findIndex((a) => a.group === 'word_draft');
+            const prevVersionsWord = wordIdx !== -1 ? [...existingWordAtts[wordIdx].versions] : [];
+            const nextVersionWord =
+              wordIdx !== -1
+                ? (existingWordAtts[wordIdx].currentVersion || prevVersionsWord.length || 0) + 1
+                : 1;
+            const failedAtt: DocumentAttachment = {
+              id: wordIdx !== -1 ? existingWordAtts[wordIdx].id : `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+              group: 'word_draft',
+              label: wordIdx !== -1 && existingWordAtts[wordIdx].label ? existingWordAtts[wordIdx].label : 'Bản Word soạn thảo',
+              isOfficial: wordIdx !== -1 ? existingWordAtts[wordIdx].isOfficial : existingWordAtts.length === 0,
+              currentVersion: nextVersionWord,
+              fileName: targetOverrideName,
+              originalFileName: file.originalname,
+              mimeType: validation.normalizedMimeType || file.mimetype,
+              fileSize: file.size,
+              sha256: shaFail,
+              driveStatus: 'failed',
+              driveError: failMsg,
+              uploadedBy: currentUser.fullName,
+              uploadedByUsername: currentUser.username,
+              uploadedAt: failNowIso,
+              versions: [
+                ...prevVersionsWord,
+                {
+                  version: nextVersionWord,
+                  fileName: targetOverrideName,
+                  originalFileName: file.originalname,
+                  mimeType: validation.normalizedMimeType || file.mimetype,
+                  fileSize: file.size,
+                  sha256: shaFail,
+                  driveStatus: 'failed',
+                  driveError: failMsg,
+                  uploadedBy: currentUser.fullName,
+                  uploadedByUsername: currentUser.username,
+                  uploadedAt: failNowIso,
+                },
+              ],
+            };
+            if (wordIdx !== -1) existingWordAtts[wordIdx] = failedAtt;
+            else existingWordAtts.push(failedAtt);
+            liveDoc.attachments = existingWordAtts;
+            liveDoc.driveStatus = 'failed';
+            liveDoc.driveFileName = targetOverrideName;
+            liveDoc.driveOriginalFileName = file.originalname;
+            liveDoc.driveFileSize = file.size;
+            liveDoc.driveError = failMsg;
+            delete liveDoc.driveUploadStartedAt;
+            return true;
+          },
+          { verifyWrite: true }
+        ).catch(() => null);
+        if (failedDoc) {
+          broadcastSSE('document_updated', { document: failedDoc });
+        }
+      }
+      throw err;
+    }
+
+    // Drive API đã xác nhận trả về fileId hợp lệ -> chỉ chuyển 'saved' SAU KHI ghi DB trung tâm thành công
+    const sha256Word = crypto.createHash('sha256').update(file.buffer).digest('hex');
+    const nowIsoWord = new Date().toISOString();
+    try {
+      const persistedDoc = await mutateDocumentInDb(
+        doc.id,
+        (liveDoc) => {
+          const existingWordAtts = getEffectiveAttachments(liveDoc);
+          const wordIdx = existingWordAtts.findIndex((a) => a.group === 'word_draft');
+          const prevVersionsWord = wordIdx !== -1 ? [...existingWordAtts[wordIdx].versions] : [];
+          const nextVersionWord =
+            wordIdx !== -1
+              ? (existingWordAtts[wordIdx].currentVersion || prevVersionsWord.length || 0) + 1
+              : 1;
+          const hasOtherOfficial = existingWordAtts.some(
+            (a, i) => i !== wordIdx && a.isOfficial && a.driveStatus === 'saved'
+          );
+          const wordAtt: DocumentAttachment = {
+            id: wordIdx !== -1 ? existingWordAtts[wordIdx].id : `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+            group: 'word_draft',
+            label: wordIdx !== -1 && existingWordAtts[wordIdx].label ? existingWordAtts[wordIdx].label : 'Bản Word soạn thảo',
+            isOfficial: wordIdx !== -1 ? existingWordAtts[wordIdx].isOfficial : !hasOtherOfficial,
+            currentVersion: nextVersionWord,
+            fileName: uploadResult.fileName,
+            originalFileName: file.originalname,
+            mimeType: validation.normalizedMimeType || file.mimetype,
+            fileSize: file.size,
+            sha256: sha256Word,
+            driveFileId: uploadResult.fileId,
+            driveFileUrl: uploadResult.webViewLink,
+            driveFolderId: uploadResult.folderId || driveCfg.folderId,
+            driveFolderPath: uploadResult.folderPath,
+            driveStatus: 'saved',
+            uploadedBy: currentUser.fullName,
+            uploadedByUsername: currentUser.username,
+            uploadedAt: nowIsoWord,
+            versions: [
+              ...prevVersionsWord,
+              {
+                version: nextVersionWord,
+                fileName: uploadResult.fileName,
+                originalFileName: file.originalname,
+                mimeType: validation.normalizedMimeType || file.mimetype,
+                fileSize: file.size,
+                sha256: sha256Word,
+                driveFileId: uploadResult.fileId,
+                driveFileUrl: uploadResult.webViewLink,
+                driveFolderId: uploadResult.folderId || driveCfg.folderId,
+                driveFolderPath: uploadResult.folderPath,
+                driveStatus: 'saved',
+                uploadedBy: currentUser.fullName,
+                uploadedByUsername: currentUser.username,
+                uploadedAt: nowIsoWord,
+              },
+            ],
+          };
+          if (wordIdx !== -1) existingWordAtts[wordIdx] = wordAtt;
+          else existingWordAtts.push(wordAtt);
+          liveDoc.attachments = existingWordAtts;
+          liveDoc.fileSha256 = liveDoc.fileSha256 || sha256Word;
+
+          liveDoc.driveStatus = 'saved';
+          liveDoc.driveFileId = uploadResult.fileId;
+          liveDoc.driveFileName = uploadResult.fileName;
+          liveDoc.driveFileUrl = uploadResult.webViewLink;
+          liveDoc.driveOriginalFileName = file.originalname;
+          liveDoc.driveMimeType = validation.normalizedMimeType || file.mimetype;
+          liveDoc.driveFileSize = file.size;
+          liveDoc.driveFolderId = uploadResult.folderId || driveCfg.folderId;
+          liveDoc.driveFolderPath = uploadResult.folderPath;
+          liveDoc.driveUploadedAt = nowIsoWord;
+          liveDoc.driveLastVerifiedAt = nowIsoWord;
+          delete liveDoc.driveError;
+          delete liveDoc.driveReconcileNote;
+          delete liveDoc.driveUploadStartedAt;
+          syncRootDriveFieldsFromAttachments(liveDoc);
+          clearDriveOnlyReviewReasons(liveDoc);
+
+          recordDocumentHistoryEntry({
+            doc: liveDoc,
+            book: targetBook,
+            actor: currentUser,
+            action: isReplacing ? 'replace_file' : 'upload_word',
+            changes: {
+              driveFileName: { old: prevFileName, new: uploadResult.fileName },
+              driveFileId: { old: prevFileId, new: uploadResult.fileId },
+            },
+            reason: isReplacing
+              ? 'Thay thế tệp Word mới trên Google Drive'
+              : uploadResult.deduplicated
+              ? 'Đối soát tệp đã có trên Google Drive theo mã bản ghi'
+              : 'Tải lên tệp Word đính kèm vào Google Drive',
+          });
+          return true;
+        },
+        { verifyWrite: true }
+      );
+      if (!persistedDoc) {
+        const e: any = new Error('Không tìm thấy bản ghi trong cơ sở dữ liệu sau khi tải tệp lên Google Drive.');
+        e.driveUploadedUnpersisted = true;
+        throw e;
+      }
+
+      broadcastSSE('document_updated', { document: persistedDoc });
+      void syncToGoogleSheets(persistedDoc, 'update').catch((err) => {
+        console.error('Lỗi đồng bộ Google Sheets nền sau khi lưu Word lên Drive:', err);
+      });
+      return persistedDoc;
+    } catch (dbErr: any) {
+      // KHÔNG báo lưu thành công giả và KHÔNG xóa fileId đã tải lên; để lần đối soát tiếp theo tìm lại theo nctDocId
+      console.error(
+        `[Upload Word] Drive đã lưu fileId=${uploadResult.fileId} nhưng ghi DB thất bại:`,
+        sanitizeErrorForLog(dbErr)
+      );
+      const persistErr: any = new Error(
+        `Tệp đã tải lên Google Drive nhưng chưa ghi nhận được vào cơ sở dữ liệu (${sanitizeErrorForLog(dbErr)}). Hãy bấm đối soát trạng thái Drive để cập nhật mà không tải trùng.`
+      );
+      persistErr.driveUploadedUnpersisted = true;
+      throw persistErr;
+    }
+  })();
+
+  inFlightDocUploads.set(doc.id, uploadTask);
+  try {
+    const updatedDoc = await uploadTask;
+    return res.json({
+      document: updatedDoc,
+      success: true,
+      timings: { driveUploadMs: Date.now() - uploadStartMs },
+    });
+  } catch (err: any) {
+    const latestDoc = db.documents.find((d) => d.id === doc.id) || doc;
+    return res.status(err?.driveUploadedUnpersisted ? 503 : 502).json({
+      error: `Đã cấp số ${latestDoc.fullDocNumber}, chưa hoàn tất ghi nhận tệp Word: ${err.message || 'Lỗi kết nối Google Drive'}`,
+      document: latestDoc,
+      ...(err?.driveUploadedUnpersisted ? { driveUploadedUnpersisted: true, persisted: false } : {}),
+    });
+  } finally {
+    if (inFlightDocUploads.get(doc.id) === uploadTask) {
+      inFlightDocUploads.delete(doc.id);
+    }
+  }
+});
+
+// 7c. NHẬP VĂN BẢN PDF TỪ SỞ HOẶC NGUỒN KHÁC (Phân tích văn bản / OCR + Xem trước + Lưu sổ Văn bản đến)
+app.post('/api/pdf/analyze', requireAuth, handleWordUploadMulter, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const file = req.file;
+  const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+  const targetBook = findBookStrictly({
+    bookId: typeof req.body?.bookId === 'string' ? req.body.bookId : undefined,
+    bookCode: typeof req.body?.bookCode === 'string' ? req.body.bookCode : undefined,
+    unit: typeof req.body?.unit === 'string' ? req.body.unit : undefined,
+  });
+  const requestId =
+    (typeof req.headers['x-vercel-id'] === 'string' && req.headers['x-vercel-id'].trim()) ||
+    (typeof req.headers['x-request-id'] === 'string' && req.headers['x-request-id'].trim()) ||
+    `pdfreq-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  res.setHeader('X-Request-Id', requestId);
+
+  if (!targetBook) {
+    return res.status(400).json({
+      error: 'Thiếu hoặc sai mã sổ/đơn vị (bookId/bookCode) khi phân tích PDF. Vui lòng chọn đúng sổ đơn vị.',
+      requestId,
+    });
+  }
+
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'import_incoming')) {
+    return res.status(403).json({
+      error: `Bạn chưa được phân quyền "Nhập văn bản đến" trong ${targetBook.name}.`,
+      requestId,
+    });
+  }
+
+  let originalFileName = file?.originalname || '';
+  let sourceType: 'pdf_url' | 'pdf_upload' | 'unknown' = file ? 'pdf_upload' : rawUrl ? 'pdf_url' : 'unknown';
+
+  try {
+    let buffer: Buffer;
+    let resolvedSourceType: 'pdf_url' | 'pdf_upload';
+    let sourceUrl: string | undefined;
+
+    if (file) {
+      const validation = validatePdfFileBuffer(file.originalname, file.mimetype, file.buffer);
+      if (!validation.valid) {
+        return res.status(400).json({ error: validation.error, requestId });
+      }
+      buffer = file.buffer;
+      originalFileName = file.originalname || 'van-ban.pdf';
+      resolvedSourceType = 'pdf_upload';
+      sourceType = resolvedSourceType;
+    } else if (rawUrl) {
+      const fetched = await fetchPdfFromUrl(rawUrl);
+      buffer = fetched.buffer;
+      originalFileName = fetched.fileName;
+      resolvedSourceType = 'pdf_url';
+      sourceType = resolvedSourceType;
+      sourceUrl = rawUrl;
+    } else {
+      return res.status(400).json({
+        error: 'Vui lòng dán đường dẫn PDF hoặc chọn tệp PDF từ máy để phân tích.',
+        requestId,
+      });
+    }
+
+    const { sha256, extraction, pageTexts } = await analyzePdfBuffer(buffer, {
+      originalFileName,
+    });
+
+    const duplicateDocument =
+      db.documents.find(
+        (d) =>
+          getDocBookId(d) === targetBook.id &&
+          d.fileSha256 === sha256 &&
+          d.status !== 'cancelled' &&
+          d.status !== 'deleted'
+      ) || null;
+
+    // Kiểm tra nghi trùng theo Cơ quan ban hành + Số/ký hiệu + Năm trong cùng sổ
+    const parsedYearMatch = (
+      extraction.documentDate ||
+      extraction.topRightDate?.date ||
+      extraction.signatureDate?.date ||
+      extraction.issueDate ||
+      extraction.signDate ||
+      ''
+    ).match(/(\d{4})$/);
+    const extractedYear = parsedYearMatch ? parseInt(parsedYearMatch[1], 10) : undefined;
+    const suspectedDuplicateDocument = findSuspectedDuplicateDocument(
+      targetBook.id,
+      extraction.docNumber,
+      extraction.issuingAgency,
+      extractedYear,
+      duplicateDocument?.id
+    );
+
+    const stageToken = `pdf-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+    await saveStagedPdfEntry({
+      token: stageToken,
+      bookId: targetBook.id,
+      buffer,
+      sha256,
+      originalFileName,
+      sourceType: resolvedSourceType,
+      sourceUrl,
+      userId: currentUser.id,
+      createdAt: Date.now(),
+      pageTexts,
+    });
+
+    const payload: PdfAnalyzeResponse = {
+      stageToken,
+      bookId: targetBook.id,
+      sha256,
+      fileSize: buffer.length,
+      originalFileName,
+      sourceType: resolvedSourceType,
+      sourceUrl,
+      extraction,
+      duplicateDocument,
+      suspectedDuplicateDocument,
+    };
+
+    return res.json(payload);
+  } catch (err: any) {
+    if (err instanceof PdfUrlFetchError) {
+      console.warn(`[PDF Analyze][requestId=${requestId}] Lỗi tải PDF từ URL:`, {
+        requestId,
+        bookId: targetBook.id,
+        userId: currentUser.id,
+        message: err.message,
+      });
+      return res.status(err.statusCode || 400).json({
+        error: err.message,
+        code: 'PDF_URL_FETCH_FAILED',
+        requestId,
+      });
+    }
+
+    const diag = getServerPdfWorkerDiagnostics();
+    console.error(`[PDF Analyze][requestId=${requestId}] Lỗi kỹ thuật khi đọc PDF:`, {
+      requestId,
+      sourceType,
+      originalFileName,
+      bookId: targetBook.id,
+      userId: currentUser.id,
+      pdfjsVersion: diag.pdfjsVersion,
+      workerExists: diag.workerExists,
+      workerPath: diag.workerPath,
+      errorName: err?.name,
+      errorMessage: err?.message,
+      stack: err?.stack,
+    });
+    return res.status(500).json({
+      error: 'Chưa đọc được PDF. Vui lòng thử lại.',
+      code: 'PDF_READ_FAILED',
+      requestId,
+    });
+  }
+});
+
+// Nạp lại tệp PDF tạm khi phiên tạm hết hạn mà không xóa các trường người dùng đã chỉnh sửa
+app.post('/api/pdf/restage', requireAuth, handleWordUploadMulter, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const file = req.file;
+  const targetBook = findBookStrictly({
+    bookId: typeof req.body?.bookId === 'string' ? req.body.bookId : undefined,
+    bookCode: typeof req.body?.bookCode === 'string' ? req.body.bookCode : undefined,
+    unit: typeof req.body?.unit === 'string' ? req.body.unit : undefined,
+  });
+  if (!targetBook) {
+    return res.status(400).json({
+      error: 'Thiếu hoặc sai mã sổ/đơn vị (bookId/bookCode) khi nạp lại tệp PDF.',
+    });
+  }
+  const expectedSha256 = typeof req.body?.expectedSha256 === 'string' ? req.body.expectedSha256.trim().toLowerCase() : '';
+  const allowDifferentFile = req.body?.allowDifferentFile === 'true' || req.body?.allowDifferentFile === true;
+
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'import_incoming')) {
+    return res.status(403).json({
+      error: `Bạn chưa được phân quyền "Nhập văn bản đến" trong ${targetBook.name}.`,
+    });
+  }
+
+  if (!file) {
+    return res.status(400).json({ error: 'Vui lòng chọn tệp PDF để khôi phục phiên lưu.' });
+  }
+
+  const validation = validatePdfFileBuffer(file.originalname, file.mimetype, file.buffer);
+  if (!validation.valid) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const actualSha256 = crypto.createHash('sha256').update(file.buffer).digest('hex');
+  const matchedOriginal = !expectedSha256 || expectedSha256 === actualSha256;
+
+  if (!matchedOriginal && !allowDifferentFile) {
+    return res.status(409).json({
+      code: 'PDF_FILE_MISMATCH',
+      expectedSha256,
+      actualSha256,
+      error: 'Tệp PDF vừa chọn khác nội dung so với tệp đã phân tích ban đầu. Vui lòng kiểm tra đúng tệp hoặc xác nhận dùng tệp mới.',
+    });
+  }
+
+  let pageTexts: PdfPageContent[] | undefined;
+  try {
+    const indexed = await extractPdfPageContentsForIndex(file.buffer);
+    pageTexts = indexed.pageTexts;
+  } catch {
+    pageTexts = undefined;
+  }
+
+  const stageToken = `pdf-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+  await saveStagedPdfEntry({
+    token: stageToken,
+    bookId: targetBook.id,
+    buffer: file.buffer,
+    sha256: actualSha256,
+    originalFileName: file.originalname || 'van-ban.pdf',
+    sourceType: 'pdf_upload',
+    userId: currentUser.id,
+    createdAt: Date.now(),
+    pageTexts,
+  });
+
+  return res.json({
+    stageToken,
+    bookId: targetBook.id,
+    sha256: actualSha256,
+    matchedOriginal,
+    originalFileName: file.originalname || 'van-ban.pdf',
+    fileSize: file.buffer.length,
+  });
+});
+
+app.get('/api/pdf/staged/:stageToken', requireAuth, async (req, res) => {
+  const { stageToken } = req.params;
+  const currentUser = (req as any).user as User;
+  const entry = await getStagedPdfEntry(stageToken);
+  if (!entry) {
+    return res.status(410).json({
+      code: 'TEMP_PDF_EXPIRED',
+      error: 'Tệp PDF tạm đã hết hạn, vui lòng chọn lại tệp hoặc bấm Thử lưu lại.',
+    });
+  }
+  const hasImportPerm = isSystemAdmin(currentUser) || hasBookPermission(currentUser, entry.bookId, 'import_incoming');
+  if (!hasImportPerm || (currentUser.role !== 'admin' && entry.userId !== currentUser.id)) {
+    return res.status(403).json({ error: 'Bạn không có quyền xem tệp PDF tạm này.' });
+  }
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(entry.originalFileName)}"`);
+  res.setHeader('Cache-Control', 'private, max-age=300');
+  res.send(entry.buffer);
+});
+
+app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
+  const totalStartMs = Date.now();
+  const currentUser = (req as any).user as User;
+  const {
+    bookId,
+    stageToken,
+    expectedSha256,
+    allowDifferentFile,
+    fullDocNumber,
+    docType,
+    docName,
+    title,
+    documentDate,
+    issueDate,
+    signDate,
+    dateComparisonStatus,
+    dateMismatchSources,
+    confirmUnifiedDate,
+    parentAgency,
+    issuingAgency,
+    signer,
+    signerRole,
+    notes,
+    expectedFileName,
+    conflictAction,
+    customFileName,
+    ignoreDuplicatePdf,
+    ignoreSuspectedDuplicate,
+    needsReview,
+    reviewReasons,
+    relevantPages,
+    idempotencyKey,
+  } = req.body || {};
+
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const entry = stageToken ? await getStagedPdfEntry(String(stageToken)) : null;
+  const targetBook =
+    findBookStrictly({
+      bookId: typeof bookId === 'string' ? bookId : undefined,
+      bookCode: typeof req.body?.bookCode === 'string' ? req.body.bookCode : undefined,
+      unit: typeof req.body?.unit === 'string' ? req.body.unit : undefined,
+    }) || (entry?.bookId ? findBookStrictly({ bookId: entry.bookId }) : null);
+
+  if (!targetBook) {
+    return res.status(400).json({
+      error: 'Thiếu hoặc sai mã sổ/đơn vị (bookId/bookCode). Hệ thống không tự mặc định sang Đoàn trường.',
+    });
+  }
+
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'import_incoming')) {
+    return res.status(403).json({
+      error: `Bạn chưa được phân quyền "Nhập văn bản đến" trong ${targetBook.name}.`,
+    });
+  }
+
+  const canManageBook =
+    isSystemAdmin(currentUser) || hasBookPermission(currentUser, targetBook.id, 'manage_book');
+
+  const cleanDocNumber = (fullDocNumber || '').trim();
+  const cleanDocType = typeof docType === 'string' ? docType.trim() : '';
+  const cleanDocName = (docName || '').trim();
+  const cleanTitle = (title || '').trim();
+  const rawDateInput = (
+    typeof documentDate === 'string' && documentDate.trim()
+      ? documentDate
+      : typeof issueDate === 'string'
+      ? issueDate
+      : ''
+  ).trim();
+  const cleanIssueDate = normalizeDateOnlyDdMmYyyy(rawDateInput);
+  if (rawDateInput && !cleanIssueDate) {
+    return res.status(400).json({
+      error: 'Ngày văn bản không hợp lệ (định dạng chuẩn dd/mm/yyyy).',
+    });
+  }
+
+  const rawSignInput = typeof signDate === 'string' ? signDate.trim() : '';
+  const cleanSignDate = normalizeDateOnlyDdMmYyyy(rawSignInput);
+  const cleanParentAgency = (parentAgency || '').trim();
+  const cleanAgency = (issuingAgency || '').trim();
+  const cleanSigner = (signer || '').trim();
+  const cleanSignerRole = (signerRole || '').trim();
+
+  if (!idempotencyKey) {
+    return res.status(400).json({ error: 'Thiếu mã chống lặp (idempotency key).' });
+  }
+
+  // 1. Kiểm tra idempotency TRƯỚC khi từ chối stageToken hết hạn để đảm bảo không tạo hồ sơ trùng lặp khi thử lại
+  let resumedExistingDoc: DocumentRecord | null = null;
+  let isRetryDriveResume = false;
+  if (db.idempotencyKeys[idempotencyKey]) {
+    const existingDocId = db.idempotencyKeys[idempotencyKey];
+    const existingDoc = db.documents.find((d) => d.id === existingDocId);
+    if (existingDoc) {
+      if (existingDoc.driveStatus === 'saved' && existingDoc.driveFileId && existingDoc.driveFileUrl) {
+        return res.json({
+          document: existingDoc,
+          duplicatePrevented: true,
+          driveSaved: true,
+          message: 'Văn bản PDF này đã được lưu trước đó.',
+          timings: { recordSaveMs: 0, driveUploadMs: 0, totalMs: Date.now() - totalStartMs },
+        });
+      }
+      // Trước khi thử tải lại hoặc báo hết hạn PDF tạm: đối soát Drive xem tệp đã tồn tại chưa
+      const preCheck = await reconcileSingleDocumentDriveStatus(existingDoc.id, {
+        actor: currentUser,
+        forceCheck: true,
+        allowNotFoundTransitionToFailed: false,
+        auditReason: 'Đối soát tệp PDF trên Google Drive trước khi thử lưu lại theo mã chống lặp',
+      });
+      if (preCheck.outcome === 'verified_saved' && preCheck.document) {
+        return res.json({
+          document: preCheck.document,
+          duplicatePrevented: true,
+          driveSaved: true,
+          message: 'Đã xác nhận tệp PDF đã tồn tại trên Google Drive và cập nhật lại trạng thái hồ sơ.',
+          timings: { recordSaveMs: 0, driveUploadMs: 0, totalMs: Date.now() - totalStartMs },
+        });
+      }
+      if (
+        preCheck.errorCode === 'MISSING_APPS_SCRIPT_TOKEN' ||
+        preCheck.errorCode === 'APPS_SCRIPT_AUTH_FAILED' ||
+        preCheck.errorCode === 'APPS_SCRIPT_REDIRECT_BLOCKED'
+      ) {
+        return res.status(preCheck.errorCode === 'MISSING_APPS_SCRIPT_TOKEN' ? 500 : 502).json({
+          code: preCheck.errorCode,
+          document: preCheck.document || existingDoc,
+          driveSaved: false,
+          uploadError: preCheck.message,
+          error: preCheck.message,
+        });
+      }
+      // Hồ sơ đã ghi vào sổ nhưng chưa lưu được tệp lên Drive -> nối tiếp tải tệp lên chính hồ sơ đó
+      if (!entry || (currentUser.role !== 'admin' && entry.userId !== currentUser.id) || entry.bookId !== getDocBookId(existingDoc)) {
+        return res.status(410).json({
+          code: 'TEMP_PDF_EXPIRED',
+          existingDocument: existingDoc,
+          error: 'Không còn dữ liệu PDF tạm trên máy chủ để thử lưu lại. Hồ sơ đã ghi sổ và các thông tin bạn đã xác nhận vẫn được giữ nguyên; vui lòng chọn lại tệp PDF gốc để hoàn tất lưu lên Google Drive.',
+        });
+      }
+      resumedExistingDoc = existingDoc;
+      isRetryDriveResume = true;
+    }
+  }
+
+  if (!resumedExistingDoc) {
+    if (!stageToken || !cleanDocNumber) {
+      return res.status(400).json({
+        error: 'Thiếu thông tin tệp PDF hoặc Số/ký hiệu văn bản gốc.',
+      });
+    }
+
+    if (!cleanDocName && !cleanTitle) {
+      return res.status(400).json({
+        error: 'Vui lòng nhập Tên văn bản hoặc Trích yếu nội dung văn bản.',
+      });
+    }
+
+    if (!entry || (currentUser.role !== 'admin' && entry.userId !== currentUser.id) || entry.bookId !== targetBook.id) {
+      return res.status(410).json({
+        code: 'TEMP_PDF_EXPIRED',
+        error: 'Tệp PDF tạm đã hết hạn hoặc không khớp sổ hiện tại. Các trường bạn đã sửa vẫn được giữ lại; vui lòng chọn lại tệp hoặc bấm Thử lưu lại.',
+      });
+    }
+
+    if (
+      typeof expectedSha256 === 'string' &&
+      expectedSha256.trim() &&
+      !allowDifferentFile &&
+      entry.sha256 !== expectedSha256.trim().toLowerCase()
+    ) {
+      return res.status(409).json({
+        code: 'PDF_FILE_MISMATCH',
+        expectedSha256: expectedSha256.trim().toLowerCase(),
+        actualSha256: entry.sha256,
+        error: 'Tệp PDF hiện tại khác nội dung với tệp đã phân tích ban đầu. Vui lòng xác nhận trước khi lưu.',
+      });
+    }
+  }
+
+  const activeEntry = entry!;
+
+  const normalizedCompStatus: DateComparisonStatus | undefined =
+    dateComparisonStatus === 'single' ||
+    dateComparisonStatus === 'matched' ||
+    dateComparisonStatus === 'mismatch' ||
+    dateComparisonStatus === 'missing'
+      ? dateComparisonStatus
+      : undefined;
+
+  const sanitizeDateSource = (src: any): ExtractedDateSource | undefined => {
+    if (!src || typeof src !== 'object') return undefined;
+    const normDate = normalizeDateOnlyDdMmYyyy(String(src.date || ''));
+    if (!normDate) return undefined;
+    return {
+      date: normDate,
+      positionLabel: String(src.positionLabel || ''),
+      page: typeof src.page === 'number' && Number.isFinite(src.page) ? src.page : 1,
+      bbox: src.bbox,
+      estimated: Boolean(src.estimated),
+      rawText: typeof src.rawText === 'string' ? src.rawText : undefined,
+    };
+  };
+
+  const sanitizedMismatchSources =
+    dateMismatchSources && typeof dateMismatchSources === 'object'
+      ? {
+          topRight: sanitizeDateSource(dateMismatchSources.topRight),
+          signature: sanitizeDateSource(dateMismatchSources.signature),
+        }
+      : undefined;
+
+  if (normalizedCompStatus === 'mismatch' && confirmUnifiedDate && cleanIssueDate && !canManageBook) {
+    return res.status(403).json({
+      error: `Chỉ Quản trị viên hệ thống hoặc Quản trị ${targetBook.name} mới có quyền xác nhận ngày thống nhất khi ngày trên văn bản chưa thống nhất.`,
+    });
+  }
+
+  let createdDoc: DocumentRecord | null = resumedExistingDoc;
+  let targetFileName = resumedExistingDoc?.driveFileName || '';
+  let recordSaveMs = 0;
+
+  if (!createdDoc) {
+    const recordStartMs = Date.now();
+    const releaseLock = await atomicLock.acquire();
+    try {
+      if (db.idempotencyKeys[idempotencyKey]) {
+        const existingDocId = db.idempotencyKeys[idempotencyKey];
+        const existingDoc = db.documents.find((d) => d.id === existingDocId);
+        if (existingDoc) {
+          if (existingDoc.driveStatus === 'saved' && existingDoc.driveFileId) {
+            return res.json({
+              document: existingDoc,
+              duplicatePrevented: true,
+              driveSaved: true,
+              message: 'Văn bản PDF này đã được lưu trước đó.',
+              timings: { recordSaveMs: 0, driveUploadMs: 0, totalMs: Date.now() - totalStartMs },
+            });
+          }
+          createdDoc = existingDoc;
+          targetFileName = existingDoc.driveFileName || targetFileName;
+          isRetryDriveResume = true;
+        }
+      }
+
+      if (!createdDoc) {
+        const nowIso = new Date().toISOString();
+        const receivedTimeVn = getRequestVietnamTimeInfo(req);
+
+        let finalIssueDate = cleanIssueDate;
+        // Tuyệt đối không tự sao chép ngày ban hành (Vùng B) sang ngày ký (signDate) khi văn bản chỉ có ngày ban hành
+        let finalSignDate = cleanSignDate || undefined;
+        let pendingDateConfirmation = false;
+        let dateConfirmedBy: string | undefined;
+        let dateConfirmedByUserId: string | undefined;
+        let dateConfirmedAt: string | undefined;
+
+        if (normalizedCompStatus === 'mismatch') {
+          if (confirmUnifiedDate && cleanIssueDate && canManageBook) {
+            finalIssueDate = cleanIssueDate;
+            finalSignDate = cleanSignDate || undefined;
+            pendingDateConfirmation = false;
+            dateConfirmedBy = currentUser.displayName?.trim() || currentUser.fullName;
+            dateConfirmedByUserId = currentUser.id;
+            dateConfirmedAt = nowIso;
+          } else {
+            finalIssueDate = '';
+            finalSignDate = undefined;
+            pendingDateConfirmation = true;
+          }
+        }
+
+        const refDateForYear = finalIssueDate || finalSignDate || '';
+        const dateParts = refDateForYear.split('/');
+        const parsedYear =
+          dateParts.length === 3 && /^\d{4}$/.test(dateParts[2])
+            ? parseInt(dateParts[2], 10)
+            : receivedTimeVn.year;
+
+        if (!ignoreDuplicatePdf) {
+          const duplicateDoc = db.documents.find(
+            (d) =>
+              getDocBookId(d) === targetBook.id &&
+              d.fileSha256 === activeEntry.sha256 &&
+              d.status !== 'cancelled' &&
+              d.status !== 'deleted'
+          );
+          if (duplicateDoc) {
+            return res.status(409).json({
+              code: 'PDF_DUPLICATE',
+              error: `Tệp PDF này trùng nội dung với văn bản đã lưu (${duplicateDoc.fullDocNumber}) trong ${targetBook.name}.`,
+              existingDocument: duplicateDoc,
+            });
+          }
+        }
+
+        if (!ignoreDuplicatePdf && !ignoreSuspectedDuplicate) {
+          const suspectedDoc = findSuspectedDuplicateDocument(
+            targetBook.id,
+            cleanDocNumber,
+            cleanAgency,
+            parsedYear
+          );
+          if (suspectedDoc) {
+            return res.status(409).json({
+              code: 'PDF_SUSPECTED_DUPLICATE',
+              error: `Nghi trùng văn bản "${suspectedDoc.fullDocNumber}" (${suspectedDoc.issuingAgency || 'cùng cơ quan'}) trong ${targetBook.name}. Vui lòng kiểm tra lại hồ sơ đã có hoặc xác nhận lưu mới.`,
+              existingDocument: suspectedDoc,
+            });
+          }
+        }
+
+        const nameInputForFile = cleanDocName || cleanTitle;
+        const standardName = buildStandardDriveFileName(cleanDocNumber, nameInputForFile, '.pdf');
+        if (typeof customFileName === 'string' && customFileName.trim()) {
+          targetFileName = sanitizeCustomDriveFileName(customFileName, '.pdf');
+        } else if (typeof expectedFileName === 'string' && expectedFileName.trim()) {
+          targetFileName = sanitizeCustomDriveFileName(expectedFileName, '.pdf');
+        } else {
+          targetFileName = standardName;
+        }
+
+        const conflictDoc = findConflictingDocumentByDriveFileName(targetFileName, undefined, targetBook.id);
+        if (conflictDoc) {
+          if (conflictAction === 'suffix') {
+            targetFileName = resolveUniqueDriveFileName(targetFileName, undefined, targetBook.id);
+          } else if (conflictAction !== 'overwrite') {
+            return res.status(409).json({
+              code: 'FILENAME_CONFLICT',
+              error: `Tên tệp "${targetFileName}" đã trùng với hồ sơ ${conflictDoc.fullDocNumber} (${conflictDoc.docName || conflictDoc.title}). Vui lòng chọn cách xử lý.`,
+              conflictingFileName: targetFileName,
+              suggestedSuffixName: resolveUniqueDriveFileName(targetFileName, undefined, targetBook.id),
+              existingDocument: conflictDoc,
+            });
+          }
+        }
+
+        const docId = `doc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const globalStt = db.documents.length + 1;
+
+        const indexedPagesCount = Array.isArray(activeEntry.pageTexts)
+          ? activeEntry.pageTexts.filter((p) => (p.text || '').trim().length >= 10).length
+          : 0;
+
+        let finalReviewReasons = Array.isArray(reviewReasons) ? [...reviewReasons] : [];
+        if (!pendingDateConfirmation) {
+          finalReviewReasons = finalReviewReasons.filter(
+            (r) => !/ngày trên văn bản chưa thống nhất|chờ quản trị viên xác nhận ngày/i.test(r)
+          );
+        }
+        const finalNeedsReview = pendingDateConfirmation
+          ? true
+          : finalReviewReasons.length > 0
+          ? Boolean(needsReview)
+          : false;
+
+        const newDocument: DocumentRecord = {
+          id: docId,
+          bookId: targetBook.id,
+          bookCode: targetBook.code,
+          bookName: targetBook.name,
+          stt: globalStt,
+          year: parsedYear,
+          issueDate: finalIssueDate,
+          signDate: finalSignDate,
+          receivedAt: nowIso,
+          receivedDate: receivedTimeVn.formattedDate,
+          createdAt: nowIso,
+          docCategory: 'incoming',
+          parentAgency: cleanParentAgency || undefined,
+          issuingAgency: cleanAgency || undefined,
+          typeCode: 'VBD',
+          typeName: 'Văn bản đến',
+          docType: cleanDocType || undefined,
+          sequenceNumber: 0,
+          fullDocNumber: cleanDocNumber,
+          docName: cleanDocName || cleanTitle,
+          title: cleanTitle || cleanDocName,
+          signer: cleanSigner || 'Chưa xác định',
+          signerRole: cleanSignerRole || (cleanAgency || 'Cơ quan ban hành'),
+          issuedBy: currentUser.displayName?.trim() || currentUser.fullName,
+          issuedByUsername: currentUser.username,
+          issuedByUserId: currentUser.id,
+          status: 'active',
+          notes: typeof notes === 'string' ? notes.trim() : '',
+          auditLogs: [],
+          syncStatus: getGoogleSheetsTargets(targetBook).length > 0 ? 'pending' : 'not_configured',
+          idempotencyKey,
+          driveStatus: 'uploading',
+          driveUploadStartedAt: nowIso,
+          driveFileName: targetFileName,
+          driveOriginalFileName: activeEntry.originalFileName,
+          driveMimeType: 'application/pdf',
+          driveFileSize: activeEntry.buffer.length,
+          sourceType: activeEntry.sourceType,
+          sourceUrl: activeEntry.sourceUrl,
+          fileSha256: activeEntry.sha256,
+          needsReview: finalNeedsReview,
+          reviewReasons: finalReviewReasons.length > 0 ? finalReviewReasons : undefined,
+          relevantPages: Array.isArray(relevantPages) ? relevantPages : undefined,
+          pendingDateConfirmation: pendingDateConfirmation || undefined,
+          dateComparisonStatus: normalizedCompStatus,
+          dateMismatchSources:
+            normalizedCompStatus === 'mismatch' ? sanitizedMismatchSources : undefined,
+          dateConfirmedBy,
+          dateConfirmedByUserId,
+          dateConfirmedAt,
+          pdfPageContents: activeEntry.pageTexts,
+          pdfContentVersion: activeEntry.pageTexts ? 1 : undefined,
+          pdfTextStatus: indexedPagesCount > 0 ? 'indexed' : 'no_text',
+          pdfIndexedPagesCount: indexedPagesCount,
+        };
+
+        recordDocumentHistoryEntry({
+          doc: newDocument,
+          book: targetBook,
+          actor: currentUser,
+          action: 'import_pdf',
+          changes: {
+            bookCode: { old: null, new: targetBook.code },
+            bookName: { old: null, new: targetBook.name },
+            fullDocNumber: { old: null, new: cleanDocNumber },
+            docName: { old: null, new: cleanDocName || cleanTitle },
+            issuingAgency: { old: null, new: cleanAgency || '(chưa xác định)' },
+            ...(finalIssueDate
+              ? { issueDate: { old: null, new: finalIssueDate } }
+              : pendingDateConfirmation
+              ? { issueDate: { old: null, new: 'Chờ xác nhận ngày thống nhất' } }
+              : {}),
+            driveFileName: { old: null, new: targetFileName },
+          },
+          reason: activeEntry.sourceType === 'pdf_url' ? 'Nhập văn bản đến từ đường dẫn PDF' : 'Nhập văn bản đến từ tệp PDF tải lên',
+        });
+
+        db.documents.unshift(newDocument);
+        db.idempotencyKeys[idempotencyKey] = docId;
+        await saveDatabasePersistent(db);
+
+        broadcastSSE('document_issued', { document: newDocument });
+        void syncToGoogleSheets(newDocument, 'create').catch((err) => {
+          console.error('Lỗi đồng bộ Google Sheets nền khi nhập PDF:', err);
+        });
+        createdDoc = newDocument;
+      }
+    } finally {
+      releaseLock();
+      recordSaveMs = Date.now() - recordStartMs;
+    }
+  }
+
+  if (!createdDoc) {
+    return res.status(500).json({ error: 'Không thể khởi tạo bản ghi văn bản đến.' });
+  }
+
+  if (!targetFileName) {
+    targetFileName =
+      createdDoc.driveFileName ||
+      buildStandardDriveFileName(createdDoc.fullDocNumber, createdDoc.docName || createdDoc.title, '.pdf');
+  }
+
+  // Tải tệp PDF gốc lên thư mục Google Drive của sổ đã cấu hình với đúng tên hiển thị
+  const driveUploadStartMs = Date.now();
+  const driveCfg = resolveDriveForBook(targetBook);
+  if (!driveCfg.isConfigured) {
+    const nowAttIso = new Date().toISOString();
+    const errMsg = driveCfg.missingReason || 'Chưa cấu hình thư mục Google Drive hợp lệ.';
+    const failedDoc = await mutateDocumentInDb(
+      createdDoc.id,
+      (liveDoc) => {
+        if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) return false;
+        liveDoc.driveStatus = 'failed';
+        liveDoc.driveError = errMsg;
+        delete liveDoc.driveUploadStartedAt;
+        liveDoc.attachments = [
+          {
+            id: `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+            group: 'signed_pdf',
+            label: 'Bản PDF gốc',
+            isOfficial: true,
+            currentVersion: 1,
+            fileName: liveDoc.driveFileName || targetFileName,
+            originalFileName: activeEntry.originalFileName,
+            mimeType: 'application/pdf',
+            fileSize: activeEntry.buffer.length,
+            sha256: activeEntry.sha256,
+            driveStatus: 'failed',
+            driveError: errMsg,
+            uploadedBy: currentUser.fullName,
+            uploadedByUsername: currentUser.username,
+            uploadedAt: nowAttIso,
+            versions: [
+              {
+                version: 1,
+                fileName: liveDoc.driveFileName || targetFileName,
+                originalFileName: activeEntry.originalFileName,
+                mimeType: 'application/pdf',
+                fileSize: activeEntry.buffer.length,
+                sha256: activeEntry.sha256,
+                driveStatus: 'failed',
+                driveError: errMsg,
+                uploadedBy: currentUser.fullName,
+                uploadedByUsername: currentUser.username,
+                uploadedAt: nowAttIso,
+              },
+            ],
+          },
+        ];
+        return true;
+      },
+      { verifyWrite: true }
+    ).catch(() => createdDoc);
+    const outDoc = failedDoc || createdDoc;
+    broadcastSSE('document_updated', { document: outDoc });
+    return res.json({
+      document: outDoc,
+      driveSaved: false,
+      uploadError: outDoc.driveError,
+      stageToken,
+      timings: {
+        recordSaveMs,
+        driveUploadMs: Date.now() - driveUploadStartMs,
+        totalMs: Date.now() - totalStartMs,
+      },
+    });
+  }
+
+  const importPdfUploadTask = (async (): Promise<DocumentRecord> => {
+    let uploadResult: DriveUploadResult;
+    try {
+      uploadResult = await uploadDocumentWithFolderCache({
+        driveCfg,
+        book: targetBook,
+        doc: createdDoc!,
+        docCategoryOverride: 'incoming',
+        originalFileName: activeEntry.originalFileName || `${targetFileName}`,
+        mimeType: 'application/pdf',
+        buffer: activeEntry.buffer,
+        overrideFileName: targetFileName,
+        isRetry: isRetryDriveResume,
+      });
+      if (!uploadResult?.fileId || !uploadResult.fileId.trim()) {
+        throw new Error('Google Drive không trả về mã tệp (fileId) hợp lệ.');
+      }
+    } catch (err: any) {
+      const errMsg = err.message || 'Lỗi kết nối khi lưu tệp PDF lên Google Drive.';
+      const nowFailIso = new Date().toISOString();
+      const failedDoc = await mutateDocumentInDb(
+        createdDoc!.id,
+        (liveDoc) => {
+          if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) return false;
+          liveDoc.driveStatus = 'failed';
+          liveDoc.driveError = errMsg;
+          delete liveDoc.driveUploadStartedAt;
+          liveDoc.attachments = [
+            {
+              id: `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+              group: 'signed_pdf',
+              label: 'Bản PDF gốc',
+              isOfficial: true,
+              currentVersion: 1,
+              fileName: liveDoc.driveFileName || targetFileName,
+              originalFileName: activeEntry.originalFileName,
+              mimeType: 'application/pdf',
+              fileSize: activeEntry.buffer.length,
+              sha256: activeEntry.sha256,
+              driveStatus: 'failed',
+              driveError: errMsg,
+              uploadedBy: currentUser.fullName,
+              uploadedByUsername: currentUser.username,
+              uploadedAt: nowFailIso,
+              versions: [
+                {
+                  version: 1,
+                  fileName: liveDoc.driveFileName || targetFileName,
+                  originalFileName: activeEntry.originalFileName,
+                  mimeType: 'application/pdf',
+                  fileSize: activeEntry.buffer.length,
+                  sha256: activeEntry.sha256,
+                  driveStatus: 'failed',
+                  driveError: errMsg,
+                  uploadedBy: currentUser.fullName,
+                  uploadedByUsername: currentUser.username,
+                  uploadedAt: nowFailIso,
+                },
+              ],
+            },
+          ];
+          return true;
+        },
+        { verifyWrite: true }
+      ).catch(() => createdDoc!);
+      if (failedDoc) broadcastSSE('document_updated', { document: failedDoc });
+      const uploadErr: any = new Error(errMsg);
+      uploadErr.document = failedDoc || createdDoc;
+      throw uploadErr;
+    }
+
+    const nowUploadIso = new Date().toISOString();
+    try {
+      const persistedDoc = await mutateDocumentInDb(
+        createdDoc!.id,
+        (liveDoc) => {
+          liveDoc.driveStatus = 'saved';
+          liveDoc.driveFileId = uploadResult.fileId;
+          liveDoc.driveFileName = uploadResult.fileName;
+          liveDoc.driveFileUrl = uploadResult.webViewLink;
+          liveDoc.driveFolderId = uploadResult.folderId || driveCfg.folderId;
+          liveDoc.driveFolderPath = uploadResult.folderPath;
+          liveDoc.driveUploadedAt = nowUploadIso;
+          liveDoc.driveLastVerifiedAt = nowUploadIso;
+          delete liveDoc.driveError;
+          delete liveDoc.driveReconcileNote;
+          delete liveDoc.driveUploadStartedAt;
+          liveDoc.attachments = [
+            {
+              id: `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+              group: 'signed_pdf',
+              label: 'Bản PDF gốc',
+              isOfficial: true,
+              currentVersion: 1,
+              fileName: uploadResult.fileName,
+              originalFileName: activeEntry.originalFileName,
+              mimeType: 'application/pdf',
+              fileSize: activeEntry.buffer.length,
+              sha256: activeEntry.sha256,
+              driveFileId: uploadResult.fileId,
+              driveFileUrl: uploadResult.webViewLink,
+              driveFolderId: uploadResult.folderId || driveCfg.folderId,
+              driveFolderPath: uploadResult.folderPath,
+              driveStatus: 'saved',
+              uploadedBy: currentUser.fullName,
+              uploadedByUsername: currentUser.username,
+              uploadedAt: nowUploadIso,
+              versions: [
+                {
+                  version: 1,
+                  fileName: uploadResult.fileName,
+                  originalFileName: activeEntry.originalFileName,
+                  mimeType: 'application/pdf',
+                  fileSize: activeEntry.buffer.length,
+                  sha256: activeEntry.sha256,
+                  driveFileId: uploadResult.fileId,
+                  driveFileUrl: uploadResult.webViewLink,
+                  driveFolderId: uploadResult.folderId || driveCfg.folderId,
+                  driveFolderPath: uploadResult.folderPath,
+                  driveStatus: 'saved',
+                  uploadedBy: currentUser.fullName,
+                  uploadedByUsername: currentUser.username,
+                  uploadedAt: nowUploadIso,
+                },
+              ],
+            },
+          ];
+          syncRootDriveFieldsFromAttachments(liveDoc);
+          clearDriveOnlyReviewReasons(liveDoc);
+
+          recordDocumentHistoryEntry({
+            doc: liveDoc,
+            book: targetBook,
+            actor: currentUser,
+            action: 'upload_pdf',
+            changes: {
+              driveFileName: { old: null, new: uploadResult.fileName },
+              driveFileId: { old: null, new: uploadResult.fileId },
+            },
+            reason: 'Lưu bản PDF gốc lên thư mục Google Drive',
+          });
+          return true;
+        },
+        { verifyWrite: true }
+      );
+      if (!persistedDoc) {
+        const e: any = new Error('Không tìm thấy bản ghi văn bản đến sau khi tải PDF lên Google Drive.');
+        e.driveUploadedUnpersisted = true;
+        throw e;
+      }
+
+      broadcastSSE('document_updated', { document: persistedDoc });
+      void syncToGoogleSheets(persistedDoc, 'update').catch((err) => {
+        console.error('Lỗi đồng bộ Google Sheets nền sau khi lưu PDF lên Drive:', err);
+      });
+      if (stageToken) {
+        await deleteStagedPdfEntry(String(stageToken));
+      }
+      return persistedDoc;
+    } catch (dbErr: any) {
+      console.error(
+        `[Import PDF] Drive đã lưu fileId=${uploadResult.fileId} nhưng ghi DB thất bại:`,
+        sanitizeErrorForLog(dbErr)
+      );
+      const persistErr: any = new Error(
+        `PDF đã tải lên Google Drive nhưng chưa ghi nhận được vào cơ sở dữ liệu (${sanitizeErrorForLog(dbErr)}). Hãy đối soát trạng thái Drive để hoàn tất.`
+      );
+      persistErr.driveUploadedUnpersisted = true;
+      persistErr.document = db.documents.find((d) => d.id === createdDoc!.id) || createdDoc;
+      throw persistErr;
+    }
+  })();
+
+  inFlightDocUploads.set(createdDoc.id, importPdfUploadTask);
+  try {
+    const savedDoc = await importPdfUploadTask;
+    const driveUploadMs = Date.now() - driveUploadStartMs;
+    return res.json({
+      document: savedDoc,
+      driveSaved: Boolean(savedDoc.driveStatus === 'saved' && savedDoc.driveFileId && savedDoc.driveFileUrl),
+      duplicatePrevented: isRetryDriveResume,
+      timings: {
+        recordSaveMs,
+        driveUploadMs,
+        totalMs: Date.now() - totalStartMs,
+      },
+    });
+  } catch (err: any) {
+    const latestDoc = err?.document || db.documents.find((d) => d.id === createdDoc!.id) || createdDoc;
+    if (err?.driveUploadedUnpersisted) {
+      return res.status(503).json({
+        document: latestDoc,
+        driveSaved: false,
+        driveUploadedUnpersisted: true,
+        persisted: false,
+        uploadError: err.message,
+        stageToken,
+        timings: {
+          recordSaveMs,
+          driveUploadMs: Date.now() - driveUploadStartMs,
+          totalMs: Date.now() - totalStartMs,
+        },
+      });
+    }
+    return res.json({
+      document: latestDoc,
+      driveSaved: false,
+      uploadError: latestDoc.driveError || err.message,
+      stageToken,
+      timings: {
+        recordSaveMs,
+        driveUploadMs: Date.now() - driveUploadStartMs,
+        totalMs: Date.now() - totalStartMs,
+      },
+    });
+  } finally {
+    if (inFlightDocUploads.get(createdDoc.id) === importPdfUploadTask) {
+      inFlightDocUploads.delete(createdDoc.id);
+    }
+  }
+});
+
+// 7d. THỬ LƯU LẠI / THAY TỆP PDF LÊN GOOGLE DRIVE CHO BẢN GHI ĐÃ LƯU
+app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+  const file = req.file;
+  const stageToken = typeof req.body?.stageToken === 'string' ? req.body.stageToken.trim() : '';
+  const requestedFileName = typeof req.body?.fileName === 'string' ? req.body.fileName.trim() : '';
+  const mode = req.body?.mode === 'replace' ? 'replace' : 'retry';
+
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) {
+    return res.status(404).json({ error: 'Không tìm thấy hồ sơ văn bản để lưu tệp PDF.' });
+  }
+
+  const targetBook = resolveStrictBookForDocument(doc);
+  if (!targetBook) {
+    return res.status(422).json({
+      error: `Không xác định được đơn vị/sổ văn bản hợp lệ cho hồ sơ ${doc.fullDocNumber} (bookId=${doc.bookId || ''}, bookCode=${doc.bookCode || ''}). Hệ thống không tự chuyển đơn vị.`,
+    });
+  }
+
+  if (doc.status === 'cancelled' || doc.status === 'deleted') {
+    return res.status(400).json({
+      error:
+        doc.status === 'deleted'
+          ? 'Văn bản đã bị xóa, không thể lưu hoặc thay tệp lên Drive.'
+          : 'Văn bản đã bị hủy, không thể lưu hoặc thay tệp lên Drive.',
+    });
+  }
+
+  const isReplacing = doc.driveStatus === 'saved' && Boolean(doc.driveFileId && doc.driveFileUrl);
+  if (mode === 'replace' || isReplacing) {
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'replace_file')) {
+      return res.status(403).json({
+        error: `Bạn cần quyền "Thay tệp" trong ${targetBook.name} để thay thế bản PDF trên Drive.`,
+      });
+    }
+  } else {
+    const canAttach =
+      isSystemAdmin(currentUser) ||
+      hasBookPermission(currentUser, targetBook.id, 'replace_file') ||
+      hasBookPermission(currentUser, targetBook.id, 'import_incoming') ||
+      (hasBookPermission(currentUser, targetBook.id, 'edit') && doc.issuedByUserId === currentUser.id);
+    if (!canAttach) {
+      return res.status(403).json({
+        error: `Bạn không có quyền tải tệp PDF cho văn bản trong ${targetBook.name}.`,
+      });
+    }
+  }
+
+  // 1. Tránh tải trùng nếu chính hồ sơ này đang có tiến trình lưu Drive chạy song song
+  const pendingUpload = inFlightDocUploads.get(doc.id);
+  if (pendingUpload) {
+    try {
+      const finishedDoc = await pendingUpload;
+      return res.json({
+        document: finishedDoc,
+        deduplicated: true,
+        success: true,
+      });
+    } catch (err: any) {
+      const latestDoc = db.documents.find((d) => d.id === doc.id) || doc;
+      return res.status(err?.driveUploadedUnpersisted ? 503 : 502).json({
+        code: err instanceof AppsScriptAuthError ? err.code : undefined,
+        error: `Chưa lưu tệp lên Drive: ${sanitizeErrorForLog(err)}`,
+        document: latestDoc,
+      });
+    }
+  }
+
+  // 2. Nếu hồ sơ đã xác nhận lưu trên Drive (và không phải thao tác thay tệp), trả về ngay không tải trùng
+  if (doc.driveStatus === 'saved' && doc.driveFileId && doc.driveFileUrl && !isReplacing) {
+    return res.json({
+      document: doc,
+      deduplicated: true,
+      success: true,
+      message: 'Tệp PDF đã được lưu trên Google Drive trước đó.',
+    });
+  }
+
+  // 3. TRƯỚC khi yêu cầu tệp PDF hoặc tải lên lại: kiểm tra trực tiếp trên Google Drive xem tệp đã tồn tại chưa
+  if (
+    !isReplacing &&
+    (mode === 'retry' ||
+      doc.driveStatus === 'failed' ||
+      doc.driveStatus === 'needs_reconcile' ||
+      doc.driveStatus === 'uploading')
+  ) {
+    const preCheck = await reconcileSingleDocumentDriveStatus(doc.id, {
+      actor: currentUser,
+      forceCheck: true,
+      allowNotFoundTransitionToFailed: false,
+      auditReason: 'Đối soát tệp PDF đã tồn tại trên Google Drive trước khi thử lưu lại',
+    });
+    if (preCheck.outcome === 'verified_saved' && preCheck.document) {
+      return res.json({
+        document: preCheck.document,
+        deduplicated: true,
+        success: true,
+        message: 'Đã xác nhận tệp PDF đã tồn tại trên Google Drive và cập nhật lại trạng thái hồ sơ.',
+      });
+    }
+    if (
+      preCheck.errorCode === 'MISSING_APPS_SCRIPT_TOKEN' ||
+      preCheck.errorCode === 'APPS_SCRIPT_AUTH_FAILED' ||
+      preCheck.errorCode === 'APPS_SCRIPT_REDIRECT_BLOCKED' ||
+      preCheck.errorCode === 'APPS_SCRIPT_INVALID_URL'
+    ) {
+      return res.status(preCheck.errorCode === 'MISSING_APPS_SCRIPT_TOKEN' ? 500 : 502).json({
+        code: preCheck.errorCode,
+        error: preCheck.message,
+        document: preCheck.document || doc,
+      });
+    }
+  }
+
+  // 4. Khi xác nhận chưa có tệp trên Drive: lấy dữ liệu PDF gốc (từ tệp vừa chọn hoặc bộ đệm tạm)
+  let pdfBuffer: Buffer;
+  let originalName: string;
+  let stagedPageTexts: PdfPageContent[] | undefined;
+
+  if (file) {
+    const validation = validatePdfFileBuffer(file.originalname, file.mimetype, file.buffer);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error });
+    }
+    pdfBuffer = file.buffer;
+    originalName = file.originalname;
+  } else if (stageToken) {
+    const staged = await getStagedPdfEntry(stageToken);
+    if (!staged || (currentUser.role !== 'admin' && staged.userId !== currentUser.id)) {
+      return res.status(410).json({
+        code: 'TEMP_PDF_EXPIRED',
+        document: doc,
+        error:
+          'Không còn dữ liệu PDF tạm trên máy chủ để thử lưu lại. Hồ sơ hiện có và các thông tin đã xác nhận vẫn được giữ nguyên; vui lòng chọn lại tệp PDF gốc để lưu lên Google Drive.',
+      });
+    }
+    pdfBuffer = staged.buffer;
+    originalName = staged.originalFileName;
+    stagedPageTexts = staged.pageTexts;
+  } else {
+    return res.status(410).json({
+      code: 'TEMP_PDF_EXPIRED',
+      document: doc,
+      error:
+        'Tệp chưa tồn tại trên Google Drive và không còn dữ liệu PDF gốc tạm trên máy chủ. Vui lòng chọn lại tệp PDF để lưu vào đúng hồ sơ này.',
+    });
+  }
+
+  const prevFileName = doc.driveFileName || null;
+  const prevFileId = doc.driveFileId || null;
+  const targetOverrideName = requestedFileName
+    ? sanitizeCustomDriveFileName(requestedFileName, '.pdf')
+    : buildStandardDriveFileName(doc.fullDocNumber, doc.docName || doc.title, '.pdf');
+
+  const uploadTask = (async (): Promise<DocumentRecord> => {
+    const driveCfg = resolveDriveForBook(targetBook);
+    if (!driveCfg.isConfigured) {
+      const errMsg = driveCfg.missingReason || 'Thư mục Google Drive chưa được cấu hình hợp lệ.';
+      if (!isReplacing) {
+        const failedDoc = await mutateDocumentInDb(
+          doc.id,
+          (liveDoc) => {
+            if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) return false;
+            liveDoc.driveStatus = 'failed';
+            liveDoc.driveFileName = targetOverrideName;
+            liveDoc.driveError = errMsg;
+            delete liveDoc.driveUploadStartedAt;
+            return true;
+          },
+          { verifyWrite: true }
+        ).catch(() => null);
+        if (failedDoc) broadcastSSE('document_updated', { document: failedDoc });
+      }
+      throw new Error(errMsg);
+    }
+
+    if (!isReplacing) {
+      const uploadStartedIso = new Date().toISOString();
+      await mutateDocumentInDb(
+        doc.id,
+        (liveDoc) => {
+          if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) return false;
+          liveDoc.driveStatus = 'uploading';
+          liveDoc.driveUploadStartedAt = uploadStartedIso;
+          liveDoc.driveFileName = targetOverrideName;
+          liveDoc.driveOriginalFileName = originalName;
+          liveDoc.driveFileSize = pdfBuffer.length;
+          delete liveDoc.driveError;
+          delete liveDoc.driveReconcileNote;
+          return true;
+        },
+        { verifyWrite: false }
+      );
+    }
+
+    let uploadResult: DriveUploadResult;
+    try {
+      uploadResult = await uploadDocumentWithFolderCache({
+        driveCfg,
+        book: targetBook,
+        doc,
+        docCategoryOverride: doc.docCategory || 'incoming',
+        originalFileName: originalName,
+        mimeType: 'application/pdf',
+        buffer: pdfBuffer,
+        overrideFileName: targetOverrideName,
+        replaceMode: isReplacing,
+        isRetry: !isReplacing && (mode === 'retry' || doc.driveStatus === 'failed' || doc.driveStatus === 'needs_reconcile'),
+        previousFileId: isReplacing ? prevFileId || undefined : undefined,
+      });
+      if (!uploadResult?.fileId || !uploadResult.fileId.trim()) {
+        throw new Error('Google Drive không trả về mã tệp (fileId) hợp lệ.');
+      }
+    } catch (err: any) {
+      if (!isReplacing) {
+        const failMsg = err.message || 'Lỗi kết nối Google Drive.';
+        const failPdfIso = new Date().toISOString();
+        const shaFail = crypto.createHash('sha256').update(pdfBuffer).digest('hex');
+        const failedDoc = await mutateDocumentInDb(
+          doc.id,
+          (liveDoc) => {
+            if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) return false;
+            const existingAtts = getEffectiveAttachments(liveDoc);
+            const pdfIdx = existingAtts.findIndex((a) => a.group === 'signed_pdf');
+            const prevPdfVersions = pdfIdx !== -1 ? [...existingAtts[pdfIdx].versions] : [];
+            const nextPdfVersion =
+              pdfIdx !== -1
+                ? (existingAtts[pdfIdx].currentVersion || prevPdfVersions.length || 0) + 1
+                : 1;
+            const failedAtt: DocumentAttachment = {
+              id: pdfIdx !== -1 ? existingAtts[pdfIdx].id : `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+              group: 'signed_pdf',
+              label: pdfIdx !== -1 && existingAtts[pdfIdx].label ? existingAtts[pdfIdx].label : 'PDF đã ký',
+              isOfficial: pdfIdx !== -1 ? existingAtts[pdfIdx].isOfficial : existingAtts.length === 0,
+              currentVersion: nextPdfVersion,
+              fileName: targetOverrideName,
+              originalFileName: originalName,
+              mimeType: 'application/pdf',
+              fileSize: pdfBuffer.length,
+              sha256: shaFail,
+              driveStatus: 'failed',
+              driveError: failMsg,
+              uploadedBy: currentUser.fullName,
+              uploadedByUsername: currentUser.username,
+              uploadedAt: failPdfIso,
+              versions: [
+                ...prevPdfVersions,
+                {
+                  version: nextPdfVersion,
+                  fileName: targetOverrideName,
+                  originalFileName: originalName,
+                  mimeType: 'application/pdf',
+                  fileSize: pdfBuffer.length,
+                  sha256: shaFail,
+                  driveStatus: 'failed',
+                  driveError: failMsg,
+                  uploadedBy: currentUser.fullName,
+                  uploadedByUsername: currentUser.username,
+                  uploadedAt: failPdfIso,
+                },
+              ],
+            };
+            if (pdfIdx !== -1) existingAtts[pdfIdx] = failedAtt;
+            else existingAtts.push(failedAtt);
+            liveDoc.attachments = existingAtts;
+            liveDoc.driveStatus = 'failed';
+            liveDoc.driveFileName = targetOverrideName;
+            liveDoc.driveError = failMsg;
+            delete liveDoc.driveUploadStartedAt;
+            return true;
+          },
+          { verifyWrite: true }
+        ).catch(() => null);
+        if (failedDoc) broadcastSSE('document_updated', { document: failedDoc });
+      }
+      throw err;
+    }
+
+    if (!stagedPageTexts) {
+      try {
+        const indexed = await extractPdfPageContentsForIndex(pdfBuffer);
+        stagedPageTexts = indexed.pageTexts;
+      } catch (indexErr) {
+        console.warn('[PDF Index] Không trích xuất lại được nội dung PDF khi upload-pdf:', indexErr);
+      }
+    }
+
+    const pdfSha256 = crypto.createHash('sha256').update(pdfBuffer).digest('hex');
+    const nowPdfIso = new Date().toISOString();
+    try {
+      const persistedDoc = await mutateDocumentInDb(
+        doc.id,
+        (liveDoc) => {
+          const existingAtts = getEffectiveAttachments(liveDoc);
+          const pdfIdx = existingAtts.findIndex((a) => a.group === 'signed_pdf');
+          const prevPdfVersions = pdfIdx !== -1 ? [...existingAtts[pdfIdx].versions] : [];
+          const nextPdfVersion =
+            pdfIdx !== -1
+              ? (existingAtts[pdfIdx].currentVersion || prevPdfVersions.length || 0) + 1
+              : 1;
+          const hasOtherOfficial = existingAtts.some(
+            (a, i) => i !== pdfIdx && a.isOfficial && a.driveStatus === 'saved'
+          );
+          const signedAtt: DocumentAttachment = {
+            id: pdfIdx !== -1 ? existingAtts[pdfIdx].id : `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+            group: 'signed_pdf',
+            label: pdfIdx !== -1 && existingAtts[pdfIdx].label ? existingAtts[pdfIdx].label : 'PDF đã ký',
+            isOfficial: pdfIdx !== -1 ? existingAtts[pdfIdx].isOfficial : !hasOtherOfficial,
+            currentVersion: nextPdfVersion,
+            fileName: uploadResult.fileName,
+            originalFileName: originalName,
+            mimeType: 'application/pdf',
+            fileSize: pdfBuffer.length,
+            sha256: pdfSha256,
+            driveFileId: uploadResult.fileId,
+            driveFileUrl: uploadResult.webViewLink,
+            driveFolderId: uploadResult.folderId || driveCfg.folderId,
+            driveFolderPath: uploadResult.folderPath,
+            driveStatus: 'saved',
+            uploadedBy: currentUser.fullName,
+            uploadedByUsername: currentUser.username,
+            uploadedAt: nowPdfIso,
+            versions: [
+              ...prevPdfVersions,
+              {
+                version: nextPdfVersion,
+                fileName: uploadResult.fileName,
+                originalFileName: originalName,
+                mimeType: 'application/pdf',
+                fileSize: pdfBuffer.length,
+                sha256: pdfSha256,
+                driveFileId: uploadResult.fileId,
+                driveFileUrl: uploadResult.webViewLink,
+                driveFolderId: uploadResult.folderId || driveCfg.folderId,
+                driveFolderPath: uploadResult.folderPath,
+                driveStatus: 'saved',
+                uploadedBy: currentUser.fullName,
+                uploadedByUsername: currentUser.username,
+                uploadedAt: nowPdfIso,
+              },
+            ],
+          };
+          if (pdfIdx !== -1) existingAtts[pdfIdx] = signedAtt;
+          else existingAtts.push(signedAtt);
+          liveDoc.attachments = existingAtts;
+          liveDoc.fileSha256 = pdfSha256;
+
+          if (Array.isArray(stagedPageTexts)) {
+            const indexedPagesCount = stagedPageTexts.filter((p) => (p.text || '').trim().length >= 10).length;
+            liveDoc.pdfPageContents = stagedPageTexts;
+            liveDoc.pdfContentVersion = (liveDoc.pdfContentVersion || 0) + 1;
+            liveDoc.pdfTextStatus = indexedPagesCount > 0 ? 'indexed' : 'no_text';
+            liveDoc.pdfIndexedPagesCount = indexedPagesCount;
+          }
+
+          liveDoc.driveStatus = 'saved';
+          liveDoc.driveFileId = uploadResult.fileId;
+          liveDoc.driveFileName = uploadResult.fileName;
+          liveDoc.driveFileUrl = uploadResult.webViewLink;
+          liveDoc.driveOriginalFileName = originalName;
+          liveDoc.driveMimeType = 'application/pdf';
+          liveDoc.driveFileSize = pdfBuffer.length;
+          liveDoc.driveFolderId = uploadResult.folderId || driveCfg.folderId;
+          liveDoc.driveFolderPath = uploadResult.folderPath;
+          liveDoc.driveUploadedAt = nowPdfIso;
+          liveDoc.driveLastVerifiedAt = nowPdfIso;
+          delete liveDoc.driveError;
+          delete liveDoc.driveReconcileNote;
+          delete liveDoc.driveUploadStartedAt;
+          syncRootDriveFieldsFromAttachments(liveDoc);
+          clearDriveOnlyReviewReasons(liveDoc);
+
+          recordDocumentHistoryEntry({
+            doc: liveDoc,
+            book: targetBook,
+            actor: currentUser,
+            action: isReplacing ? 'replace_file' : 'upload_pdf',
+            changes: {
+              driveFileName: { old: prevFileName, new: uploadResult.fileName },
+              driveFileId: { old: prevFileId, new: uploadResult.fileId },
+            },
+            reason: isReplacing
+              ? 'Thay thế bản PDF mới trên Google Drive'
+              : uploadResult.deduplicated
+              ? 'Đối soát tệp PDF đã có trên Google Drive theo mã bản ghi'
+              : 'Thử lưu lại tệp PDF vào Google Drive',
+          });
+          return true;
+        },
+        { verifyWrite: true }
+      );
+      if (!persistedDoc) {
+        const e: any = new Error('Không tìm thấy bản ghi sau khi tải PDF lên Google Drive.');
+        e.driveUploadedUnpersisted = true;
+        throw e;
+      }
+
+      broadcastSSE('document_updated', { document: persistedDoc });
+      void syncToGoogleSheets(persistedDoc, 'update').catch(() => {});
+      if (stageToken) await deleteStagedPdfEntry(stageToken);
+      return persistedDoc;
+    } catch (dbErr: any) {
+      console.error(
+        `[Upload PDF] Drive đã lưu fileId=${uploadResult.fileId} nhưng ghi DB thất bại:`,
+        sanitizeErrorForLog(dbErr)
+      );
+      const persistErr: any = new Error(
+        `PDF đã tải lên Google Drive nhưng chưa ghi nhận được vào cơ sở dữ liệu (${sanitizeErrorForLog(dbErr)}). Hãy đối soát trạng thái Drive để hoàn tất.`
+      );
+      persistErr.driveUploadedUnpersisted = true;
+      throw persistErr;
+    }
+  })();
+
+  inFlightDocUploads.set(doc.id, uploadTask);
+  try {
+    const updatedDoc = await uploadTask;
+    return res.json({ document: updatedDoc, success: true });
+  } catch (err: any) {
+    const latestDoc = db.documents.find((d) => d.id === doc.id) || doc;
+    const authCode = err instanceof AppsScriptAuthError ? err.code : undefined;
+    const statusCode = err?.driveUploadedUnpersisted
+      ? 503
+      : authCode === 'MISSING_APPS_SCRIPT_TOKEN'
+      ? 500
+      : 502;
+    return res.status(statusCode).json({
+      code: authCode,
+      error: `Chưa hoàn tất ghi nhận tệp lên Drive: ${sanitizeErrorForLog(err)}`,
+      document: latestDoc,
+      ...(err?.driveUploadedUnpersisted ? { driveUploadedUnpersisted: true, persisted: false } : {}),
+    });
+  } finally {
+    if (inFlightDocUploads.get(doc.id) === uploadTask) {
+      inFlightDocUploads.delete(doc.id);
+    }
+  }
+});
+
+// 8. Sổ Theo Dõi - Danh sách văn bản theo quyền Xem từng sổ
+app.get('/api/documents', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 250 });
+  const currentUser = (req as any).user as User;
+  const {
+    bookId,
+    year,
+    month,
+    typeCode,
+    category,
+    signer,
+    status,
+    deletedArchive,
+    driveStatus,
+    deletedBy,
+    fromDate,
+    toDate,
+    search,
+    sort = 'newest',
+  } = req.query as Record<string, string>;
+
+  if (bookId && bookId !== 'all') {
+    const targetBook = getBookById(bookId);
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'view')) {
+      return res.status(403).json({
+        error: `Bạn chưa được cấp quyền "Xem" trong ${targetBook.name}.`,
+      });
+    }
+  }
+
+  if (deletedArchive === 'archived' || deletedArchive === 'all') {
+    if (!isSystemAdmin(currentUser)) {
+      return res.status(403).json({
+        error: 'Chỉ Admin toàn quyền hệ thống mới có quyền tra cứu VB đã xóa ở trạng thái Đã lưu trữ.',
+      });
+    }
+  }
+
+  let list = db.documents.filter((d) => {
+    const bId = getDocBookId(d);
+    if (bookId && bookId !== 'all' && bId !== bookId) return false;
+    return isSystemAdmin(currentUser) || hasBookPermission(currentUser, bId, 'view');
+  });
+
+  // Tự động đối soát nhanh các bản ghi bị kẹt quá lâu ở trạng thái 'uploading' (không thuộc tiến trình đang tải)
+  const staleInList = list.filter((d) => isDocumentStaleUploading(d));
+  if (staleInList.length > 0) {
+    await reconcileStaleUploadingDocuments(staleInList, 5).catch(() => {});
+    list = db.documents.filter((d) => {
+      const bId = getDocBookId(d);
+      if (bookId && bookId !== 'all' && bId !== bookId) return false;
+      return isSystemAdmin(currentUser) || hasBookPermission(currentUser, bId, 'view');
+    });
+  }
+
+  if (year === 'unknown') {
+    list = list.filter((d) => getDocumentFilterYear(d) === 'unknown');
+  } else if (year && year !== 'all') {
+    const y = parseInt(year, 10);
+    if (Number.isFinite(y)) {
+      list = list.filter((d) => getDocumentFilterYear(d) === y);
+    }
+  }
+
+  if (month && month !== 'all') {
+    const m = parseInt(month, 10);
+    list = list.filter((d) => {
+      const parts = (d.issueDate || '').split('/');
+      return parts.length >= 2 && parseInt(parts[1], 10) === m;
+    });
+  }
+
+  if (category && category !== 'all') {
+    if (category === 'incoming') {
+      list = list.filter((d) => d.docCategory === 'incoming');
+    } else if (category === 'outgoing') {
+      list = list.filter((d) => d.docCategory !== 'incoming');
+    }
+  }
+
+  if (typeCode && typeCode !== 'all') {
+    list = list.filter((d) => d.typeCode === typeCode);
+  }
+
+  if (signer && signer !== 'all') {
+    list = list.filter((d) => d.signer.toLowerCase() === signer.toLowerCase());
+  }
+
+  if (status === 'deleted') {
+    list = list.filter((d) => d.status === 'deleted');
+    if (deletedArchive === 'archived') {
+      list = list.filter((d) => Boolean(d.deletedListArchived));
+    } else if (deletedArchive !== 'all') {
+      list = list.filter((d) => !d.deletedListArchived);
+    }
+  } else if (status === 'all_with_deleted') {
+    // keep all
+  } else if (status && status !== 'all') {
+    list = list.filter((d) => d.status === status);
+  } else {
+    // Danh sách hiệu lực mặc định không bao gồm văn bản đã xóa
+    list = list.filter((d) => d.status !== 'deleted');
+  }
+
+  if (deletedBy && deletedBy !== 'all') {
+    const lowerDel = deletedBy.trim().toLowerCase();
+    list = list.filter(
+      (d) =>
+        (d.deletedByUsername || '').toLowerCase() === lowerDel ||
+        (d.deletedByUserId || '') === deletedBy
+    );
+  }
+
+  if (fromDate && /^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
+    list = list.filter((d) => {
+      const refIso = d.status === 'deleted' ? d.deletedAt || d.createdAt : d.createdAt;
+      return getVietnamDateKey(new Date(refIso)) >= fromDate;
+    });
+  }
+
+  if (toDate && /^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+    list = list.filter((d) => {
+      const refIso = d.status === 'deleted' ? d.deletedAt || d.createdAt : d.createdAt;
+      return getVietnamDateKey(new Date(refIso)) <= toDate;
+    });
+  }
+
+  if (driveStatus && driveStatus !== 'all') {
+    list = list.filter((d) => (d.driveStatus || 'none') === driveStatus);
+  }
+
+  if (search && search.trim()) {
+    const term = search.trim().toLowerCase();
+    list = list.filter(
+      (d) =>
+        d.id.toLowerCase().includes(term) ||
+        d.fullDocNumber.toLowerCase().includes(term) ||
+        (d.docName && d.docName.toLowerCase().includes(term)) ||
+        (d.driveFileName && d.driveFileName.toLowerCase().includes(term)) ||
+        (d.issuingAgency && d.issuingAgency.toLowerCase().includes(term)) ||
+        d.title.toLowerCase().includes(term) ||
+        d.signer.toLowerCase().includes(term) ||
+        d.issuedBy.toLowerCase().includes(term) ||
+        (d.deleteReason && d.deleteReason.toLowerCase().includes(term)) ||
+        (d.notes && d.notes.toLowerCase().includes(term))
+    );
+  }
+
+  if (sort === 'newest') {
+    list.sort(
+      (a, b) =>
+        new Date(b.deletedAt || b.createdAt).getTime() -
+        new Date(a.deletedAt || a.createdAt).getTime()
+    );
+  } else if (sort === 'oldest') {
+    list.sort(
+      (a, b) =>
+        new Date(a.deletedAt || a.createdAt).getTime() -
+        new Date(b.deletedAt || b.createdAt).getTime()
+    );
+  } else if (sort === 'number_asc') {
+    list.sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+  } else if (sort === 'number_desc') {
+    list.sort((a, b) => b.sequenceNumber - a.sequenceNumber);
+  }
+
+  res.json({
+    total: list.length,
+    documents: list.map(stripLargeIndexFieldsForList),
+  });
+});
+
+// Tra cứu theo nội dung bên trong PDF (phải đặt trước /api/documents/:id)
+app.get('/api/documents/search-pdf', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const bookId = typeof req.query.bookId === 'string' ? req.query.bookId.trim() : '';
+  const yearParam = typeof req.query.year === 'string' ? req.query.year.trim() : '';
+  const includeDeleted = req.query.includeDeleted === 'true';
+
+  if (bookId && bookId !== 'all') {
+    const targetBook = getBookById(bookId);
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'view')) {
+      return res.status(403).json({
+        error: `Bạn chưa được cấp quyền "Xem" trong ${targetBook.name}.`,
+      });
+    }
+  }
+
+  // Lọc quyền trước khi tìm kiếm hay đếm
+  const permittedDocs = db.documents.filter((d) => {
+    const bId = getDocBookId(d);
+    if (bookId && bookId !== 'all' && bId !== bookId) return false;
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, bId, 'view')) return false;
+    if (!includeDeleted && d.status === 'deleted') return false;
+    if (yearParam && yearParam !== 'all') {
+      if (yearParam === 'unknown') {
+        if (getDocumentFilterYear(d) !== 'unknown') return false;
+      } else {
+        const y = parseInt(yearParam, 10);
+        if (Number.isFinite(y) && getDocumentFilterYear(d) !== y) return false;
+      }
+    }
+    return true;
+  });
+
+  const pdfDocs = permittedDocs.filter((d) => {
+    const fileName = (d.driveFileName || d.driveOriginalFileName || '').toLowerCase();
+    return (
+      d.docCategory === 'incoming' ||
+      fileName.endsWith('.pdf') ||
+      (Array.isArray(d.pdfPageContents) && d.pdfPageContents.length > 0) ||
+      getEffectiveAttachments(d).some((a) => a.group === 'signed_pdf' || a.fileName.toLowerCase().endsWith('.pdf'))
+    );
+  });
+
+  let indexedCount = 0;
+  let unindexedCount = 0;
+  for (const d of pdfDocs) {
+    const hasIndex =
+      Array.isArray(d.pdfPageContents) &&
+      d.pdfPageContents.some((p) => (p.text || '').trim().length >= 10);
+    if (hasIndex) indexedCount++;
+    else unindexedCount++;
+  }
+
+  if (!q) {
+    return res.json({
+      total: 0,
+      matches: [],
+      indexedCount,
+      unindexedCount,
+    });
+  }
+
+  const lowerQ = q.toLowerCase();
+  const normQ = removeVietnameseDiacritics(q).toLowerCase().replace(/\s+/g, ' ').trim();
+  const matches: PdfContentSearchMatch[] = [];
+
+  for (const d of pdfDocs) {
+    const pages = Array.isArray(d.pdfPageContents) ? d.pdfPageContents : [];
+    const hasText = pages.some((p) => (p.text || '').trim().length >= 10);
+    if (!hasText) continue;
+
+    const book = getBookById(getDocBookId(d));
+    const officialAtt = getOfficialAttachment(d);
+    const pdfAtt =
+      getEffectiveAttachments(d).find(
+        (a) => a.group === 'signed_pdf' || a.fileName.toLowerCase().endsWith('.pdf')
+      ) || officialAtt;
+
+    for (const p of pages) {
+      const rawText = (p.text || '').trim();
+      if (!rawText) continue;
+
+      const lowerRaw = rawText.toLowerCase();
+      let idx = lowerRaw.indexOf(lowerQ);
+      let usedNorm = false;
+
+      if (idx === -1 && normQ) {
+        const normText = removeVietnameseDiacritics(rawText).toLowerCase();
+        idx = normText.indexOf(normQ);
+        usedNorm = true;
+      }
+
+      if (idx === -1) continue;
+
+      const start = Math.max(0, idx - 80);
+      const end = Math.min(rawText.length, idx + q.length + 140);
+      let snippet = rawText.slice(start, end).replace(/\s+/g, ' ').trim();
+      if (usedNorm && snippet.length < 20) {
+        snippet = rawText.slice(0, 220).replace(/\s+/g, ' ').trim();
+      }
+      if (start > 0) snippet = `…${snippet}`;
+      if (end < rawText.length) snippet = `${snippet}…`;
+
+      matches.push({
+        docId: d.id,
+        bookId: book.id,
+        bookCode: book.code,
+        bookName: book.name,
+        fullDocNumber: d.fullDocNumber,
+        docName: d.docName || d.title,
+        docCategory: d.docCategory,
+        issueDate: d.issueDate,
+        year: d.year,
+        typeCode: d.typeCode,
+        status: d.status,
+        page: p.page,
+        snippet,
+        attachmentId: pdfAtt?.id,
+        pdfTextStatus: 'indexed',
+      });
+    }
+  }
+
+  return res.json({
+    total: matches.length,
+    matches: matches.slice(0, 120),
+    indexedCount,
+    unindexedCount,
+  });
+});
+
+// Chi tiết 1 văn bản (luôn đọc bản DB mới nhất + tự động đối soát nếu kẹt 'uploading')
+app.get('/api/documents/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+  await ensureLatestDb({ maxAgeMs: 0 });
+  let doc = db.documents.find((d) => d.id === id);
+  if (!doc) return res.status(404).json({ error: 'Không tìm thấy văn bản' });
+  const docBookId = getDocBookId(doc);
+  const canReadOwnIssued =
+    doc.issuedByUserId === currentUser.id &&
+    (hasBookPermission(currentUser, docBookId, 'issue_number') ||
+      hasBookPermission(currentUser, docBookId, 'import_incoming'));
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, docBookId, 'view') && !canReadOwnIssued) {
+    return res.status(403).json({ error: 'Bạn không có quyền xem hồ sơ thuộc sổ này.' });
+  }
+  if (isDocumentStaleUploading(doc)) {
+    await reconcileStaleUploadingDocuments([doc], 1).catch(() => {});
+    doc = db.documents.find((d) => d.id === id) || doc;
+  }
+  res.json({ document: doc });
+});
+
+// Đối soát & xác minh trực tiếp trạng thái lưu Google Drive cho 1 văn bản cụ thể
+app.post('/api/documents/:id/verify-drive', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) return res.status(404).json({ error: 'Không tìm thấy hồ sơ văn bản.' });
+
+  const docBook = resolveStrictBookForDocument(doc);
+  if (!docBook) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản này. Hệ thống từ chối tự động mặc định sang đơn vị khác.',
+    });
+  }
+  const docBookId = docBook.id;
+  const canVerify =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, docBookId, 'view') ||
+    hasBookPermission(currentUser, docBookId, 'manage_book') ||
+    hasBookPermission(currentUser, docBookId, 'replace_file') ||
+    (doc.issuedByUserId === currentUser.id &&
+      (hasBookPermission(currentUser, docBookId, 'issue_number') ||
+        hasBookPermission(currentUser, docBookId, 'import_incoming')));
+  if (!canVerify) {
+    return res.status(403).json({ error: 'Bạn không có quyền đối soát trạng thái Google Drive của hồ sơ này.' });
+  }
+
+  const result = await reconcileSingleDocumentDriveStatus(doc.id, {
+    actor: currentUser,
+    forceCheck: false,
+    allowNotFoundTransitionToFailed: true,
+    auditReason: 'Người dùng kích hoạt đối soát trạng thái lưu Google Drive',
+  });
+  return res.json({
+    success: true,
+    document: result.document || doc,
+    outcome: result.outcome,
+    previousStatus: result.previousStatus,
+    newStatus: result.newStatus,
+    matchedBy: result.matchedBy,
+    ...(result.errorCode ? { code: result.errorCode } : {}),
+    message: result.message,
+  });
+});
+
+// Kiểm tra quyền và trả liên kết mở tệp Google Drive (hỗ trợ chọn attachmentId cụ thể hoặc lấy bản chính thức)
+app.get('/api/documents/:id/open-file', requireAuth, (req, res) => {
+  const { id } = req.params;
+  const attachmentId = typeof req.query.attachmentId === 'string' ? req.query.attachmentId.trim() : '';
+  const currentUser = (req as any).user as User;
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) return res.status(404).json({ error: 'Không tìm thấy văn bản' });
+
+  const docBookId = getDocBookId(doc);
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, docBookId, 'view')) {
+    return res.status(403).json({ error: 'Bạn không có quyền mở tệp trong sổ này.' });
+  }
+
+  if (attachmentId) {
+    const targetAtt = getEffectiveAttachments(doc).find((a) => a.id === attachmentId);
+    if (!targetAtt || targetAtt.driveStatus !== 'saved' || !targetAtt.driveFileUrl) {
+      return res.status(404).json({ error: 'Tệp đính kèm được chọn chưa được lưu trên Google Drive.' });
+    }
+    return res.json({
+      url: targetAtt.driveFileUrl,
+      fileName: targetAtt.fileName || '',
+      fileId: targetAtt.driveFileId || '',
+      attachmentId: targetAtt.id,
+    });
+  }
+
+  const official = getOfficialAttachment(doc);
+  if (official && official.driveStatus === 'saved' && official.driveFileUrl) {
+    return res.json({
+      url: official.driveFileUrl,
+      fileName: official.fileName || '',
+      fileId: official.driveFileId || '',
+      attachmentId: official.id,
+    });
+  }
+
+  if (doc.driveStatus !== 'saved' || !doc.driveFileUrl) {
+    return res.status(404).json({ error: 'Hồ sơ này chưa có tệp được lưu trên Google Drive.' });
+  }
+
+  res.json({
+    url: doc.driveFileUrl,
+    fileName: doc.driveFileName || '',
+    fileId: doc.driveFileId || '',
+  });
+});
+
+// Xác nhận ngày văn bản thống nhất cho hồ sơ có ngày chưa thống nhất (chỉ Admin hệ thống hoặc Quản trị sổ)
+app.post('/api/documents/:id/confirm-date', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+  await ensureLatestDb({ maxAgeMs: 0 });
+
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) {
+    return res.status(404).json({ error: 'Không tìm thấy hồ sơ văn bản.' });
+  }
+
+  const targetBook = resolveStrictBookForDocument(doc);
+  if (!targetBook) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản này.',
+    });
+  }
+  const canManageBook =
+    isSystemAdmin(currentUser) || hasBookPermission(currentUser, targetBook.id, 'manage_book');
+  if (!canManageBook) {
+    return res.status(403).json({
+      error: `Chỉ Quản trị viên hệ thống hoặc Quản trị ${targetBook.name} mới có quyền xác nhận ngày thống nhất.`,
+    });
+  }
+
+  if (doc.status === 'cancelled' || doc.status === 'deleted') {
+    return res.status(400).json({
+      error:
+        doc.status === 'deleted'
+          ? 'Không thể xác nhận ngày cho văn bản đã bị xóa.'
+          : 'Không thể xác nhận ngày cho văn bản đã bị hủy.',
+    });
+  }
+
+  const rawDate = typeof req.body?.confirmedDate === 'string' ? req.body.confirmedDate.trim() : '';
+  const confirmedDate = normalizeDateOnlyDdMmYyyy(rawDate);
+  if (!confirmedDate || !isValidCalendarDateDdMmYyyy(confirmedDate)) {
+    return res.status(400).json({
+      error: 'Ngày thống nhất không hợp lệ (định dạng chuẩn dd/mm/yyyy).',
+    });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const lockedDoc = db.documents.find((d) => d.id === id);
+    if (!lockedDoc) {
+      return res.status(404).json({ error: 'Không tìm thấy hồ sơ văn bản.' });
+    }
+    const lockedBook = resolveStrictBookForDocument(lockedDoc);
+    if (!lockedBook) {
+      return res.status(400).json({
+        code: 'BOOK_NOT_FOUND',
+        error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản này.',
+      });
+    }
+
+    const prevIssueDate = lockedDoc.issueDate || null;
+    const prevSignDate = lockedDoc.signDate || null;
+    const nowIso = new Date().toISOString();
+    const yearParts = confirmedDate.split('/');
+    const parsedYear = yearParts.length === 3 ? parseInt(yearParts[2], 10) : lockedDoc.year;
+
+    lockedDoc.issueDate = confirmedDate;
+    lockedDoc.signDate = confirmedDate;
+    if (Number.isFinite(parsedYear) && lockedDoc.docCategory === 'incoming') {
+      lockedDoc.year = parsedYear;
+    }
+    lockedDoc.pendingDateConfirmation = false;
+    lockedDoc.dateConfirmedBy = currentUser.displayName?.trim() || currentUser.fullName;
+    lockedDoc.dateConfirmedByUserId = currentUser.id;
+    lockedDoc.dateConfirmedAt = nowIso;
+
+    if (Array.isArray(lockedDoc.reviewReasons)) {
+      lockedDoc.reviewReasons = lockedDoc.reviewReasons.filter(
+        (r) => !/ngày trên văn bản chưa thống nhất|chờ quản trị viên xác nhận ngày/i.test(r)
+      );
+      if (lockedDoc.reviewReasons.length === 0) {
+        delete lockedDoc.reviewReasons;
+      }
+    }
+    lockedDoc.needsReview = Boolean(lockedDoc.reviewReasons && lockedDoc.reviewReasons.length > 0);
+
+    recordDocumentHistoryEntry({
+      doc: lockedDoc,
+      book: lockedBook,
+      actor: currentUser,
+      action: 'confirm_date',
+      changes: {
+        issueDate: { old: prevIssueDate, new: confirmedDate },
+        ...(prevSignDate !== confirmedDate
+          ? { signDate: { old: prevSignDate, new: confirmedDate } }
+          : {}),
+      },
+      reason: 'Quản trị viên xác nhận ngày văn bản thống nhất',
+      timestampIso: nowIso,
+    });
+
+    if (lockedDoc.syncStatus === 'synced') {
+      lockedDoc.syncStatus = 'pending';
+    }
+    await saveDatabasePersistent(db);
+    broadcastSSE('document_updated', { document: lockedDoc });
+    await syncToGoogleSheets(lockedDoc, 'update');
+
+    return res.json({ success: true, document: lockedDoc });
+  } finally {
+    releaseLock();
+  }
+});
+
+// Chỉnh sửa văn bản (Yêu cầu quyền "Sửa" trong sổ; sửa số thứ tự văn bản đi chỉ dành cho Admin hoặc Quản trị sổ)
+app.put('/api/documents/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const {
+    docName,
+    title,
+    signer,
+    signerRole,
+    notes,
+    sequenceNumber,
+    fullDocNumber,
+    parentAgency,
+    issuingAgency,
+    issueDate,
+    signDate,
+    confirmUnifiedDate,
+    needsReview,
+  } = req.body;
+  const currentUser = (req as any).user as User;
+
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) return res.status(404).json({ error: 'Không tìm thấy văn bản' });
+
+  const targetBook = resolveStrictBookForDocument(doc);
+  if (!targetBook) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản cần sửa.',
+    });
+  }
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'edit')) {
+    return res.status(403).json({
+      error: `Bạn cần quyền "Sửa" trong ${targetBook.name} để chỉnh sửa thông tin văn bản này.`,
+    });
+  }
+
+  if (doc.status === 'cancelled' || doc.status === 'deleted') {
+    return res.status(400).json({
+      error:
+        doc.status === 'deleted'
+          ? 'Không thể chỉnh sửa văn bản đã bị xóa'
+          : 'Không thể chỉnh sửa văn bản đã bị hủy',
+    });
+  }
+
+  const changes: Record<string, { old: string | null; new: string | null }> = {};
+  const canManageBook = isSystemAdmin(currentUser) || hasBookPermission(currentUser, targetBook.id, 'manage_book');
+
+  if (doc.pendingDateConfirmation && confirmUnifiedDate && !canManageBook) {
+    return res.status(403).json({
+      error: `Chỉ Quản trị viên hệ thống hoặc Quản trị ${targetBook.name} mới có quyền xác nhận ngày thống nhất.`,
+    });
+  }
+
+  if (doc.docCategory === 'incoming') {
+    if (fullDocNumber && fullDocNumber.trim() !== doc.fullDocNumber) {
+      changes.fullDocNumber = { old: doc.fullDocNumber, new: fullDocNumber.trim() };
+      doc.fullDocNumber = fullDocNumber.trim();
+    }
+  } else if (canManageBook) {
+    if (typeof sequenceNumber === 'number' && sequenceNumber !== doc.sequenceNumber) {
+      const newSeq = sequenceNumber;
+      changes.sequenceNumber = { old: String(doc.sequenceNumber), new: String(newSeq) };
+      doc.sequenceNumber = newSeq;
+
+      const seqStr = formatSequenceNumber(newSeq);
+      const computedDocNum = renderFullDocNumber(
+        targetBook.numberFormat,
+        seqStr,
+        doc.typeCode,
+        targetBook.unitCode
+      );
+      const targetFullNum = fullDocNumber && fullDocNumber.trim() ? fullDocNumber.trim() : computedDocNum;
+      changes.fullDocNumber = { old: doc.fullDocNumber, new: targetFullNum };
+      doc.fullDocNumber = targetFullNum;
+    } else if (fullDocNumber && fullDocNumber.trim() !== doc.fullDocNumber) {
+      changes.fullDocNumber = { old: doc.fullDocNumber, new: fullDocNumber.trim() };
+      doc.fullDocNumber = fullDocNumber.trim();
+    }
+  }
+
+  if (docName !== undefined && docName.trim() !== (doc.docName || '')) {
+    changes.docName = { old: doc.docName || null, new: docName.trim() };
+    doc.docName = docName.trim();
+  }
+
+  if (title !== undefined && title.trim() !== doc.title) {
+    changes.title = { old: doc.title, new: title.trim() };
+    doc.title = title.trim();
+  }
+
+  if (signer && signer.trim() !== doc.signer) {
+    changes.signer = { old: doc.signer, new: signer.trim() };
+    doc.signer = signer.trim();
+  }
+
+  if (signerRole && signerRole.trim() !== doc.signerRole) {
+    changes.signerRole = { old: doc.signerRole, new: signerRole.trim() };
+    doc.signerRole = signerRole.trim();
+  }
+
+  if (typeof parentAgency === 'string' && parentAgency.trim() !== (doc.parentAgency || '')) {
+    changes.parentAgency = { old: doc.parentAgency || '', new: parentAgency.trim() };
+    doc.parentAgency = parentAgency.trim() || undefined;
+  }
+
+  if (typeof issuingAgency === 'string' && issuingAgency.trim() !== (doc.issuingAgency || '')) {
+    changes.issuingAgency = { old: doc.issuingAgency || '', new: issuingAgency.trim() };
+    doc.issuingAgency = issuingAgency.trim();
+  }
+
+  if (typeof issueDate === 'string') {
+    const trimmedIssueDate = issueDate.trim();
+    if (!trimmedIssueDate && doc.docCategory === 'incoming') {
+      if (doc.issueDate) {
+        changes.issueDate = { old: doc.issueDate, new: '' };
+        doc.issueDate = '';
+      }
+    } else if (trimmedIssueDate) {
+      const normalizedIssueDate = normalizeDateOnlyDdMmYyyy(trimmedIssueDate);
+      if (!normalizedIssueDate) {
+        return res.status(400).json({ error: 'Ngày văn bản không hợp lệ (định dạng chuẩn dd/mm/yyyy).' });
+      }
+      if (normalizedIssueDate !== doc.issueDate) {
+        changes.issueDate = { old: doc.issueDate, new: normalizedIssueDate };
+        doc.issueDate = normalizedIssueDate;
+      }
+      if (doc.docCategory === 'incoming') {
+        const yp = normalizedIssueDate.split('/')[2];
+        if (/^\d{4}$/.test(yp)) doc.year = parseInt(yp, 10);
+      }
+    }
+  }
+
+  if (typeof signDate === 'string') {
+    const trimmedSign = signDate.trim();
+    if (trimmedSign) {
+      const normalizedSignDate = normalizeDateOnlyDdMmYyyy(trimmedSign);
+      if (!normalizedSignDate) {
+        return res.status(400).json({ error: 'Ngày ký không hợp lệ (định dạng chuẩn dd/mm/yyyy).' });
+      }
+      if (normalizedSignDate !== (doc.signDate || '')) {
+        changes.signDate = { old: doc.signDate || '', new: normalizedSignDate };
+        doc.signDate = normalizedSignDate;
+      }
+    } else if (doc.signDate) {
+      changes.signDate = { old: doc.signDate, new: '' };
+      doc.signDate = undefined;
+    }
+  }
+
+  if (confirmUnifiedDate && canManageBook && doc.issueDate && isValidCalendarDateDdMmYyyy(doc.issueDate)) {
+    const prevPending = Boolean(doc.pendingDateConfirmation);
+    if (prevPending) {
+      changes.pendingDateConfirmation = { old: 'true', new: 'false' };
+    }
+    doc.pendingDateConfirmation = false;
+    if (doc.signDate !== doc.issueDate) {
+      changes.signDate = { old: doc.signDate || '', new: doc.issueDate };
+    }
+    doc.signDate = doc.issueDate;
+    doc.dateConfirmedBy = currentUser.displayName?.trim() || currentUser.fullName;
+    doc.dateConfirmedByUserId = currentUser.id;
+    doc.dateConfirmedAt = new Date().toISOString();
+    if (Array.isArray(doc.reviewReasons)) {
+      doc.reviewReasons = doc.reviewReasons.filter(
+        (r) => !/ngày trên văn bản chưa thống nhất|chờ quản trị viên xác nhận ngày/i.test(r)
+      );
+      if (doc.reviewReasons.length === 0) delete doc.reviewReasons;
+      doc.needsReview = Boolean(doc.reviewReasons && doc.reviewReasons.length > 0);
+    }
+  }
+
+  if (typeof notes === 'string' && notes.trim() !== (doc.notes || '')) {
+    changes.notes = { old: doc.notes || '', new: notes.trim() };
+    doc.notes = notes.trim();
+  }
+
+  if (typeof needsReview === 'boolean' && needsReview !== Boolean(doc.needsReview)) {
+    changes.needsReview = { old: String(Boolean(doc.needsReview)), new: String(needsReview) };
+    doc.needsReview = needsReview;
+    if (!needsReview) delete doc.reviewReasons;
+  }
+
+  if (Object.keys(changes).length > 0) {
+    recordDocumentHistoryEntry({
+      doc,
+      book: targetBook,
+      actor: currentUser,
+      action: 'update',
+      changes,
+    });
+    if (doc.syncStatus === 'synced') {
+      doc.syncStatus = 'pending';
+    }
+    await saveDatabasePersistent(db);
+    broadcastSSE('document_updated', { document: doc });
+    await syncToGoogleSheets(doc, 'update');
+  }
+
+  res.json({ document: doc });
+});
+
+function collectAllDocumentDriveFileIds(doc: DocumentRecord): string[] {
+  const ids = new Set<string>();
+  if (doc.driveFileId && doc.driveFileId.trim()) {
+    ids.add(doc.driveFileId.trim());
+  }
+  if (Array.isArray(doc.attachments)) {
+    for (const att of doc.attachments) {
+      if (att?.driveFileId && att.driveFileId.trim()) {
+        ids.add(att.driveFileId.trim());
+      }
+      if (Array.isArray(att?.versions)) {
+        for (const ver of att.versions) {
+          if (ver?.driveFileId && ver.driveFileId.trim()) {
+            ids.add(ver.driveFileId.trim());
+          }
+        }
+      }
+    }
+  }
+  return Array.from(ids);
+}
+
+function buildDocumentOriginalFolderMap(
+  doc: DocumentRecord,
+  deletedFolderId?: string,
+  extraFileResults?: Array<{
+    fileId: string;
+    previousFolderId?: string;
+    previousFolderPath?: string;
+  }>
+): Record<string, { folderId?: string; folderPath?: string }> {
+  const result: Record<string, { folderId?: string; folderPath?: string }> = {};
+  const isDeletedFolder = (folderId?: string, folderPath?: string) => {
+    if (deletedFolderId && folderId && folderId.trim() === deletedFolderId.trim()) return true;
+    if (folderPath && /\/VB đã xóa$/i.test(folderPath.trim())) return true;
+    return false;
+  };
+
+  if (doc.driveOriginalFolderMap && typeof doc.driveOriginalFolderMap === 'object') {
+    for (const [fid, info] of Object.entries(doc.driveOriginalFolderMap)) {
+      if (!fid || !info) continue;
+      if (!isDeletedFolder(info.folderId, info.folderPath)) {
+        result[fid] = {
+          ...(info.folderId ? { folderId: info.folderId } : {}),
+          ...(info.folderPath ? { folderPath: info.folderPath } : {}),
+        };
+      }
+    }
+  }
+
+  const recordIfOriginal = (fid?: string, folderId?: string, folderPath?: string) => {
+    const cleanFid = (fid || '').trim();
+    if (!cleanFid) return;
+    if (isDeletedFolder(folderId, folderPath)) return;
+    const prev = result[cleanFid] || {};
+    const nextFolderId = prev.folderId || (folderId && folderId.trim()) || undefined;
+    const nextFolderPath = prev.folderPath || (folderPath && folderPath.trim()) || undefined;
+    if (nextFolderId || nextFolderPath) {
+      result[cleanFid] = {
+        ...(nextFolderId ? { folderId: nextFolderId } : {}),
+        ...(nextFolderPath ? { folderPath: nextFolderPath } : {}),
+      };
+    }
+  };
+
+  recordIfOriginal(doc.driveFileId, doc.driveFolderId, doc.driveFolderPath);
+  if (Array.isArray(doc.attachments)) {
+    for (const att of doc.attachments) {
+      recordIfOriginal(att?.driveFileId, att?.driveFolderId, att?.driveFolderPath);
+      if (Array.isArray(att?.versions)) {
+        for (const ver of att.versions) {
+          recordIfOriginal(ver?.driveFileId, ver?.driveFolderId, ver?.driveFolderPath);
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(extraFileResults)) {
+    for (const fr of extraFileResults) {
+      if (!fr?.fileId) continue;
+      recordIfOriginal(fr.fileId, fr.previousFolderId, fr.previousFolderPath);
+    }
+  }
+
+  return result;
+}
+
+const activeDeleteOrRestoreDocIds = new Set<string>();
+
+// XÓA VĂN BẢN (Yêu cầu quyền "Xóa VB" hoặc Quản trị viên, bắt buộc nhập lý do & xác nhận;
+// chuyển đồng bộ toàn bộ tệp chính, phụ lục và phiên bản cũ sang thư mục "<Tên sổ>/<Năm>/VB đã xóa" trên Google Drive;
+// chỉ đánh dấu đã xóa sau khi xác nhận chuyển thành công; nếu lỗi 1 phần thì lưu trạng thái từng tệp để thử lại an toàn không chuyển trùng)
+app.delete('/api/documents/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+
+  if (activeDeleteOrRestoreDocIds.has(id)) {
+    return res.status(409).json({
+      code: 'DOCUMENT_OPERATION_IN_PROGRESS',
+      error: 'Văn bản này đang được xử lý xóa/khôi phục từ một thiết bị hoặc phiên khác. Vui lòng đợi giây lát rồi làm mới.',
+    });
+  }
+  activeDeleteOrRestoreDocIds.add(id);
+
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const doc = db.documents.find((d) => d.id === id);
+    if (!doc) return res.status(404).json({ error: 'Không tìm thấy văn bản cần xóa' });
+
+    const targetBook = resolveStrictBookForDocument(doc);
+    if (!targetBook) {
+      return res.status(400).json({
+        code: 'BOOK_NOT_FOUND',
+        error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản cần xóa. Hệ thống từ chối tự động mặc định sang đơn vị khác.',
+      });
+    }
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'delete')) {
+      return res.status(403).json({
+        error: `Bạn cần quyền "Xóa văn bản" trong ${targetBook.name} để thực hiện thao tác này.`,
+      });
+    }
+
+    if (doc.status === 'deleted') {
+      return res.status(400).json({ error: 'Văn bản này đã được xóa trước đó.' });
+    }
+
+    const rawReason = req.body?.reason ?? req.body?.deleteReason ?? '';
+    const cleanReason = typeof rawReason === 'string' ? rawReason.trim() : '';
+    if (!cleanReason) {
+      return res.status(400).json({ error: 'Bắt buộc nhập lý do xóa văn bản.' });
+    }
+    if (req.body?.confirmed === false) {
+      return res.status(400).json({ error: 'Vui lòng xác nhận trước khi xóa văn bản.' });
+    }
+
+    // Bước 1: Chuyển đồng bộ toàn bộ tệp trên Google Drive (tệp chính, phụ lục, phiên bản cũ)
+    // sang thư mục "<Tên sổ>/<Năm>/VB đã xóa" TRƯỚC khi ghi trạng thái "Đã xóa" trong DB.
+    const initialFileIds = collectAllDocumentDriveFileIds(doc);
+    const docYear = getDocumentFilterYear(doc) || getVietnamTimeInfo().year;
+    let driveMoveResult: Awaited<ReturnType<typeof moveFilesToDeletedFolderOnGoogleDrive>> | null = null;
+
+    if (initialFileIds.length > 0) {
+      const driveConfig = resolveDriveForBook(targetBook);
+      driveMoveResult = await moveFilesToDeletedFolderOnGoogleDrive({
+        config: driveConfig,
+        fileIds: initialFileIds,
+        docId: doc.id,
+        bookName: targetBook.name,
+        bookCode: targetBook.code,
+        unit: targetBook.code,
+        year: docYear,
+        folderCache: db.driveFolderCache,
+      });
+
+      if (!driveMoveResult.ok) {
+        const failRelease = await atomicLock.acquire();
+        let persistedActiveDoc: DocumentRecord | undefined;
+        try {
+          await ensureLatestDb({ maxAgeMs: 0 });
+          const liveDoc = db.documents.find((d) => d.id === id);
+          if (liveDoc && liveDoc.status !== 'deleted') {
+            const movedSoFar = Array.from(
+              new Set([...driveMoveResult.movedIds, ...driveMoveResult.alreadyInDeletedIds])
+            );
+            liveDoc.driveOriginalFolderMap = buildDocumentOriginalFolderMap(
+              liveDoc,
+              driveMoveResult.targetFolderId,
+              driveMoveResult.fileResults
+            );
+            liveDoc.driveDeleteSyncStatus = driveMoveResult.partial ? 'partial' : 'failed';
+            liveDoc.driveDeleteError =
+              driveMoveResult.error ||
+              'Không thể chuyển tệp sang thư mục "VB đã xóa" trên Google Drive.';
+            if (driveMoveResult.targetFolderId) {
+              liveDoc.driveDeletedFolderId = driveMoveResult.targetFolderId;
+            }
+            if (driveMoveResult.folderPath) {
+              liveDoc.driveDeletedFolderPath = driveMoveResult.folderPath;
+            }
+            if (movedSoFar.length > 0) {
+              liveDoc.driveMovedFileIds = movedSoFar;
+            }
+            if (driveMoveResult.fileResults.length > 0) {
+              liveDoc.driveDeleteFileResults = driveMoveResult.fileResults;
+            }
+            await saveDatabasePersistent(db);
+            broadcastSSE('document_updated', { document: liveDoc });
+            persistedActiveDoc = liveDoc;
+          }
+        } finally {
+          failRelease();
+        }
+
+        return res.status(502).json({
+          code: 'DRIVE_DELETE_SYNC_FAILED',
+          partial: driveMoveResult.partial,
+          error:
+            driveMoveResult.error ||
+            'Không thể chuyển tệp sang thư mục "VB đã xóa" trên Google Drive. Hệ thống giữ nguyên trạng thái văn bản để tránh lệch dữ liệu.',
+          driveDeleteSync: driveMoveResult,
+          document: persistedActiveDoc,
+        });
+      }
+    }
+
+    const releaseLock = await atomicLock.acquire();
+    try {
+      await ensureLatestDb({ maxAgeMs: 0 });
+      const lockedDoc = db.documents.find((d) => d.id === id);
+      if (!lockedDoc || lockedDoc.status === 'deleted') {
+        return res.status(400).json({ error: 'Văn bản này đã được xóa trước đó.' });
+      }
+
+      const lockedBook = resolveStrictBookForDocument(lockedDoc);
+      if (!lockedBook) {
+        return res.status(400).json({
+          code: 'BOOK_NOT_FOUND',
+          error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản cần xóa.',
+        });
+      }
+
+      // Nếu trong lúc đang gọi Drive có thêm tệp mới phát sinh trên văn bản, chuyển nốt trước khi xóa
+      const lockedFileIds = collectAllDocumentDriveFileIds(lockedDoc);
+      const alreadyHandledSet = new Set(initialFileIds);
+      const extraFileIds = lockedFileIds.filter((fid) => !alreadyHandledSet.has(fid));
+      if (extraFileIds.length > 0) {
+        const extraResult = await moveFilesToDeletedFolderOnGoogleDrive({
+          config: resolveDriveForBook(lockedBook),
+          fileIds: extraFileIds,
+          docId: lockedDoc.id,
+          bookName: lockedBook.name,
+          bookCode: lockedBook.code,
+          unit: lockedBook.code,
+          year: getDocumentFilterYear(lockedDoc) || getVietnamTimeInfo().year,
+          folderCache: db.driveFolderCache,
+        });
+        if (!extraResult.ok) {
+          const combinedMoved = Array.from(
+            new Set([
+              ...(driveMoveResult?.movedIds || []),
+              ...(driveMoveResult?.alreadyInDeletedIds || []),
+              ...extraResult.movedIds,
+              ...extraResult.alreadyInDeletedIds,
+            ])
+          );
+          const combinedResults = [
+            ...(driveMoveResult?.fileResults || []),
+            ...extraResult.fileResults,
+          ];
+          lockedDoc.driveOriginalFolderMap = buildDocumentOriginalFolderMap(
+            lockedDoc,
+            extraResult.targetFolderId || driveMoveResult?.targetFolderId,
+            combinedResults
+          );
+          lockedDoc.driveDeleteSyncStatus = combinedMoved.length > 0 ? 'partial' : 'failed';
+          lockedDoc.driveDeleteError =
+            extraResult.error ||
+            'Có tệp đính kèm mới phát sinh không thể chuyển sang thư mục "VB đã xóa" trên Google Drive.';
+          lockedDoc.driveMovedFileIds = combinedMoved;
+          lockedDoc.driveDeleteFileResults = combinedResults;
+          await saveDatabasePersistent(db);
+          broadcastSSE('document_updated', { document: lockedDoc });
+
+          return res.status(502).json({
+            code: 'DRIVE_DELETE_SYNC_FAILED',
+            partial: combinedMoved.length > 0,
+            error:
+              extraResult.error ||
+              'Có tệp đính kèm mới phát sinh không thể chuyển sang thư mục "VB đã xóa" trên Google Drive. Hệ thống giữ nguyên trạng thái văn bản.',
+            driveDeleteSync: extraResult,
+            document: lockedDoc,
+          });
+        }
+        driveMoveResult = driveMoveResult
+          ? {
+              ...driveMoveResult,
+              targetFolderId: extraResult.targetFolderId || driveMoveResult.targetFolderId,
+              folderPath: extraResult.folderPath || driveMoveResult.folderPath,
+              movedIds: Array.from(new Set([...driveMoveResult.movedIds, ...extraResult.movedIds])),
+              alreadyInDeletedIds: Array.from(
+                new Set([
+                  ...driveMoveResult.alreadyInDeletedIds,
+                  ...extraResult.alreadyInDeletedIds,
+                ])
+              ),
+              alreadyMissingIds: Array.from(
+                new Set([...driveMoveResult.alreadyMissingIds, ...extraResult.alreadyMissingIds])
+              ),
+              fileResults: [...driveMoveResult.fileResults, ...extraResult.fileResults],
+            }
+          : extraResult;
+      }
+
+      const prevStatus = lockedDoc.status;
+      const prevFolderPath = lockedDoc.driveFolderPath || null;
+      const originalFolderMap = buildDocumentOriginalFolderMap(
+        lockedDoc,
+        driveMoveResult?.targetFolderId,
+        driveMoveResult?.fileResults
+      );
+      const deletedSnapshot = buildDocumentSnapshot(lockedDoc, lockedBook);
+      const nowIso = new Date().toISOString();
+      const nowVn = formatVietnamDateTime(new Date(nowIso));
+
+      lockedDoc.status = 'deleted';
+      lockedDoc.deleteReason = cleanReason;
+      lockedDoc.deletedAt = nowIso;
+      lockedDoc.deletedAtVietnam = nowVn;
+      lockedDoc.deletedBy = `${currentUser.fullName} (${currentUser.username})`;
+      lockedDoc.deletedByUsername = currentUser.username;
+      lockedDoc.deletedByUserId = currentUser.id;
+      lockedDoc.deletedSnapshot = deletedSnapshot;
+      lockedDoc.excelMovedToDeletedSheet = false;
+      lockedDoc.excelRemovedFromMainSheet = false;
+      delete lockedDoc.excelSyncError;
+      delete lockedDoc.excelSyncedAt;
+      lockedDoc.excelSyncTargets = {};
+      if (Object.keys(originalFolderMap).length > 0) {
+        lockedDoc.driveOriginalFolderMap = originalFolderMap;
+      }
+
+      if (driveMoveResult && lockedFileIds.length > 0) {
+        const movedOrPresentIds = Array.from(
+          new Set([...driveMoveResult.movedIds, ...driveMoveResult.alreadyInDeletedIds])
+        );
+        const movedSet = new Set(movedOrPresentIds);
+        lockedDoc.driveDeleteSyncStatus = 'moved_to_deleted';
+        lockedDoc.driveDeletedAt = nowIso;
+        lockedDoc.driveDeletedFolderId = driveMoveResult.targetFolderId;
+        lockedDoc.driveDeletedFolderPath = driveMoveResult.folderPath;
+        lockedDoc.driveMovedFileIds = movedOrPresentIds;
+        lockedDoc.driveDeleteFileResults = driveMoveResult.fileResults;
+        delete lockedDoc.driveDeleteError;
+
+        if (driveMoveResult.targetFolderId && driveMoveResult.folderPath) {
+          if (lockedDoc.driveFileId && movedSet.has(lockedDoc.driveFileId)) {
+            lockedDoc.driveFolderId = driveMoveResult.targetFolderId;
+            lockedDoc.driveFolderPath = driveMoveResult.folderPath;
+          }
+          if (Array.isArray(lockedDoc.attachments)) {
+            for (const att of lockedDoc.attachments) {
+              if (att.driveFileId && movedSet.has(att.driveFileId)) {
+                att.driveFolderId = driveMoveResult.targetFolderId;
+                att.driveFolderPath = driveMoveResult.folderPath;
+              }
+              if (Array.isArray(att.versions)) {
+                for (const ver of att.versions) {
+                  if (ver.driveFileId && movedSet.has(ver.driveFileId)) {
+                    ver.driveFolderId = driveMoveResult.targetFolderId;
+                    ver.driveFolderPath = driveMoveResult.folderPath;
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        lockedDoc.driveDeleteSyncStatus = 'none';
+        delete lockedDoc.driveDeleteError;
+        delete lockedDoc.driveDeleteFileResults;
+      }
+
+      const hasExcelTargets = getGoogleSheetsTargets(lockedBook).length > 0;
+      lockedDoc.excelDeleteSyncStatus = hasExcelTargets ? 'pending' : 'not_configured';
+
+      recordDocumentHistoryEntry({
+        doc: lockedDoc,
+        book: lockedBook,
+        actor: currentUser,
+        action: 'delete',
+        changes: {
+          status: { old: prevStatus, new: 'deleted' },
+          deleteReason: { old: null, new: cleanReason },
+          ...(driveMoveResult && lockedFileIds.length > 0
+            ? {
+                driveMovedToDeletedFolder: {
+                  old: prevFolderPath || `${lockedBook.name}/${docYear}`,
+                  new: `${driveMoveResult.folderPath || 'VB đã xóa'} (${
+                    driveMoveResult.movedIds.length + driveMoveResult.alreadyInDeletedIds.length
+                  }/${lockedFileIds.length} tệp)`,
+                },
+              }
+            : {}),
+        },
+        reason: cleanReason,
+        timestampIso: nowIso,
+        snapshot: deletedSnapshot,
+      });
+
+      await saveDatabasePersistent(db);
+
+      const syncResult = await syncDeletedDocumentToOnlineExcel(lockedDoc, lockedBook);
+
+      broadcastSSE('document_deleted', {
+        id: lockedDoc.id,
+        fullDocNumber: lockedDoc.fullDocNumber,
+        document: lockedDoc,
+      });
+
+      const movedTotal = driveMoveResult
+        ? driveMoveResult.movedIds.length + driveMoveResult.alreadyInDeletedIds.length
+        : 0;
+      const driveSummaryText =
+        driveMoveResult && lockedFileIds.length > 0
+          ? ` và đã chuyển ${movedTotal}/${lockedFileIds.length} tệp sang "${driveMoveResult.folderPath}" trên Google Drive`
+          : '';
+
+      res.json({
+        success: true,
+        document: lockedDoc,
+        excelSync: syncResult,
+        driveDeleteSync: driveMoveResult || undefined,
+        message:
+          syncResult.attempted && !syncResult.ok
+            ? `Đã xóa văn bản ${lockedDoc.fullDocNumber}${driveSummaryText} (Chờ đồng bộ Google Trang tính: ${syncResult.error || 'Lỗi kết nối'})`
+            : `Đã xóa văn bản ${lockedDoc.fullDocNumber}, chuyển vào mục VB đã xóa${driveSummaryText}`,
+      });
+    } finally {
+      releaseLock();
+    }
+  } finally {
+    activeDeleteOrRestoreDocIds.delete(id);
+  }
+});
+
+// KHÔI PHỤC VĂN BẢN ĐÃ XÓA (Chuyển tệp từ "VB đã xóa" về lại thư mục gốc trên Google Drive,
+// khôi phục trạng thái bản ghi về hiệu lực, giữ nguyên số văn bản & toàn bộ dữ liệu gốc, không tạo văn bản mới)
+app.post('/api/documents/:id/restore', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+
+  if (activeDeleteOrRestoreDocIds.has(id)) {
+    return res.status(409).json({
+      code: 'DOCUMENT_OPERATION_IN_PROGRESS',
+      error: 'Văn bản này đang được xử lý xóa/khôi phục từ một phiên khác. Vui lòng đợi giây lát rồi thử lại.',
+    });
+  }
+  activeDeleteOrRestoreDocIds.add(id);
+
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const doc = db.documents.find((d) => d.id === id);
+    if (!doc) return res.status(404).json({ error: 'Không tìm thấy văn bản cần khôi phục' });
+
+    const targetBook = resolveStrictBookForDocument(doc);
+    if (!targetBook) {
+      return res.status(400).json({
+        code: 'BOOK_NOT_FOUND',
+        error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản cần khôi phục. Hệ thống từ chối tự động mặc định sang đơn vị khác.',
+      });
+    }
+    const canRestore =
+      isSystemAdmin(currentUser) ||
+      hasBookPermission(currentUser, targetBook.id, 'delete') ||
+      hasBookPermission(currentUser, targetBook.id, 'manage_book');
+    if (!canRestore) {
+      return res.status(403).json({
+        error: `Bạn cần quyền "Xóa văn bản" hoặc "Quản trị sổ" trong ${targetBook.name} để khôi phục văn bản.`,
+      });
+    }
+
+    if (doc.status !== 'deleted') {
+      return res.status(400).json({ error: 'Văn bản này hiện không ở trạng thái đã xóa.' });
+    }
+
+    const rawReason = req.body?.reason ?? req.body?.restoreReason ?? '';
+    const cleanReason = typeof rawReason === 'string' ? rawReason.trim() : '';
+
+    const linkedFileIds = collectAllDocumentDriveFileIds(doc);
+    const docYear = getDocumentFilterYear(doc) || getVietnamTimeInfo().year;
+    let driveRestoreResult: Awaited<ReturnType<typeof restoreFilesFromDeletedFolderOnGoogleDrive>> | null = null;
+
+    if (linkedFileIds.length > 0) {
+      const driveConfig = resolveDriveForBook(targetBook);
+      driveRestoreResult = await restoreFilesFromDeletedFolderOnGoogleDrive({
+        config: driveConfig,
+        fileIds: linkedFileIds,
+        docId: doc.id,
+        bookName: targetBook.name,
+        bookCode: targetBook.code,
+        unit: targetBook.code,
+        year: docYear,
+        docCategory: doc.docCategory || 'outgoing',
+        originalFolderMap: doc.driveOriginalFolderMap || {},
+        folderCache: db.driveFolderCache,
+      });
+
+      if (!driveRestoreResult.ok) {
+        const failRelease = await atomicLock.acquire();
+        let persistedDeletedDoc: DocumentRecord | undefined;
+        try {
+          await ensureLatestDb({ maxAgeMs: 0 });
+          const liveDoc = db.documents.find((d) => d.id === id);
+          if (liveDoc && liveDoc.status === 'deleted') {
+            liveDoc.driveDeleteError =
+              driveRestoreResult.error ||
+              'Không thể khôi phục tệp từ "VB đã xóa" về thư mục gốc trên Google Drive.';
+            if (driveRestoreResult.fileResults.length > 0) {
+              liveDoc.driveDeleteFileResults = driveRestoreResult.fileResults;
+            }
+            await saveDatabasePersistent(db);
+            broadcastSSE('document_updated', { document: liveDoc });
+            persistedDeletedDoc = liveDoc;
+          }
+        } finally {
+          failRelease();
+        }
+
+        return res.status(502).json({
+          code: 'DRIVE_RESTORE_SYNC_FAILED',
+          partial: driveRestoreResult.partial,
+          error:
+            driveRestoreResult.error ||
+            'Không thể chuyển tệp từ "VB đã xóa" về lại thư mục ban đầu trên Google Drive. Văn bản vẫn được giữ ở mục VB đã xóa.',
+          driveRestoreSync: driveRestoreResult,
+          document: persistedDeletedDoc,
+        });
+      }
+    }
+
+    const releaseLock = await atomicLock.acquire();
+    try {
+      await ensureLatestDb({ maxAgeMs: 0 });
+      const lockedDoc = db.documents.find((d) => d.id === id);
+      if (!lockedDoc || lockedDoc.status !== 'deleted') {
+        return res.status(400).json({ error: 'Văn bản này đã được khôi phục trước đó.' });
+      }
+
+      const lockedBook = resolveStrictBookForDocument(lockedDoc);
+      if (!lockedBook) {
+        return res.status(400).json({
+          code: 'BOOK_NOT_FOUND',
+          error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản cần khôi phục.',
+        });
+      }
+      const nowIso = new Date().toISOString();
+      const nowVn = formatVietnamDateTime(new Date(nowIso));
+      const prevDeletedFolderPath = lockedDoc.driveDeletedFolderPath || `${lockedBook.name}/${docYear}/VB đã xóa`;
+      const originalMap = lockedDoc.driveOriginalFolderMap || {};
+      const fallbackTargetId = driveRestoreResult?.targetFolderId;
+      const fallbackTargetPath =
+        driveRestoreResult?.folderPath ||
+        `${lockedBook.name}/${docYear}/${lockedDoc.docCategory === 'incoming' ? 'Văn bản đến' : 'Văn bản đi'}`;
+
+      const getRestoredFolderInfo = (fid?: string) => {
+        const cleanFid = (fid || '').trim();
+        const mapped = cleanFid ? originalMap[cleanFid] : undefined;
+        const fr = cleanFid
+          ? driveRestoreResult?.fileResults?.find((item) => item.fileId === cleanFid)
+          : undefined;
+        return {
+          folderId: fr?.targetFolderId || mapped?.folderId || fallbackTargetId,
+          folderPath: mapped?.folderPath || fallbackTargetPath,
+        };
+      };
+
+      // Giữ nguyên hoàn toàn id, sequenceNumber, fullDocNumber, trích yếu, tệp & lịch sử cũ
+      lockedDoc.status = 'active';
+      lockedDoc.restoredAt = nowIso;
+      lockedDoc.restoredAtVietnam = nowVn;
+      lockedDoc.restoredBy = `${currentUser.fullName} (${currentUser.username})`;
+      lockedDoc.restoredByUsername = currentUser.username;
+      lockedDoc.restoredByUserId = currentUser.id;
+      if (cleanReason) {
+        lockedDoc.restoreReason = cleanReason;
+      } else {
+        delete lockedDoc.restoreReason;
+      }
+
+      delete lockedDoc.deleteReason;
+      delete lockedDoc.deletedAt;
+      delete lockedDoc.deletedAtVietnam;
+      delete lockedDoc.deletedBy;
+      delete lockedDoc.deletedByUsername;
+      delete lockedDoc.deletedByUserId;
+      delete lockedDoc.deletedListArchived;
+      delete lockedDoc.deletedArchivedAt;
+      delete lockedDoc.deletedArchivedBy;
+      delete lockedDoc.excelMovedToDeletedSheet;
+      delete lockedDoc.excelRemovedFromMainSheet;
+      delete lockedDoc.excelDeleteSyncStatus;
+      delete lockedDoc.excelSyncError;
+      delete lockedDoc.excelSyncTargets;
+
+      lockedDoc.driveDeleteSyncStatus = 'none';
+      delete lockedDoc.driveDeleteError;
+      delete lockedDoc.driveDeletedAt;
+      delete lockedDoc.driveDeletedFolderId;
+      delete lockedDoc.driveDeletedFolderPath;
+      delete lockedDoc.driveMovedFileIds;
+      delete lockedDoc.driveDeleteFileResults;
+
+      if (linkedFileIds.length > 0 && driveRestoreResult) {
+        if (lockedDoc.driveFileId) {
+          const info = getRestoredFolderInfo(lockedDoc.driveFileId);
+          if (info.folderId) lockedDoc.driveFolderId = info.folderId;
+          if (info.folderPath) lockedDoc.driveFolderPath = info.folderPath;
+        }
+        if (Array.isArray(lockedDoc.attachments)) {
+          for (const att of lockedDoc.attachments) {
+            if (att.driveFileId) {
+              const info = getRestoredFolderInfo(att.driveFileId);
+              if (info.folderId) att.driveFolderId = info.folderId;
+              if (info.folderPath) att.driveFolderPath = info.folderPath;
+            }
+            if (Array.isArray(att.versions)) {
+              for (const ver of att.versions) {
+                if (ver.driveFileId) {
+                  const info = getRestoredFolderInfo(ver.driveFileId);
+                  if (info.folderId) ver.driveFolderId = info.folderId;
+                  if (info.folderPath) ver.driveFolderPath = info.folderPath;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      const restoredTotal = driveRestoreResult
+        ? driveRestoreResult.restoredIds.length + driveRestoreResult.alreadyInTargetIds.length
+        : 0;
+
+      recordDocumentHistoryEntry({
+        doc: lockedDoc,
+        book: lockedBook,
+        actor: currentUser,
+        action: 'restore',
+        changes: {
+          status: { old: 'deleted', new: 'active' },
+          ...(driveRestoreResult && linkedFileIds.length > 0
+            ? {
+                driveRestoredFolder: {
+                  old: prevDeletedFolderPath,
+                  new: `${lockedDoc.driveFolderPath || fallbackTargetPath} (${restoredTotal}/${linkedFileIds.length} tệp)`,
+                },
+              }
+            : {}),
+        },
+        reason: cleanReason || 'Khôi phục văn bản từ mục VB đã xóa',
+        timestampIso: nowIso,
+      });
+
+      await saveDatabasePersistent(db);
+
+      const sheetsSync = await syncToGoogleSheets(lockedDoc, 'restore');
+
+      broadcastSSE('document_restored', {
+        id: lockedDoc.id,
+        fullDocNumber: lockedDoc.fullDocNumber,
+        document: lockedDoc,
+      });
+
+      const driveSummaryText =
+        driveRestoreResult && linkedFileIds.length > 0
+          ? ` và đã chuyển ${restoredTotal}/${linkedFileIds.length} tệp về thư mục "${lockedDoc.driveFolderPath || fallbackTargetPath}" trên Google Drive`
+          : '';
+
+      res.json({
+        success: true,
+        document: lockedDoc,
+        excelSync: sheetsSync,
+        driveRestoreSync: driveRestoreResult || undefined,
+        message: `Đã khôi phục văn bản ${lockedDoc.fullDocNumber} về sổ hiệu lực${driveSummaryText}.`,
+      });
+    } finally {
+      releaseLock();
+    }
+  } finally {
+    activeDeleteOrRestoreDocIds.delete(id);
+  }
+});
+
+// THỬ ĐỒNG BỘ LẠI GOOGLE TRANG TÍNH (Hoàn tất phần chưa xong theo mã hồ sơ cố định, tránh trùng dòng trong VB đã xóa)
+app.post('/api/documents/:id/retry-excel-sync', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) return res.status(404).json({ error: 'Không tìm thấy văn bản để đồng bộ lại.' });
+
+  const targetBook = getBookById(getDocBookId(doc));
+  const canRetry =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, targetBook.id, 'delete') ||
+    hasBookPermission(currentUser, targetBook.id, 'edit') ||
+    hasBookPermission(currentUser, targetBook.id, 'manage_book');
+  if (!canRetry) {
+    return res.status(403).json({
+      error: `Bạn không có quyền đồng bộ lại Google Trang tính cho văn bản thuộc ${targetBook.name}.`,
+    });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const lockedDoc = db.documents.find((d) => d.id === id);
+    if (!lockedDoc) return res.status(404).json({ error: 'Không tìm thấy văn bản để đồng bộ lại.' });
+    const lockedBook = getBookById(getDocBookId(lockedDoc));
+
+    if (lockedDoc.status === 'deleted') {
+      const prevStatus = lockedDoc.excelDeleteSyncStatus || 'pending';
+      const targets = getGoogleSheetsTargets(lockedBook);
+      if (targets.length === 0) {
+        return res.status(400).json({
+          success: false,
+          document: lockedDoc,
+          error: `Sổ "${lockedBook.name}" chưa bật cấu hình đồng bộ Google Trang tính.`,
+        });
+      }
+
+      const result = await syncDeletedDocumentToOnlineExcel(lockedDoc, lockedBook);
+      const nextStatus: ExcelDeleteSyncStatus = lockedDoc.excelDeleteSyncStatus || 'not_configured';
+
+      recordDocumentHistoryEntry({
+        doc: lockedDoc,
+        book: lockedBook,
+        actor: currentUser,
+        action: 'retry_excel_sync',
+        changes: {
+          excelDeleteSyncStatus: { old: prevStatus, new: nextStatus },
+        },
+        reason: result.ok
+          ? 'Thử đồng bộ lại chuyển dòng sang sheet VB đã xóa trên Google Trang tính thành công'
+          : `Thử đồng bộ lại Google Trang tính chưa thành công: ${result.error || 'Lỗi kết nối'}`,
+      });
+      await saveDatabasePersistent(db);
+      broadcastSSE('document_updated', { document: lockedDoc });
+
+      if (!result.ok) {
+        return res.status(502).json({
+          success: false,
+          document: lockedDoc,
+          error: result.error || 'Đồng bộ lại Google Trang tính chưa thành công.',
+        });
+      }
+      return res.json({
+        success: true,
+        document: lockedDoc,
+        message: 'Đã hoàn tất đồng bộ dòng sang sheet VB đã xóa trên Google Trang tính.',
+      });
+    }
+
+    const prevSync = lockedDoc.syncStatus;
+    const result = await syncToGoogleSheets(lockedDoc, lockedDoc.status === 'cancelled' ? 'cancel' : 'update');
+    recordDocumentHistoryEntry({
+      doc: lockedDoc,
+      book: lockedBook,
+      actor: currentUser,
+      action: 'retry_excel_sync',
+      changes: {
+        syncStatus: { old: prevSync, new: lockedDoc.syncStatus },
+      },
+      reason: result.ok
+        ? 'Thử đồng bộ lại Google Trang tính thành công'
+        : `Đồng bộ lại Google Trang tính thất bại: ${result.error || ''}`,
+    });
+    await saveDatabasePersistent(db);
+    broadcastSSE('document_updated', { document: lockedDoc });
+
+    if (!result.ok) {
+      return res.status(502).json({
+        success: false,
+        document: lockedDoc,
+        error: result.error || 'Đồng bộ Google Trang tính chưa thành công.',
+      });
+    }
+    return res.json({
+      success: true,
+      document: lockedDoc,
+      message: 'Đã đồng bộ lại dữ liệu văn bản sang Google Trang tính.',
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+// ĐỒNG BỘ HÀNG LOẠT VB ĐÃ XÓA SANG GOOGLE TRANG TÍNH (các mục đã chọn hoặc tất cả mục đang chờ trong sổ)
+app.post('/api/documents/deleted/bulk-sync', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { bookId = 'all', mode = 'selected', docIds } = req.body || {};
+
+  const canSyncBook = (bId: string) =>
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, bId, 'delete') ||
+    hasBookPermission(currentUser, bId, 'edit') ||
+    hasBookPermission(currentUser, bId, 'manage_book');
+
+  if (bookId && bookId !== 'all') {
+    const targetBook = findBookExplicitly(bookId);
+    if (!targetBook) {
+      return res.status(404).json({ error: 'Không tìm thấy sổ văn bản.' });
+    }
+    if (!canSyncBook(targetBook.id)) {
+      return res.status(403).json({
+        error: `Bạn không có quyền đồng bộ Google Trang tính trong ${targetBook.name}.`,
+      });
+    }
+  } else if (!isSystemAdmin(currentUser) && !db.books.some((b) => canSyncBook(b.id))) {
+    return res.status(403).json({
+      error: 'Bạn không có quyền đồng bộ Google Trang tính trên bất kỳ sổ văn bản nào.',
+    });
+  }
+
+  if (mode !== 'selected' && mode !== 'pending') {
+    return res.status(400).json({ error: 'Chế độ đồng bộ hàng loạt không hợp lệ.' });
+  }
+  if (mode === 'selected' && (!Array.isArray(docIds) || docIds.length === 0)) {
+    return res.status(400).json({ error: 'Vui lòng chọn ít nhất một văn bản đã xóa để đồng bộ.' });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const scopedBook = bookId && bookId !== 'all' ? findBookExplicitly(bookId) : null;
+    const requestedIds = mode === 'selected' ? new Set(docIds.map((x: any) => String(x))) : null;
+
+    if (mode === 'selected' && requestedIds) {
+      for (const reqId of requestedIds) {
+        const d = db.documents.find((item) => item.id === reqId && item.status === 'deleted');
+        if (d && !canSyncBook(getDocBookId(d))) {
+          return res.status(403).json({
+            error: `Bạn không có quyền đồng bộ văn bản ${d.fullDocNumber} thuộc sổ khác.`,
+          });
+        }
+      }
+    }
+
+    const targets = db.documents.filter((d) => {
+      if (d.status !== 'deleted' || d.deletedListArchived) return false;
+      const bId = getDocBookId(d);
+      if (!canSyncBook(bId)) return false;
+      if (scopedBook && bId !== scopedBook.id) return false;
+      if (mode === 'selected') {
+        return requestedIds ? requestedIds.has(d.id) : false;
+      }
+      return d.excelDeleteSyncStatus === 'pending' || d.excelDeleteSyncStatus === 'failed';
+    });
+
+    const succeededIds: string[] = [];
+    const failedItems: Array<{ id: string; fullDocNumber: string; docName: string; error: string }> = [];
+    const updatedDocs: DocumentRecord[] = [];
+
+    for (const doc of targets) {
+      const targetBook = getBookById(getDocBookId(doc));
+      const sheetTargets = getGoogleSheetsTargets(targetBook);
+      const prevStatus = doc.excelDeleteSyncStatus || 'pending';
+
+      if (sheetTargets.length === 0) {
+        const errMsg = `Sổ "${targetBook.name}" chưa bật cấu hình đồng bộ Google Trang tính.`;
+        doc.excelDeleteSyncStatus = 'not_configured';
+        doc.excelSyncError = errMsg;
+        failedItems.push({
+          id: doc.id,
+          fullDocNumber: doc.fullDocNumber,
+          docName: doc.docName || doc.title || '',
+          error: errMsg,
+        });
+        updatedDocs.push(doc);
+        continue;
+      }
+
+      const result = await syncDeletedDocumentToOnlineExcel(doc, targetBook);
+      const nextStatus: ExcelDeleteSyncStatus = doc.excelDeleteSyncStatus || 'not_configured';
+
+      recordDocumentHistoryEntry({
+        doc,
+        book: targetBook,
+        actor: currentUser,
+        action: 'retry_excel_sync',
+        changes: {
+          excelDeleteSyncStatus: { old: prevStatus, new: nextStatus },
+        },
+        reason: result.ok
+          ? 'Đồng bộ hàng loạt chuyển dòng sang sheet VB đã xóa trên Google Trang tính thành công'
+          : `Đồng bộ hàng loạt Google Trang tính chưa thành công: ${result.error || 'Lỗi kết nối'}`,
+      });
+
+      if (result.ok) {
+        succeededIds.push(doc.id);
+      } else {
+        failedItems.push({
+          id: doc.id,
+          fullDocNumber: doc.fullDocNumber,
+          docName: doc.docName || doc.title || '',
+          error: result.error || 'Đồng bộ Google Trang tính chưa thành công.',
+        });
+      }
+      updatedDocs.push(doc);
+    }
+
+    if (targets.length > 0) {
+      await saveDatabasePersistent(db);
+      for (const updated of updatedDocs) {
+        broadcastSSE('document_updated', { document: updated });
+      }
+    }
+
+    const scopeName = scopedBook ? scopedBook.name : 'tất cả sổ được phân quyền';
+    const message =
+      targets.length === 0
+        ? `Không có văn bản đã xóa nào cần đồng bộ trong ${scopeName}.`
+        : failedItems.length === 0
+        ? `Đã đồng bộ thành công ${succeededIds.length}/${targets.length} mục sang sheet VB đã xóa trên Google Trang tính.`
+        : `Hoàn tất đồng bộ ${targets.length} mục: thành công ${succeededIds.length}, lỗi ${failedItems.length} (các mục lỗi vẫn được giữ lại để xử lý).`;
+
+    res.json({
+      success: failedItems.length === 0,
+      bookId: scopedBook ? scopedBook.id : 'all',
+      bookName: scopeName,
+      totalTargeted: targets.length,
+      succeededCount: succeededIds.length,
+      failedCount: failedItems.length,
+      succeededIds,
+      failedItems,
+      documents: updatedDocs,
+      message,
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+// DỌN KHỎI DANH SÁCH VB ĐÃ XÓA -> ĐÁNH DẤU ĐÃ LƯU TRỮ (CHỈ Admin toàn quyền hệ thống)
+// Chỉ dọn các mục đã đồng bộ thành công sang Google Trang tính; giữ nguyên hồ sơ, số đã cấp, link Drive và dòng trên Google Trang tính.
+app.post('/api/documents/deleted/archive', requireAuth, requireAdmin, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { bookId = 'all', mode = 'all_synced', docIds } = req.body || {};
+
+  if (mode !== 'selected' && mode !== 'all_synced') {
+    return res.status(400).json({ error: 'Chế độ dọn danh sách VB đã xóa không hợp lệ.' });
+  }
+  if (mode === 'selected' && (!Array.isArray(docIds) || docIds.length === 0)) {
+    return res.status(400).json({ error: 'Vui lòng chọn ít nhất một mục đã đồng bộ để dọn khỏi danh sách.' });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const scopedBook = bookId && bookId !== 'all' ? findBookExplicitly(bookId) : null;
+    if (bookId && bookId !== 'all' && !scopedBook) {
+      return res.status(404).json({ error: 'Không tìm thấy sổ văn bản đã chọn.' });
+    }
+
+    const requestedIds = mode === 'selected' ? new Set(docIds.map((x: any) => String(x))) : null;
+    const candidates = db.documents.filter((d) => {
+      if (d.status !== 'deleted' || d.deletedListArchived) return false;
+      if (scopedBook && getDocBookId(d) !== scopedBook.id) return false;
+      if (mode === 'selected') {
+        return requestedIds ? requestedIds.has(d.id) : false;
+      }
+      return true;
+    });
+
+    const eligible = candidates.filter((d) => d.excelDeleteSyncStatus === 'synced');
+    const skippedUnsyncedCount = candidates.length - eligible.length;
+
+    const nowIso = new Date().toISOString();
+    const actorLabel = `${currentUser.fullName} (${currentUser.username})`;
+    const archivedIds: string[] = [];
+
+    for (const doc of eligible) {
+      doc.deletedListArchived = true;
+      doc.deletedArchivedAt = nowIso;
+      doc.deletedArchivedBy = actorLabel;
+      doc.deletedArchivedByUserId = currentUser.id;
+      archivedIds.push(doc.id);
+    }
+
+    const scopeName = scopedBook ? scopedBook.name : 'tất cả các sổ';
+    if (eligible.length > 0) {
+      appendSystemAuditLog({
+        actorUserId: currentUser.id,
+        actorName: actorLabel,
+        action: 'deleted_list_archive',
+        bookId: scopedBook ? scopedBook.id : undefined,
+        bookCode: scopedBook ? scopedBook.code : undefined,
+        details: `Dọn khỏi danh sách VB đã xóa (${scopeName}) → Đã lưu trữ ${eligible.length} hồ sơ đã xác nhận đồng bộ Google Trang tính${
+          skippedUnsyncedCount > 0 ? ` (giữ lại ${skippedUnsyncedCount} mục chưa đồng bộ)` : ''
+        }.`,
+        changes: {
+          archivedCount: { old: null, new: String(eligible.length) },
+          skippedUnsyncedCount: { old: null, new: String(skippedUnsyncedCount) },
+        },
+      });
+      await saveDatabasePersistent(db);
+      broadcastSSE('documents_deleted_archived', {
+        bookId: scopedBook ? scopedBook.id : 'all',
+        archivedIds,
+      });
+    }
+
+    const message =
+      eligible.length > 0
+        ? `Đã dọn ${eligible.length} văn bản sang trạng thái Đã lưu trữ${
+            skippedUnsyncedCount > 0
+              ? ` (bỏ qua ${skippedUnsyncedCount} mục chưa đồng bộ Google Trang tính để tiếp tục xử lý)`
+              : ''
+          }.`
+        : skippedUnsyncedCount > 0
+        ? `Không thể dọn vì ${skippedUnsyncedCount} mục đang chọn chưa hoàn tất đồng bộ Google Trang tính.`
+        : `Không có văn bản đã xóa nào đủ điều kiện dọn trong ${scopeName}.`;
+
+    res.json({
+      success: true,
+      bookId: scopedBook ? scopedBook.id : 'all',
+      bookName: scopeName,
+      archivedCount: eligible.length,
+      skippedUnsyncedCount,
+      archivedIds,
+      documents: eligible,
+      message,
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+// HỦY SỐ VĂN BẢN (Yêu cầu quyền "Hủy" trong sổ - Không xóa cứng, lưu lý do, số không được cấp lại)
+app.post('/api/documents/:id/cancel', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { reason } = req.body;
+  const currentUser = (req as any).user as User;
+
+  if (!reason || !reason.trim()) {
+    return res.status(400).json({ error: 'Bắt buộc nhập lý do hủy văn bản' });
+  }
+
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) return res.status(404).json({ error: 'Không tìm thấy văn bản' });
+
+  const targetBook = resolveStrictBookForDocument(doc);
+  if (!targetBook) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản cần hủy.',
+    });
+  }
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'cancel')) {
+    return res.status(403).json({
+      error: `Bạn cần quyền "Hủy" trong ${targetBook.name} để hủy văn bản này.`,
+    });
+  }
+
+  if (doc.status === 'deleted') {
+    return res.status(400).json({ error: 'Văn bản này đã bị xóa.' });
+  }
+
+  if (doc.status === 'cancelled') {
+    return res.status(400).json({ error: 'Văn bản này đã được hủy trước đó' });
+  }
+
+  doc.status = 'cancelled';
+  doc.cancelReason = reason.trim();
+  doc.cancelledAt = new Date().toISOString();
+  doc.cancelledBy = `${currentUser.fullName} (${currentUser.username})`;
+
+  recordDocumentHistoryEntry({
+    doc,
+    book: targetBook,
+    actor: currentUser,
+    action: 'cancel',
+    reason: reason.trim(),
+    changes: {
+      status: { old: 'active', new: 'cancelled' },
+    },
+  });
+
+  if (doc.syncStatus === 'synced') {
+    doc.syncStatus = 'pending';
+  }
+
+  await saveDatabasePersistent(db);
+  broadcastSSE('document_cancelled', { document: doc });
+  await syncToGoogleSheets(doc, 'cancel');
+  res.json({ document: doc });
+});
+
+// 9. THỐNG KÊ (Dashboard & Statistics - Lọc theo sổ được quyền Xem, loại trừ văn bản đã xóa khỏi thống kê hiệu lực)
+app.get('/api/statistics', requireAuth, (req, res) => {
+  const currentUser = (req as any).user as User;
+  const queryYear = req.query.year ? parseInt(req.query.year as string, 10) : getRequestVietnamTimeInfo(req).year;
+  const bookId = (req.query.bookId as string) || '';
+
+  if (bookId && bookId !== 'all') {
+    const targetBook = getBookById(bookId);
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'view')) {
+      return res.status(403).json({
+        error: `Bạn chưa được cấp quyền "Xem" trong ${targetBook.name}.`,
+      });
+    }
+  }
+
+  const docsOfYear = db.documents.filter((d) => {
+    if (d.year !== queryYear) return false;
+    if (d.status === 'deleted') return false;
+    const bId = getDocBookId(d);
+    if (bookId && bookId !== 'all' && bId !== bookId) return false;
+    return isSystemAdmin(currentUser) || hasBookPermission(currentUser, bId, 'view');
+  });
+
+  const totalIssued = docsOfYear.length;
+  const activeCount = docsOfYear.filter((d) => d.status === 'active').length;
+  const cancelledCount = docsOfYear.filter((d) => d.status === 'cancelled').length;
+  const pendingSyncCount = docsOfYear.filter((d) => d.syncStatus === 'pending').length;
+
+  const targetStatsBook = bookId && bookId !== 'all' ? getBookById(bookId) : null;
+  const relevantTypes = targetStatsBook
+    ? db.documentTypes.filter(
+        (type) =>
+          isTypeEnabledInBook(targetStatsBook, type.code) ||
+          docsOfYear.some((d) => d.docCategory !== 'incoming' && d.typeCode === type.code)
+      )
+    : db.documentTypes;
+
+  const byType = relevantTypes.map((type) => {
+    const typeDocs = docsOfYear.filter((d) => d.docCategory !== 'incoming' && d.typeCode === type.code);
+    return {
+      typeCode: type.code,
+      typeName: type.name,
+      count: typeDocs.length,
+      cancelledCount: typeDocs.filter((d) => d.status === 'cancelled').length,
+    };
+  });
+  const incomingDocs = docsOfYear.filter((d) => d.docCategory === 'incoming');
+  byType.push({
+    typeCode: 'VBD',
+    typeName: 'Văn bản đến',
+    count: incomingDocs.length,
+    cancelledCount: incomingDocs.filter((d) => d.status === 'cancelled').length,
+  });
+
+  const byMonth = Array.from({ length: 12 }, (_, i) => {
+    const month = i + 1;
+    const monthDocs = docsOfYear.filter((d) => {
+      const parts = (d.issueDate || '').split('/');
+      return parts.length >= 2 && parseInt(parts[1], 10) === month;
+    });
+    return {
+      month,
+      count: monthDocs.length,
+      cancelledCount: monthDocs.filter((d) => d.status === 'cancelled').length,
+    };
+  });
+
+  const stats: StatisticsData = {
+    year: queryYear,
+    bookId: bookId || undefined,
+    totalIssued,
+    activeCount,
+    cancelledCount,
+    pendingSyncCount,
+    byType,
+    byMonth,
+  };
+
+  res.json(stats);
+});
+
+// 10. XUẤT FILE EXCEL .XLSX CHUẨN (Giữ đúng bộ lọc, mã hồ sơ cố định, quyền Xuất sổ & sheet riêng "VB đã xóa")
+app.get('/api/export-excel', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const {
+    bookId,
+    year,
+    month,
+    typeCode,
+    status,
+    category,
+    signer,
+    driveStatus,
+    search,
+    sort = 'number_asc',
+  } = req.query as Record<string, string>;
+
+  if (bookId && bookId !== 'all') {
+    const targetBook = getBookById(bookId);
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'export')) {
+      return res.status(403).json({
+        error: `Bạn cần quyền "Xuất sổ" trong ${targetBook.name} để xuất file Excel.`,
+      });
+    }
+  } else if (
+    !isSystemAdmin(currentUser) &&
+    !db.books.some((b) => hasBookPermission(currentUser, b.id, 'export'))
+  ) {
+    return res.status(403).json({
+      error: 'Bạn chưa được cấp quyền "Xuất sổ" cho bất kỳ sổ văn bản nào.',
+    });
+  }
+
+  const isUnknownYearFilter = year === 'unknown';
+  const queryYear = year && year !== 'all' && !isUnknownYearFilter ? parseInt(year, 10) : getRequestVietnamTimeInfo(req).year;
+
+  const filterScopeDocs = (baseDocs: DocumentRecord[]) => {
+    let scoped = baseDocs.filter((d) => {
+      const bId = getDocBookId(d);
+      if (bookId && bookId !== 'all' && bId !== bookId) return false;
+      if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, bId, 'export')) return false;
+      if (isUnknownYearFilter) {
+        if (getDocumentFilterYear(d) !== 'unknown') return false;
+      } else if (year && year !== 'all') {
+        if (getDocumentFilterYear(d) !== queryYear) return false;
+      }
+      return true;
+    });
+
+    if (month && month !== 'all') {
+      const m = parseInt(month, 10);
+      scoped = scoped.filter((d) => {
+        const parts = (d.issueDate || '').split('/');
+        return parts.length >= 2 && parseInt(parts[1], 10) === m;
+      });
+    }
+    if (category && category !== 'all') {
+      if (category === 'incoming') scoped = scoped.filter((d) => d.docCategory === 'incoming');
+      else if (category === 'outgoing') scoped = scoped.filter((d) => d.docCategory !== 'incoming');
+    }
+    if (typeCode && typeCode !== 'all') {
+      scoped = scoped.filter((d) => d.typeCode === typeCode);
+    }
+    if (signer && signer !== 'all') {
+      scoped = scoped.filter((d) => d.signer.toLowerCase() === signer.toLowerCase());
+    }
+    if (driveStatus && driveStatus !== 'all') {
+      scoped = scoped.filter((d) => (d.driveStatus || 'none') === driveStatus);
+    }
+    if (search && search.trim()) {
+      const term = search.trim().toLowerCase();
+      scoped = scoped.filter(
+        (d) =>
+          d.id.toLowerCase().includes(term) ||
+          d.fullDocNumber.toLowerCase().includes(term) ||
+          (d.docName && d.docName.toLowerCase().includes(term)) ||
+          (d.driveFileName && d.driveFileName.toLowerCase().includes(term)) ||
+          (d.issuingAgency && d.issuingAgency.toLowerCase().includes(term)) ||
+          d.title.toLowerCase().includes(term) ||
+          d.signer.toLowerCase().includes(term) ||
+          d.issuedBy.toLowerCase().includes(term) ||
+          (d.notes && d.notes.toLowerCase().includes(term))
+      );
+    }
+    return scoped;
+  };
+
+  let docs = filterScopeDocs(db.documents.filter((d) => d.status !== 'deleted'));
+  if (status && status !== 'all' && status !== 'deleted') {
+    docs = docs.filter((d) => d.status === status);
+  }
+  const deletedDocs = filterScopeDocs(db.documents.filter((d) => d.status === 'deleted')).sort(
+    (a, b) => new Date(b.deletedAt || b.createdAt).getTime() - new Date(a.deletedAt || a.createdAt).getTime()
+  );
+
+  if (sort === 'newest') {
+    docs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  } else if (sort === 'oldest') {
+    docs.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  } else if (sort === 'number_desc') {
+    docs.sort((a, b) => b.sequenceNumber - a.sequenceNumber);
+  } else {
+    docs.sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+  }
+
+  try {
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Đoàn Trường THPT Nguyễn Chí Thanh';
+    workbook.created = new Date();
+
+    const yearLabel = isUnknownYearFilter
+      ? 'CHƯA XÁC ĐỊNH NĂM'
+      : year === 'all'
+      ? 'TẤT CẢ CÁC NĂM'
+      : `NĂM ${queryYear}`;
+    const selectedBookObj = bookId && bookId !== 'all' ? getBookById(bookId) : null;
+    const sheetName = isUnknownYearFilter
+      ? 'Sổ VB chưa xác định năm'
+      : year === 'all'
+      ? 'Sổ văn bản tổng hợp'
+      : `Sổ văn bản ${queryYear}`;
+    const worksheet = workbook.addWorksheet(sheetName, {
+      views: [{ state: 'frozen', ySplit: 3, activeCell: 'A4' }],
+      pageSetup: { orientation: 'landscape', paperSize: 9 },
+    });
+
+    worksheet.mergeCells('A1:R1');
+    const titleCell = worksheet.getCell('A1');
+    titleCell.value = selectedBookObj
+      ? `${selectedBookObj.name.toUpperCase()} (${yearLabel})`
+      : `SỔ QUẢN LÝ VĂN BẢN ${yearLabel} - TRƯỜNG THPT NGUYỄN CHÍ THANH`;
+    titleCell.font = { name: 'Arial', size: 14, bold: true, color: { argb: 'FF004085' } };
+    titleCell.alignment = { vertical: 'middle', horizontal: 'center' };
+    worksheet.getRow(1).height = 30;
+
+    worksheet.mergeCells('A2:R2');
+    const subCell = worksheet.getCell('A2');
+    subCell.value = `Thời điểm xuất sổ: ${formatVietnamDateTime()} | Văn bản hiệu lực/hủy: ${docs.length} | VB đã xóa: ${deletedDocs.length}`;
+    subCell.font = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF555555' } };
+    subCell.alignment = { vertical: 'middle', horizontal: 'center' };
+    worksheet.getRow(2).height = 20;
+
+    worksheet.columns = [
+      { key: 'stt', width: 8 },
+      { key: 'docId', width: 22 },
+      { key: 'bookName', width: 20 },
+      { key: 'year', width: 10 },
+      { key: 'issueDate', width: 16 },
+      { key: 'signDate', width: 16 },
+      { key: 'receivedDate', width: 16 },
+      { key: 'typeName', width: 20 },
+      { key: 'sequenceNumber', width: 12 },
+      { key: 'fullDocNumber', width: 24 },
+      { key: 'docName', width: 35 },
+      { key: 'title', width: 40 },
+      { key: 'signer', width: 22 },
+      { key: 'signerRole', width: 24 },
+      { key: 'issuedBy', width: 22 },
+      { key: 'status', width: 18 },
+      { key: 'notes', width: 28 },
+      { key: 'driveFile', width: 38 },
+    ];
+
+    const headers = [
+      'STT',
+      'Mã hồ sơ',
+      'Sổ',
+      'Năm',
+      'Ngày ban hành',
+      'Ngày ký',
+      'Ngày tiếp nhận / Cấp',
+      'Loại văn bản',
+      'Số thứ tự',
+      'Số/Ký hiệu văn bản',
+      'Tên văn bản',
+      'Trích yếu/Nội dung',
+      'Người ký',
+      'Chức vụ / Cơ quan',
+      'Người lấy số / Nhập',
+      'Trạng thái',
+      'Ghi chú',
+      'Tệp đính kèm (Google Drive)',
+    ];
+
+    const headerRow = worksheet.getRow(3);
+    headerRow.values = headers;
+    headerRow.height = 28;
+
+    headerRow.eachCell((cell) => {
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF005BAA' },
+      };
+      cell.font = {
+        name: 'Arial',
+        size: 11,
+        bold: true,
+        color: { argb: 'FFFFFFFF' },
+      };
+      cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      cell.border = {
+        top: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+        bottom: { style: 'medium', color: { argb: 'FF003366' } },
+        left: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+        right: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+      };
+    });
+
+    docs.forEach((doc, idx) => {
+      const bookObj = getBookById(getDocBookId(doc));
+      const statusText =
+        doc.status === 'cancelled'
+          ? `Đã hủy (${doc.cancelReason || 'Sai sót'})`
+          : doc.docCategory === 'incoming'
+          ? 'Đã ghi sổ văn bản đến'
+          : 'Đã cấp số';
+      const driveText =
+        doc.driveStatus === 'saved' && doc.driveFileName
+          ? doc.driveFileName
+          : doc.driveStatus === 'failed'
+          ? 'Lưu tệp thất bại'
+          : 'Không đính kèm';
+
+      const cleanIssueDate = normalizeDateOnlyDdMmYyyy(doc.issueDate || '');
+      const cleanSignDate = normalizeDateOnlyDdMmYyyy(doc.signDate || '');
+      const cleanReceivedDate =
+        normalizeDateOnlyDdMmYyyy(doc.receivedDate || '') ||
+        (doc.createdAt ? getVietnamTimeInfo(new Date(doc.createdAt)).formattedDate : '');
+
+      const noteParts: string[] = [];
+      if (doc.docCategory === 'incoming' && doc.issuingAgency) {
+        noteParts.push(`CQ ban hành: ${doc.issuingAgency}`);
+      }
+      if (doc.pendingDateConfirmation) {
+        noteParts.push('Chờ xác nhận ngày');
+      }
+      if (doc.notes) {
+        noteParts.push(doc.notes);
+      }
+
+      const row = worksheet.addRow({
+        stt: idx + 1,
+        docId: doc.id,
+        bookName: bookObj.name,
+        year: doc.year,
+        issueDate: cleanIssueDate || (doc.pendingDateConfirmation ? 'Chờ xác nhận' : ''),
+        signDate: cleanSignDate,
+        receivedDate: cleanReceivedDate,
+        typeName: doc.typeName,
+        sequenceNumber: doc.docCategory === 'incoming' ? 'VB đến' : doc.sequenceNumber,
+        fullDocNumber: doc.fullDocNumber,
+        docName: doc.docName || doc.title,
+        title: doc.title || '',
+        signer: doc.signer,
+        signerRole: doc.signerRole,
+        issuedBy: doc.issuedBy,
+        status: statusText,
+        notes: noteParts.join(' | '),
+        driveFile: driveText,
+      });
+
+      row.height = 24;
+
+      if (doc.driveStatus === 'saved' && doc.driveFileUrl) {
+        const driveCell = row.getCell(18);
+        driveCell.value = {
+          text: doc.driveFileName || 'Mở tệp',
+          hyperlink: doc.driveFileUrl,
+        };
+      }
+
+      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+        cell.font = { name: 'Arial', size: 10 };
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FFE0E0E0' } },
+          bottom: { style: 'thin', color: { argb: 'FFE0E0E0' } },
+          left: { style: 'thin', color: { argb: 'FFE0E0E0' } },
+          right: { style: 'thin', color: { argb: 'FFE0E0E0' } },
+        };
+
+        if ([1, 2, 4, 5, 6, 7, 9].includes(colNumber)) {
+          cell.numFmt = '@';
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        } else if (colNumber === 10) {
+          cell.numFmt = '@';
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+          cell.font = { name: 'Arial', size: 10, bold: true };
+        } else if (colNumber === 11 || colNumber === 12) {
+          cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+        } else if (colNumber === 16) {
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+          if (doc.status === 'cancelled') {
+            cell.font = { name: 'Arial', size: 9, italic: true, color: { argb: 'FFDC2626' } };
+          } else {
+            cell.font = { name: 'Arial', size: 10, color: { argb: 'FF16A34A' } };
+          }
+        } else if (colNumber === 18) {
+          cell.alignment = { vertical: 'middle', horizontal: 'left' };
+          if (doc.driveStatus === 'saved' && doc.driveFileUrl) {
+            cell.font = { name: 'Arial', size: 10, underline: true, color: { argb: 'FF0369A1' } };
+          } else if (doc.driveStatus === 'failed') {
+            cell.font = { name: 'Arial', size: 10, italic: true, color: { argb: 'FFDC2626' } };
+          } else {
+            cell.font = { name: 'Arial', size: 10, color: { argb: 'FF64748B' } };
+          }
+        } else {
+          cell.alignment = { vertical: 'middle', horizontal: 'left' };
+        }
+      });
+    });
+
+    worksheet.autoFilter = `A3:R${docs.length + 3}`;
+
+    // Sheet thứ 2: "VB đã xóa" (chứa đầy đủ thông tin + Sổ, Người xóa, Thời điểm xóa, Lý do xóa & liên kết Drive)
+    const deletedSheet = workbook.addWorksheet('VB đã xóa', {
+      views: [{ state: 'frozen', ySplit: 3, activeCell: 'A4' }],
+      pageSetup: { orientation: 'landscape', paperSize: 9 },
+    });
+
+    deletedSheet.mergeCells('A1:S1');
+    const delTitleCell = deletedSheet.getCell('A1');
+    delTitleCell.value = selectedBookObj
+      ? `DANH SÁCH VĂN BẢN ĐÃ XÓA - ${selectedBookObj.name.toUpperCase()} (${yearLabel})`
+      : `DANH SÁCH VĂN BẢN ĐÃ XÓA (${yearLabel})`;
+    delTitleCell.font = { name: 'Arial', size: 14, bold: true, color: { argb: 'FF991B1B' } };
+    delTitleCell.alignment = { vertical: 'middle', horizontal: 'center' };
+    deletedSheet.getRow(1).height = 30;
+
+    deletedSheet.mergeCells('A2:S2');
+    const delSubCell = deletedSheet.getCell('A2');
+    delSubCell.value = `Tổng số văn bản đã xóa: ${deletedDocs.length} | Số đã cấp và tệp Google Drive được giữ nguyên để tra cứu đối chiếu`;
+    delSubCell.font = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF555555' } };
+    delSubCell.alignment = { vertical: 'middle', horizontal: 'center' };
+    deletedSheet.getRow(2).height = 20;
+
+    deletedSheet.columns = [
+      { key: 'stt', width: 8 },
+      { key: 'docId', width: 22 },
+      { key: 'bookName', width: 22 },
+      { key: 'year', width: 10 },
+      { key: 'issueDate', width: 16 },
+      { key: 'signDate', width: 16 },
+      { key: 'typeName', width: 18 },
+      { key: 'sequenceNumber', width: 12 },
+      { key: 'fullDocNumber', width: 24 },
+      { key: 'docName', width: 34 },
+      { key: 'title', width: 36 },
+      { key: 'signer', width: 20 },
+      { key: 'signerRole', width: 22 },
+      { key: 'issuedBy', width: 20 },
+      { key: 'deletedBy', width: 24 },
+      { key: 'deletedAtVietnam', width: 22 },
+      { key: 'deleteReason', width: 32 },
+      { key: 'notes', width: 24 },
+      { key: 'driveFile', width: 38 },
+    ];
+
+    const deletedHeaders = [
+      'STT',
+      'Mã hồ sơ',
+      'Sổ',
+      'Năm',
+      'Ngày ban hành',
+      'Ngày ký',
+      'Loại văn bản',
+      'Số thứ tự',
+      'Số/Ký hiệu văn bản',
+      'Tên văn bản',
+      'Trích yếu/Nội dung',
+      'Người ký',
+      'Chức vụ / Cơ quan',
+      'Người lấy số / Nhập',
+      'Người xóa',
+      'Thời điểm xóa',
+      'Lý do xóa',
+      'Ghi chú',
+      'Tệp đính kèm (Google Drive)',
+    ];
+
+    const delHeaderRow = deletedSheet.getRow(3);
+    delHeaderRow.values = deletedHeaders;
+    delHeaderRow.height = 28;
+    delHeaderRow.eachCell((cell) => {
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF991B1B' },
+      };
+      cell.font = {
+        name: 'Arial',
+        size: 11,
+        bold: true,
+        color: { argb: 'FFFFFFFF' },
+      };
+      cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      cell.border = {
+        top: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+        bottom: { style: 'medium', color: { argb: 'FF7F1D1D' } },
+        left: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+        right: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+      };
+    });
+
+    deletedDocs.forEach((doc, idx) => {
+      const bookObj = getBookById(getDocBookId(doc));
+      const cleanIssueDate = normalizeDateOnlyDdMmYyyy(doc.issueDate || '');
+      const cleanSignDate = normalizeDateOnlyDdMmYyyy(doc.signDate || '');
+      const driveText =
+        doc.driveStatus === 'saved' && doc.driveFileName
+          ? doc.driveFileName
+          : doc.driveStatus === 'failed'
+          ? 'Lưu tệp thất bại'
+          : 'Không đính kèm';
+
+      const delRow = deletedSheet.addRow({
+        stt: idx + 1,
+        docId: doc.id,
+        bookName: `${bookObj.name} (${bookObj.code})`,
+        year: doc.year,
+        issueDate: cleanIssueDate,
+        signDate: cleanSignDate,
+        typeName: doc.typeName,
+        sequenceNumber: doc.docCategory === 'incoming' ? 'VB đến' : doc.sequenceNumber,
+        fullDocNumber: doc.fullDocNumber,
+        docName: doc.docName || doc.title,
+        title: doc.title || '',
+        signer: doc.signer,
+        signerRole: doc.signerRole,
+        issuedBy: doc.issuedBy,
+        deletedBy: doc.deletedBy || '—',
+        deletedAtVietnam: doc.deletedAtVietnam || (doc.deletedAt ? formatVietnamDateTime(new Date(doc.deletedAt)) : '—'),
+        deleteReason: doc.deleteReason || '—',
+        notes: doc.notes || '',
+        driveFile: driveText,
+      });
+
+      delRow.height = 24;
+
+      if (doc.driveStatus === 'saved' && doc.driveFileUrl) {
+        const driveCell = delRow.getCell(19);
+        driveCell.value = {
+          text: doc.driveFileName || 'Mở tệp',
+          hyperlink: doc.driveFileUrl,
+        };
+      }
+
+      delRow.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+        cell.font = { name: 'Arial', size: 10 };
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FFE0E0E0' } },
+          bottom: { style: 'thin', color: { argb: 'FFE0E0E0' } },
+          left: { style: 'thin', color: { argb: 'FFE0E0E0' } },
+          right: { style: 'thin', color: { argb: 'FFE0E0E0' } },
+        };
+
+        if ([1, 2, 4, 5, 6, 8, 16].includes(colNumber)) {
+          cell.numFmt = '@';
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        } else if (colNumber === 9) {
+          cell.numFmt = '@';
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+          cell.font = { name: 'Arial', size: 10, bold: true };
+        } else if (colNumber === 10 || colNumber === 11 || colNumber === 17) {
+          cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+        } else if (colNumber === 19) {
+          cell.alignment = { vertical: 'middle', horizontal: 'left' };
+          if (doc.driveStatus === 'saved' && doc.driveFileUrl) {
+            cell.font = { name: 'Arial', size: 10, underline: true, color: { argb: 'FF0369A1' } };
+          } else {
+            cell.font = { name: 'Arial', size: 10, color: { argb: 'FF64748B' } };
+          }
+        } else {
+          cell.alignment = { vertical: 'middle', horizontal: 'left' };
+        }
+      });
+    });
+
+    deletedSheet.autoFilter = `A3:S${deletedDocs.length + 3}`;
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    const fileName = `SO_VAN_BAN_${
+      isUnknownYearFilter ? 'CHUA_XAC_DINH_NAM' : year === 'all' ? 'TAT_CA' : queryYear
+    }.xlsx`;
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fileName)}"`);
+    res.send(Buffer.from(buffer));
+  } catch (err: any) {
+    console.error('Lỗi khi xuất Excel:', err);
+    res.status(500).json({ error: 'Không thể tạo file Excel: ' + err.message });
+  }
+});
+
+// 11. Cấu hình & Đồng bộ Google Sheets Webhook (Cách đồng bộ dễ nhất cho trường học)
+app.post('/api/sync/google-sheets/config', requireAuth, requireAdmin, async (req, res) => {
+  const { enabled, webhookUrl } = req.body;
+  if (!db.settings.googleSheetsConfig) {
+    db.settings.googleSheetsConfig = { enabled: false, webhookUrl: '', lastSyncTime: '' };
+  }
+
+  db.settings.googleSheetsConfig.enabled = Boolean(enabled);
+  db.settings.googleSheetsConfig.webhookUrl = webhookUrl ? webhookUrl.trim() : '';
+  await saveDatabasePersistent(db);
+  broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
+  res.json({ googleSheetsConfig: db.settings.googleSheetsConfig });
+});
+
+app.post('/api/sync/google-sheets/test', requireAuth, requireAdmin, async (req, res) => {
+  const cfg = db.settings.googleSheetsConfig;
+  const targetUrl = req.body?.webhookUrl || cfg?.webhookUrl;
+  const hasExplicitBook = Boolean(req.body?.bookId || req.body?.bookCode || req.body?.unit);
+  const targetBook = hasExplicitBook
+    ? findBookStrictly({
+        bookId: req.body?.bookId,
+        bookCode: req.body?.bookCode,
+        unit: req.body?.unit,
+      })
+    : db.books.find((b) => b.isActive) || null;
+  if (!targetBook) {
+    return res.status(400).json({
+      success: false,
+      code: 'BOOK_NOT_FOUND',
+      message: 'Sổ hoặc mã đơn vị kiểm tra không hợp lệ. Vui lòng chọn đúng sổ cần kiểm tra.',
+    });
+  }
+  if (!targetUrl || !targetUrl.trim()) {
+    return res.status(400).json({ success: false, message: 'Chưa nhập URL Webhook Google Apps Script.' });
+  }
+
+  try {
+    const testPayload = {
+      action: 'test',
+      id: `test-sample-${targetBook.code}`,
+      bookId: targetBook.id,
+      bookCode: targetBook.code,
+      bookName: targetBook.name,
+      unitCode: targetBook.unitCode,
+      unit: targetBook.code,
+      stt: 0,
+      year: getVietnamTimeInfo().year,
+      issueDate: getVietnamTimeInfo().formattedDate,
+      signDate: '',
+      docCategory: 'outgoing',
+      categoryLabel: 'Văn bản đi',
+      typeCode: 'TEST',
+      typeName: 'Kiểm tra',
+      sequenceNumber: 0,
+      fullDocNumber: `00-TEST/${targetBook.unitCode}`,
+      docName: `Kiểm tra kết nối sổ ${targetBook.name}`,
+      title: `Kiểm tra đồng bộ bảng tính theo tab ${targetBook.code}`,
+      signer: 'Quản trị viên',
+      signerRole: 'Ban quản trị',
+      issuedBy: (req as any).user.fullName,
+      status: 'Thử nghiệm',
+      driveStatus: 'none',
+      driveStatusLabel: 'Không đính kèm',
+      driveFileName: '',
+      driveFileId: '',
+      driveFileUrl: '',
+      driveFolderPath: '',
+      notes: `Dòng kiểm tra kết nối Google Sheets (Tab: ${targetBook.code})`,
+      timestamp: new Date().toISOString(),
+    };
+
+    const { res: rawRes } = await postJsonWithTimeout(targetUrl.trim(), testPayload, 15000);
+    const ok = rawRes ? rawRes.ok : true;
+
+    if (cfg && ok) {
+      cfg.lastSyncTime = new Date().toISOString();
+      await saveDatabasePersistent(db);
+    }
+
+    res.json({
+      success: ok,
+      message: ok
+        ? `Đã gửi dữ liệu kiểm tra vào tab "${targetBook.code}" trên Google Sheets thành công!`
+        : `Google Apps Script trả về mã ${rawRes?.status || 502}. Hãy kiểm tra lại quyền truy cập Web App.`,
+    });
+  } catch (err: any) {
+    const statusCode =
+      err instanceof AppsScriptAuthError
+        ? err.code === 'MISSING_APPS_SCRIPT_TOKEN'
+          ? 500
+          : 502
+        : 500;
+    res.status(statusCode).json({
+      success: false,
+      ...(err instanceof AppsScriptAuthError ? { code: err.code } : {}),
+      message: 'Lỗi khi gửi đến Google Sheets: ' + scrubSecretsFromText(err?.message || 'Không thể kết nối'),
+    });
+  }
+});
+
+app.post('/api/sync/google-sheets/sync-all', requireAuth, requireAdmin, async (req, res) => {
+  const { bookId } = req.body || {};
+  const cfg = db.settings.googleSheetsConfig;
+  const targetBook = bookId && bookId !== 'all' ? getBookById(bookId) : null;
+  const hasAnyTarget =
+    (cfg && cfg.enabled && cfg.webhookUrl) ||
+    (targetBook?.googleSheetsConfig?.enabled && targetBook.googleSheetsConfig.webhookUrl);
+  if (!hasAnyTarget) {
+    return res.status(400).json({ error: 'Chưa bật cấu hình Google Sheets Webhook.' });
+  }
+
+  try {
+    const filteredDocs = targetBook
+      ? db.documents.filter((d) => getDocBookId(d) === targetBook.id)
+      : db.documents;
+    const sortedDocs = [...filteredDocs].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+    let successCount = 0;
+
+    for (const doc of sortedDocs) {
+      await syncToGoogleSheets(doc, doc.status === 'deleted' ? 'delete' : doc.status === 'cancelled' ? 'cancel' : 'create');
+      successCount++;
+    }
+
+    if (cfg && cfg.enabled) {
+      cfg.lastSyncTime = new Date().toISOString();
+    }
+    await saveDatabasePersistent(db);
+
+    res.json({
+      success: true,
+      message: targetBook
+        ? `Đã gửi ${successCount} văn bản của sổ "${targetBook.name}" (tab ${targetBook.code}) sang Google Sheets.`
+        : `Đã gửi toàn bộ ${successCount} văn bản theo từng tab sổ sang Google Trang tính thành công!`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Đồng bộ thất bại: ' + err.message });
+  }
+});
+
+// Tùy chọn Google Sheets riêng cho từng sổ (để đơn vị tự chia sẻ file riêng ngoài file tổng Admin)
+app.post('/api/books/:id/google-sheets', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const targetBook = db.books.find((b) => b.id === req.params.id);
+  if (!targetBook) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản.' });
+  }
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
+    return res.status(403).json({
+      error: `Bạn cần quyền "Quản trị sổ" trong ${targetBook.name} để cấu hình Google Sheets riêng.`,
+    });
+  }
+  if (checkVersionConflict(req, res, targetBook, currentUser)) return;
+  const { enabled, webhookUrl } = req.body || {};
+  targetBook.googleSheetsConfig = {
+    enabled: Boolean(enabled),
+    webhookUrl: typeof webhookUrl === 'string' ? webhookUrl.trim() : '',
+    lastSyncTime: targetBook.googleSheetsConfig?.lastSyncTime || '',
+  };
+  bumpBookVersion(targetBook);
+  await saveDatabasePersistent(db);
+  broadcastSSE('books_updated', {
+    bookId: targetBook.id,
+    configVersion: targetBook.configVersion,
+    updatedAt: targetBook.updatedAt,
+  });
+  res.json({ book: sanitizeBookForUser(targetBook, currentUser) });
+});
+
+// 13. Cấu hình & Kiểm tra kết nối Lưu trữ Google Drive (Theo sổ hoặc mặc định hệ thống)
+app.post('/api/drive/config', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const {
+    bookId,
+    enabled,
+    authMode,
+    folderUrl,
+    appsScriptUrl,
+    clearAppsScriptUrl,
+    serviceAccountJson,
+    clearServiceAccountJson,
+    scopeUnitCode,
+  } = req.body;
+
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const hasExplicitBook = Boolean(bookId || req.body?.bookCode || req.body?.unit);
+  const targetBook = hasExplicitBook
+    ? findBookStrictly({ bookId, bookCode: req.body?.bookCode, unit: req.body?.unit })
+    : db.books.find((b) => b.id === DEFAULT_BOOK_ID) || null;
+  if (!targetBook) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Sổ hoặc mã đơn vị cấu hình Google Drive không hợp lệ.',
+    });
+  }
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
+    return res.status(403).json({
+      error: `Bạn cần quyền "Quản trị sổ" hoặc Quản trị viên để cấu hình thư mục Google Drive cho ${targetBook.name}.`,
+    });
+  }
+
+  if (checkVersionConflict(req, res, targetBook, currentUser)) return;
+
+  if (!db.settings.googleDriveConfig) {
+    db.settings.googleDriveConfig = {
+      enabled: false,
+      authMode: 'apps_script',
+      folderUrl: '',
+      folderId: '',
+      folderByUnit: {},
+    };
+  }
+
+  const isDedicatedBook = Boolean(bookId && targetBook.id !== DEFAULT_BOOK_ID);
+  const prev: GoogleDriveConfig = isDedicatedBook
+    ? {
+        enabled: false,
+        authMode: db.settings.googleDriveConfig.authMode || 'apps_script',
+        folderUrl: '',
+        folderId: '',
+        ...(targetBook.googleDriveConfig || {}),
+      }
+    : db.settings.googleDriveConfig;
+
+  const nextAuthMode: 'apps_script' | 'service_account' =
+    authMode === 'service_account' ? 'service_account' : 'apps_script';
+
+  const rawFolderInput = typeof folderUrl === 'string' ? folderUrl.trim() : prev.folderUrl || '';
+  const parsedFolderId = extractGoogleDriveFolderId(rawFolderInput);
+
+  if (rawFolderInput && !parsedFolderId) {
+    return res.status(400).json({
+      error: 'URL hoặc ID thư mục Google Drive không hợp lệ. Vui lòng dán liên kết dạng https://drive.google.com/drive/folders/... hoặc ID thư mục.',
+    });
+  }
+
+  if (Boolean(enabled) && !parsedFolderId) {
+    return res.status(400).json({
+      error: 'Vui lòng nhập URL hoặc ID thư mục Google Drive trước khi bật tính năng lưu tệp.',
+    });
+  }
+
+  let nextSaJson = prev.serviceAccountJson || '';
+  let nextSaEmail = prev.serviceAccountEmail || '';
+  if (clearServiceAccountJson) {
+    nextSaJson = '';
+    nextSaEmail = '';
+  } else if (typeof serviceAccountJson === 'string' && serviceAccountJson.trim()) {
+    const parsedSa = parseServiceAccountJson(serviceAccountJson);
+    if (parsedSa.error || !parsedSa.parsed) {
+      return res.status(400).json({ error: parsedSa.error || 'Tài khoản dịch vụ JSON không hợp lệ.' });
+    }
+    nextSaJson = serviceAccountJson.trim();
+    nextSaEmail = parsedSa.parsed.client_email;
+  }
+
+  let nextAppsScriptUrl = prev.appsScriptUrl || '';
+  if (clearAppsScriptUrl) {
+    nextAppsScriptUrl = '';
+  } else if (typeof appsScriptUrl === 'string' && appsScriptUrl.trim()) {
+    const trimmedUrl = appsScriptUrl.trim();
+    try {
+      parseAndValidateAppsScriptUrl(trimmedUrl, false);
+    } catch (urlErr: any) {
+      return res.status(400).json({
+        code: urlErr instanceof AppsScriptAuthError ? urlErr.code : 'APPS_SCRIPT_INVALID_URL',
+        error: scrubSecretsFromText(
+          urlErr?.message || 'URL Apps Script Web App phải là HTTPS hợp lệ thuộc script.google.com.'
+        ),
+      });
+    }
+    nextAppsScriptUrl = trimmedUrl;
+  }
+
+  if (isDedicatedBook) {
+    targetBook.googleDriveConfig = {
+      enabled: Boolean(enabled),
+      authMode: nextAuthMode,
+      folderUrl: rawFolderInput,
+      folderId: parsedFolderId,
+      folderName: parsedFolderId === targetBook.googleDriveConfig?.folderId ? targetBook.googleDriveConfig?.folderName : undefined,
+      appsScriptUrl: nextAppsScriptUrl !== db.settings.googleDriveConfig.appsScriptUrl ? nextAppsScriptUrl : undefined,
+      serviceAccountJson: nextSaJson !== db.settings.googleDriveConfig.serviceAccountJson ? nextSaJson : undefined,
+      serviceAccountEmail: nextSaEmail,
+    };
+    bumpBookVersion(targetBook);
+    await saveDatabasePersistent(db);
+    broadcastSSE('books_updated', {
+      bookId: targetBook.id,
+      configVersion: targetBook.configVersion,
+      updatedAt: targetBook.updatedAt,
+    });
+    return res.json({
+      googleDriveConfig: sanitizeDriveConfigForClient(
+        db.settings.googleDriveConfig,
+        true,
+        targetBook.unitCode,
+        targetBook.googleDriveConfig,
+        false
+      ),
+      book: sanitizeBookForUser(targetBook, currentUser),
+    });
+  }
+
+  const targetUnit = (typeof scopeUnitCode === 'string' && scopeUnitCode.trim()) || db.settings.unitCode;
+  const folderByUnit = { ...(db.settings.googleDriveConfig.folderByUnit || {}) };
+  if (targetUnit && parsedFolderId) {
+    folderByUnit[targetUnit] = {
+      folderUrl: rawFolderInput,
+      folderId: parsedFolderId,
+      folderName: parsedFolderId === db.settings.googleDriveConfig.folderId ? db.settings.googleDriveConfig.folderName : undefined,
+    };
+  }
+
+  const updatedConfig: GoogleDriveConfig = {
+    ...db.settings.googleDriveConfig,
+    enabled: Boolean(enabled),
+    authMode: nextAuthMode,
+    folderUrl: rawFolderInput,
+    folderId: parsedFolderId,
+    folderName: parsedFolderId === db.settings.googleDriveConfig.folderId ? db.settings.googleDriveConfig.folderName : undefined,
+    folderByUnit,
+    appsScriptUrl: nextAppsScriptUrl,
+    serviceAccountJson: nextSaJson,
+    serviceAccountEmail: nextSaEmail,
+  };
+
+  db.settings.googleDriveConfig = updatedConfig;
+  bumpBookVersion(targetBook);
+  await saveDatabasePersistent(db);
+  broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
+  broadcastSSE('books_updated', {
+    bookId: targetBook.id,
+    configVersion: targetBook.configVersion,
+    updatedAt: targetBook.updatedAt,
+  });
+
+  res.json({
+    googleDriveConfig: sanitizeDriveConfigForClient(db.settings.googleDriveConfig, true, db.settings.unitCode),
+    book: sanitizeBookForUser(targetBook, currentUser),
+  });
+});
+
+app.post('/api/drive/test', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { bookId, authMode, folderUrl, appsScriptUrl, serviceAccountJson } = req.body || {};
+
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const hasExplicitBook = Boolean(bookId || req.body?.bookCode || req.body?.unit);
+  const targetBook = hasExplicitBook
+    ? findBookStrictly({ bookId, bookCode: req.body?.bookCode, unit: req.body?.unit })
+    : db.books.find((b) => b.id === DEFAULT_BOOK_ID) || null;
+  if (!targetBook) {
+    return res.status(400).json({
+      success: false,
+      code: 'BOOK_NOT_FOUND',
+      message: 'Sổ hoặc mã đơn vị kiểm tra kết nối Google Drive không hợp lệ.',
+    });
+  }
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
+    return res.status(403).json({
+      error: `Bạn cần quyền "Quản trị sổ" hoặc Quản trị viên để kiểm tra kết nối Drive cho ${targetBook.name}.`,
+    });
+  }
+
+  const resolved = resolveDriveForBook(targetBook);
+
+  const testAuthMode: 'apps_script' | 'service_account' =
+    authMode === 'service_account' || authMode === 'apps_script' ? authMode : resolved.authMode;
+  const testFolderId =
+    typeof folderUrl === 'string' && folderUrl.trim()
+      ? extractGoogleDriveFolderId(folderUrl.trim())
+      : resolved.folderId;
+  const testAppsScriptUrl =
+    typeof appsScriptUrl === 'string' && appsScriptUrl.trim()
+      ? appsScriptUrl.trim()
+      : resolved.appsScriptUrl;
+  const testSaJson =
+    typeof serviceAccountJson === 'string' && serviceAccountJson.trim()
+      ? serviceAccountJson.trim()
+      : resolved.serviceAccountJson;
+
+  try {
+    const result = await testGoogleDriveConnection({
+      authMode: testAuthMode,
+      folderId: testFolderId,
+      appsScriptUrl: testAppsScriptUrl,
+      serviceAccountJson: testSaJson,
+    });
+
+    const isDedicatedBook = Boolean(bookId && targetBook.id !== DEFAULT_BOOK_ID);
+    if (isDedicatedBook) {
+      if (!targetBook.googleDriveConfig) targetBook.googleDriveConfig = {};
+      targetBook.googleDriveConfig.lastCheckedAt = new Date().toISOString();
+      targetBook.googleDriveConfig.lastCheckStatus = result.success ? 'ok' : 'error';
+      targetBook.googleDriveConfig.lastCheckMessage = result.message;
+      if (result.success && result.folderName && result.folderId === targetBook.googleDriveConfig.folderId) {
+        targetBook.googleDriveConfig.folderName = result.folderName;
+      }
+      await saveDatabasePersistent(db);
+      broadcastSSE('books_updated', { bookId: targetBook.id });
+    } else if (db.settings.googleDriveConfig) {
+      db.settings.googleDriveConfig.lastCheckedAt = new Date().toISOString();
+      db.settings.googleDriveConfig.lastCheckStatus = result.success ? 'ok' : 'error';
+      db.settings.googleDriveConfig.lastCheckMessage = result.message;
+      if (result.success && result.folderName && result.folderId === db.settings.googleDriveConfig.folderId) {
+        db.settings.googleDriveConfig.folderName = result.folderName;
+        if (db.settings.googleDriveConfig.folderByUnit?.[db.settings.unitCode]) {
+          db.settings.googleDriveConfig.folderByUnit[db.settings.unitCode].folderName = result.folderName;
+        }
+      }
+      await saveDatabasePersistent(db);
+      broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
+      broadcastSSE('books_updated', { bookId: targetBook.id });
+    }
+
+    const httpStatus = result.success
+      ? 200
+      : result.code === 'MISSING_APPS_SCRIPT_TOKEN'
+      ? 500
+      : result.code === 'APPS_SCRIPT_AUTH_FAILED' || result.code === 'APPS_SCRIPT_REDIRECT_BLOCKED'
+      ? 502
+      : 400;
+    res.status(httpStatus).json({
+      ...result,
+      googleDriveConfig: sanitizeDriveConfigForClient(
+        db.settings.googleDriveConfig,
+        true,
+        targetBook.unitCode,
+        isDedicatedBook ? targetBook.googleDriveConfig : undefined,
+        !isDedicatedBook
+      ),
+    });
+  } catch (err: any) {
+    const msg = scrubSecretsFromText(err?.message || 'Không thể kết nối tới Google Drive.');
+    const isDedicatedBook = Boolean(bookId && targetBook.id !== DEFAULT_BOOK_ID);
+    if (isDedicatedBook) {
+      if (!targetBook.googleDriveConfig) targetBook.googleDriveConfig = {};
+      targetBook.googleDriveConfig.lastCheckedAt = new Date().toISOString();
+      targetBook.googleDriveConfig.lastCheckStatus = 'error';
+      targetBook.googleDriveConfig.lastCheckMessage = msg;
+      await saveDatabasePersistent(db);
+    } else if (db.settings.googleDriveConfig) {
+      db.settings.googleDriveConfig.lastCheckedAt = new Date().toISOString();
+      db.settings.googleDriveConfig.lastCheckStatus = 'error';
+      db.settings.googleDriveConfig.lastCheckMessage = msg;
+      await saveDatabasePersistent(db);
+    }
+    const statusCode =
+      err instanceof AppsScriptAuthError
+        ? err.code === 'MISSING_APPS_SCRIPT_TOKEN'
+          ? 500
+          : 502
+        : 500;
+    res.status(statusCode).json({
+      success: false,
+      ...(err instanceof AppsScriptAuthError ? { code: err.code } : {}),
+      folderId: testFolderId,
+      message: msg,
+    });
+  }
+});
+
+// =========================================================================
+// 11. MẪU WORD (.docx) THEO SỔ & LOẠI VĂN BẢN
+// =========================================================================
+app.get('/api/word-templates', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const bookId = typeof req.query.bookId === 'string' ? req.query.bookId.trim() : '';
+
+  if (bookId) {
+    const targetBook = getBookById(bookId);
+    if (
+      !isSystemAdmin(currentUser) &&
+      getUserBookPermissions(currentUser, targetBook.id).length === 0
+    ) {
+      return res.status(403).json({ error: `Bạn chưa được phân quyền trong ${targetBook.name}.` });
+    }
+  }
+
+  const list = (db.wordTemplates || [])
+    .filter((t) => {
+      if (bookId && t.bookId !== bookId) return false;
+      return isSystemAdmin(currentUser) || getUserBookPermissions(currentUser, t.bookId).length > 0;
+    })
+    .map(({ base64Docx: _b64, ...safe }) => ({ ...safe, base64Docx: '' }));
+
+  res.json({
+    templates: list,
+    supportedPlaceholders: SUPPORTED_WORD_PLACEHOLDERS,
+  });
+});
+
+app.post('/api/word-templates', requireAuth, handleWordUploadMulter, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const file = req.file;
+  const bookId = typeof req.body?.bookId === 'string' ? req.body.bookId.trim() : '';
+  const typeCode = typeof req.body?.typeCode === 'string' ? req.body.typeCode.trim().toUpperCase() : '';
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+
+  const targetBook = getBookById(bookId);
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
+    return res.status(403).json({
+      error: `Chỉ Admin toàn quyền hoặc Quản trị sổ (${targetBook.name}) mới được tải lên mẫu Word.`,
+    });
+  }
+
+  if (!typeCode) {
+    return res.status(400).json({ error: 'Vui lòng chọn loại văn bản áp dụng cho mẫu Word.' });
+  }
+  if (!file) {
+    return res.status(400).json({ error: 'Vui lòng chọn tệp mẫu Word (.docx).' });
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    return res.status(413).json({ error: 'Tệp mẫu Word (.docx) không được vượt quá 5 MB.' });
+  }
+
+  const validation = validateWordFileBuffer(file.originalname, file.mimetype, file.buffer);
+  if (!validation.valid || validation.extension !== '.docx') {
+    return res.status(400).json({
+      error: validation.valid
+        ? 'Mẫu văn bản tự động chỉ hỗ trợ định dạng .docx.'
+        : validation.error || 'Tệp mẫu Word (.docx) không hợp lệ.',
+    });
+  }
+
+  let inspected: { placeholders: string[]; unknownPlaceholders: string[] };
+  try {
+    inspected = inspectDocxTemplate(file.buffer);
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Không đọc được cấu trúc tệp mẫu .docx.' });
+  }
+
+  const nowIso = new Date().toISOString();
+  const tpl: WordTemplate = {
+    id: `tpl-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+    bookId: targetBook.id,
+    bookCode: targetBook.code,
+    typeCode,
+    name: name || file.originalname.replace(/\.docx$/i, ''),
+    originalFileName: file.originalname,
+    fileSize: file.size,
+    base64Docx: file.buffer.toString('base64'),
+    placeholders: inspected.placeholders,
+    createdBy: currentUser.fullName,
+    createdByUserId: currentUser.id,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    updatedBy: currentUser.fullName,
+  };
+
+  if (!Array.isArray(db.wordTemplates)) db.wordTemplates = [];
+  db.wordTemplates.unshift(tpl);
+
+  appendSystemAuditLog({
+    actorUserId: currentUser.id,
+    actorName: `${currentUser.fullName} (${currentUser.username})`,
+    action: 'book_update',
+    bookId: targetBook.id,
+    bookCode: targetBook.code,
+    details: `Thêm mẫu Word "${tpl.name}" cho loại ${typeCode} trong ${targetBook.name}`,
+  });
+
+  await saveDatabasePersistent(db);
+  broadcastSSE('templates_updated', { bookId: targetBook.id });
+
+  const { base64Docx: _b64, ...safeTpl } = tpl;
+  res.status(201).json({
+    template: { ...safeTpl, base64Docx: '' },
+    placeholders: inspected.placeholders,
+  });
+});
+
+app.delete('/api/word-templates/:id', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { id } = req.params;
+  if (!Array.isArray(db.wordTemplates)) db.wordTemplates = [];
+  const idx = db.wordTemplates.findIndex((t) => t.id === id);
+  if (idx === -1) {
+    return res.status(404).json({ error: 'Không tìm thấy mẫu Word.' });
+  }
+  const tpl = db.wordTemplates[idx];
+  const targetBook = getBookById(tpl.bookId);
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
+    return res.status(403).json({
+      error: `Bạn không có quyền xóa mẫu Word của ${targetBook.name}.`,
+    });
+  }
+
+  db.wordTemplates.splice(idx, 1);
+  appendSystemAuditLog({
+    actorUserId: currentUser.id,
+    actorName: `${currentUser.fullName} (${currentUser.username})`,
+    action: 'book_update',
+    bookId: targetBook.id,
+    bookCode: targetBook.code,
+    details: `Xóa mẫu Word "${tpl.name}" (${tpl.typeCode}) trong ${targetBook.name}`,
+  });
+
+  await saveDatabasePersistent(db);
+  broadcastSSE('templates_updated', { bookId: targetBook.id });
+  res.json({ success: true });
+});
+
+app.post('/api/word-templates/:id/preview-draft', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { id } = req.params;
+  const tpl = (db.wordTemplates || []).find((t) => t.id === id);
+  if (!tpl) {
+    return res.status(404).json({ error: 'Không tìm thấy mẫu Word.' });
+  }
+  const targetBook = getBookById(tpl.bookId);
+  if (
+    !isSystemAdmin(currentUser) &&
+    getUserBookPermissions(currentUser, targetBook.id).length === 0
+  ) {
+    return res.status(403).json({ error: `Bạn chưa được phân quyền trong ${targetBook.name}.` });
+  }
+
+  const vnNow = getVietnamTimeInfo(new Date());
+  const { docName, title, signer, signerRole, issueDate, customValues, download } = req.body || {};
+  const docxBuffer = Buffer.from(tpl.base64Docx, 'base64');
+  const filled = fillDocxTemplate(
+    docxBuffer,
+    {
+      so_ky_hieu: 'DỰ THẢO (CHƯA CẤP SỐ)',
+      don_vi: targetBook.unitName || targetBook.name,
+      ten_van_ban: typeof docName === 'string' ? docName.trim() : '',
+      trich_yeu: typeof title === 'string' ? title.trim() : typeof docName === 'string' ? docName.trim() : '',
+      ngay_ban_hanh: typeof issueDate === 'string' && issueDate.trim() ? issueDate.trim() : vnNow.formattedDate,
+      nguoi_ky: typeof signer === 'string' ? signer.trim() : '',
+      chuc_vu: typeof signerRole === 'string' ? signerRole.trim() : '',
+      ...(customValues && typeof customValues === 'object' ? customValues : {}),
+    },
+    { isDraft: true }
+  );
+
+  if (download === true) {
+    const cleanName = sanitizeCustomDriveFileName(
+      `DU-THAO - ${typeof docName === 'string' && docName.trim() ? docName.trim() : tpl.name}`,
+      '.docx'
+    );
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    );
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(cleanName)}`);
+    return res.send(filled.outputBuffer);
+  }
+
+  return res.json({
+    templateId: tpl.id,
+    placeholders: filled.placeholders,
+    replacedPlaceholders: filled.placeholders.filter(
+      (k) => !filled.missingFields.some((m) => m.key === k)
+    ),
+    missingFields: filled.missingFields,
+  });
+});
+
+// =========================================================================
+// 12. VIỆC CẦN LÀM & "VIỆC CỦA TÔI"
+// =========================================================================
+app.get('/api/tasks', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const scope = typeof req.query.scope === 'string' ? req.query.scope.trim() : 'all';
+  const docId = typeof req.query.docId === 'string' ? req.query.docId.trim() : '';
+  const bookId = typeof req.query.bookId === 'string' ? req.query.bookId.trim() : '';
+  const statusParam = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+
+  if (bookId && bookId !== 'all') {
+    const targetBook = getBookById(bookId);
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'view')) {
+      return res.status(403).json({ error: `Bạn chưa được cấp quyền "Xem" trong ${targetBook.name}.` });
+    }
+  }
+
+  const list = (db.documentTasks || []).filter((t) => {
+    const canSeeBook =
+      isSystemAdmin(currentUser) ||
+      hasBookPermission(currentUser, t.bookId, 'view') ||
+      t.assigneeUserId === currentUser.id;
+    if (!canSeeBook) return false;
+    if (scope === 'mine' && t.assigneeUserId !== currentUser.id) return false;
+    if (docId && t.docId !== docId) return false;
+    if (bookId && bookId !== 'all' && t.bookId !== bookId) return false;
+    if (statusParam && statusParam !== 'all' && t.status !== statusParam) return false;
+    return true;
+  });
+
+  res.json({
+    total: list.length,
+    tasks: list,
+  });
+});
+
+app.get('/api/tasks/assignees', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const bookId = typeof req.query.bookId === 'string' ? req.query.bookId.trim() : '';
+  const targetBook = getBookById(bookId || undefined);
+
+  if (!isSystemAdmin(currentUser) && getUserBookPermissions(currentUser, targetBook.id).length === 0) {
+    return res.status(403).json({ error: `Bạn chưa được phân quyền trong ${targetBook.name}.` });
+  }
+
+  const assignees = db.users
+    .filter(
+      (u) =>
+        u.isActive &&
+        (u.role === 'admin' || getUserBookPermissions(u, targetBook.id).length > 0)
+    )
+    .map((u) => ({
+      id: u.id,
+      username: u.username,
+      fullName: u.fullName,
+      displayName: u.displayName || u.fullName || u.username,
+      role: u.role,
+    }));
+
+  res.json({ assignees });
+});
+
+app.post('/api/tasks', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const {
+    docId,
+    suggestionId,
+    title,
+    dueDate,
+    rawDeadlineText,
+    needsConfirmation,
+    recipient,
+    sourceExcerpt,
+    sourcePage,
+    assigneeUserId,
+  } = req.body || {};
+
+  if (!docId || typeof docId !== 'string') {
+    return res.status(400).json({ error: 'Thiếu mã hồ sơ văn bản liên kết.' });
+  }
+  const doc = db.documents.find((d) => d.id === docId);
+  if (!doc) {
+    return res.status(404).json({ error: 'Không tìm thấy hồ sơ văn bản.' });
+  }
+  const targetBook = getBookById(getDocBookId(doc));
+  const canCreate =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, targetBook.id, 'import_incoming') ||
+    hasBookPermission(currentUser, targetBook.id, 'edit') ||
+    hasBookPermission(currentUser, targetBook.id, 'manage_book') ||
+    hasBookPermission(currentUser, targetBook.id, 'view');
+  if (!canCreate) {
+    return res.status(403).json({ error: `Bạn không có quyền tạo việc từ hồ sơ thuộc ${targetBook.name}.` });
+  }
+
+  const cleanTitle = typeof title === 'string' ? title.trim() : '';
+  if (!cleanTitle) {
+    return res.status(400).json({ error: 'Vui lòng nhập nội dung việc cần thực hiện.' });
+  }
+
+  const targetAssigneeId =
+    typeof assigneeUserId === 'string' && assigneeUserId.trim() ? assigneeUserId.trim() : currentUser.id;
+  const assignee = db.users.find((u) => u.id === targetAssigneeId && u.isActive);
+  if (!assignee) {
+    return res.status(400).json({ error: 'Không tìm thấy người được giao việc đang hoạt động.' });
+  }
+
+  const cleanDueDate = typeof dueDate === 'string' ? dueDate.trim() : '';
+  if (cleanDueDate && !/^\d{2}\/\d{2}\/\d{4}$/.test(cleanDueDate)) {
+    return res.status(400).json({ error: 'Hạn nộp phải theo định dạng dd/MM/yyyy hoặc để trống nếu cần xác nhận.' });
+  }
+
+  if (!Array.isArray(db.documentTasks)) db.documentTasks = [];
+  const cleanSuggestionId = typeof suggestionId === 'string' && suggestionId.trim() ? suggestionId.trim() : undefined;
+  const nowIso = new Date().toISOString();
+
+  // Tránh tạo trùng nếu xác nhận lại cùng một suggestionId trên cùng hồ sơ
+  const existing = cleanSuggestionId
+    ? db.documentTasks.find((t) => t.docId === doc.id && t.suggestionId === cleanSuggestionId)
+    : undefined;
+
+  if (existing) {
+    existing.title = cleanTitle;
+    existing.dueDate = cleanDueDate;
+    existing.rawDeadlineText = typeof rawDeadlineText === 'string' ? rawDeadlineText.trim() || undefined : existing.rawDeadlineText;
+    existing.needsConfirmation = Boolean(needsConfirmation) && !cleanDueDate;
+    existing.recipient = typeof recipient === 'string' ? recipient.trim() || undefined : existing.recipient;
+    existing.sourceExcerpt = typeof sourceExcerpt === 'string' ? sourceExcerpt.trim() || undefined : existing.sourceExcerpt;
+    existing.sourcePage = typeof sourcePage === 'number' && Number.isFinite(sourcePage) ? sourcePage : existing.sourcePage;
+    existing.assigneeUserId = assignee.id;
+    existing.assigneeName = assignee.displayName || assignee.fullName || assignee.username;
+    existing.assigneeUsername = assignee.username;
+    existing.updatedAt = nowIso;
+
+    await saveDatabasePersistent(db);
+    broadcastSSE('tasks_updated', { docId: doc.id, task: existing });
+    return res.json({ task: existing, deduplicated: true });
+  }
+
+  const newTask: DocumentTask = {
+    id: `task-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+    bookId: targetBook.id,
+    bookCode: targetBook.code,
+    bookName: targetBook.name,
+    docId: doc.id,
+    fullDocNumber: doc.fullDocNumber,
+    docName: doc.docName || doc.title,
+    ...(cleanSuggestionId ? { suggestionId: cleanSuggestionId } : {}),
+    title: cleanTitle,
+    dueDate: cleanDueDate,
+    ...(typeof rawDeadlineText === 'string' && rawDeadlineText.trim() ? { rawDeadlineText: rawDeadlineText.trim() } : {}),
+    needsConfirmation: Boolean(needsConfirmation) && !cleanDueDate,
+    ...(typeof recipient === 'string' && recipient.trim() ? { recipient: recipient.trim() } : {}),
+    ...(typeof sourceExcerpt === 'string' && sourceExcerpt.trim() ? { sourceExcerpt: sourceExcerpt.trim() } : {}),
+    ...(typeof sourcePage === 'number' && Number.isFinite(sourcePage) ? { sourcePage } : {}),
+    assigneeUserId: assignee.id,
+    assigneeName: assignee.displayName || assignee.fullName || assignee.username,
+    assigneeUsername: assignee.username,
+    status: 'pending',
+    createdByUserId: currentUser.id,
+    createdByName: currentUser.fullName,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
+
+  db.documentTasks.unshift(newTask);
+  recordDocumentHistoryEntry({
+    doc,
+    book: targetBook,
+    actor: currentUser,
+    action: 'task_create',
+    changes: {
+      taskTitle: { old: null, new: newTask.title },
+      assignee: { old: null, new: `${newTask.assigneeName} (@${newTask.assigneeUsername})` },
+      dueDate: { old: null, new: newTask.dueDate || 'Cần xác nhận' },
+    },
+    reason: 'Xác nhận việc cần làm từ văn bản',
+  });
+
+  await saveDatabasePersistent(db);
+  broadcastSSE('tasks_updated', { docId: doc.id, task: newTask });
+  res.status(201).json({ task: newTask });
+});
+
+app.put('/api/tasks/:id', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { id } = req.params;
+  const task = (db.documentTasks || []).find((t) => t.id === id);
+  if (!task) {
+    return res.status(404).json({ error: 'Không tìm thấy đầu việc.' });
+  }
+
+  const targetBook = getBookById(task.bookId);
+  const canFullEdit =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, targetBook.id, 'manage_book') ||
+    hasBookPermission(currentUser, targetBook.id, 'edit') ||
+    task.createdByUserId === currentUser.id;
+  const isAssignee = task.assigneeUserId === currentUser.id;
+
+  if (!canFullEdit && !isAssignee) {
+    return res.status(403).json({ error: 'Bạn không có quyền cập nhật việc này.' });
+  }
+
+  const { status, title, dueDate, assigneeUserId, needsConfirmation } = req.body || {};
+  const prevStatus = task.status;
+
+  if (status !== undefined) {
+    const allowed: DocumentTaskStatus[] = ['pending', 'in_progress', 'done'];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ error: 'Trạng thái công việc không hợp lệ.' });
+    }
+    task.status = status;
+  }
+
+  if (canFullEdit) {
+    if (typeof title === 'string' && title.trim()) {
+      task.title = title.trim();
+    }
+    if (typeof dueDate === 'string') {
+      const cleanDue = dueDate.trim();
+      if (cleanDue && !/^\d{2}\/\d{2}\/\d{4}$/.test(cleanDue)) {
+        return res.status(400).json({ error: 'Hạn nộp phải theo định dạng dd/MM/yyyy.' });
+      }
+      task.dueDate = cleanDue;
+      task.needsConfirmation = cleanDue ? false : Boolean(needsConfirmation);
+    }
+    if (typeof assigneeUserId === 'string' && assigneeUserId.trim()) {
+      const nextAssignee = db.users.find((u) => u.id === assigneeUserId.trim() && u.isActive);
+      if (!nextAssignee) {
+        return res.status(400).json({ error: 'Không tìm thấy người thực hiện được chọn.' });
+      }
+      task.assigneeUserId = nextAssignee.id;
+      task.assigneeName = nextAssignee.displayName || nextAssignee.fullName || nextAssignee.username;
+      task.assigneeUsername = nextAssignee.username;
+    }
+  }
+
+  task.updatedAt = new Date().toISOString();
+  const doc = db.documents.find((d) => d.id === task.docId);
+  if (doc && prevStatus !== task.status) {
+    recordDocumentHistoryEntry({
+      doc,
+      book: targetBook,
+      actor: currentUser,
+      action: 'task_update',
+      changes: {
+        taskStatus: { old: prevStatus, new: task.status },
+      },
+      reason: `Cập nhật trạng thái việc "${task.title}"`,
+    });
+  }
+
+  await saveDatabasePersistent(db);
+  broadcastSSE('tasks_updated', { docId: task.docId, task });
+  res.json({ task });
+});
+
+// =========================================================================
+// 13. QUẢN LÝ NHIỀU TỆP ĐÍNH KÈM & PHIÊN BẢN TRÊN MỘT HỒ SƠ
+// =========================================================================
+app.post('/api/documents/:id/attachments', requireAuth, handleWordUploadMulter, async (req, res) => {
+  const { id } = req.params;
+  const currentUser = (req as any).user as User;
+  const file = req.file;
+  const groupInput = typeof req.body?.group === 'string' ? req.body.group.trim() : '';
+  const attachmentId = typeof req.body?.attachmentId === 'string' ? req.body.attachmentId.trim() : '';
+  const labelInput = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
+  const requestedFileName = typeof req.body?.fileName === 'string' ? req.body.fileName.trim() : '';
+  const setAsOfficial = req.body?.setAsOfficial === 'true' || req.body?.setAsOfficial === true;
+
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) {
+    return res.status(404).json({ error: 'Không tìm thấy hồ sơ văn bản.' });
+  }
+  const targetBook = resolveStrictBookForDocument(doc);
+  if (!targetBook) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản này.',
+    });
+  }
+  if (doc.status === 'cancelled' || doc.status === 'deleted') {
+    return res.status(400).json({ error: 'Không thể đính kèm thêm tệp vào văn bản đã hủy hoặc đã xóa.' });
+  }
+
+  const allowedGroups: AttachmentGroup[] = ['word_draft', 'signed_pdf', 'appendix'];
+  if (!allowedGroups.includes(groupInput as AttachmentGroup)) {
+    return res.status(400).json({ error: 'Nhóm tệp đính kèm không hợp lệ (word_draft, signed_pdf, appendix).' });
+  }
+  const group = groupInput as AttachmentGroup;
+
+  if (!file) {
+    return res.status(400).json({ error: 'Vui lòng chọn tệp cần tải lên.' });
+  }
+
+  const ext = getSupportedAttachmentExtension(file.originalname);
+  if (!ext) {
+    return res.status(400).json({
+      error: 'Định dạng tệp chưa được hỗ trợ. Hệ thống chấp nhận .doc, .docx, .pdf, .xls, .xlsx, .png, .jpg.',
+    });
+  }
+  if (ext === '.pdf') {
+    const v = validatePdfFileBuffer(file.originalname, file.mimetype, file.buffer);
+    if (!v.valid) return res.status(400).json({ error: v.error });
+  } else if (ext === '.doc' || ext === '.docx') {
+    const v = validateWordFileBuffer(file.originalname, file.mimetype, file.buffer);
+    if (!v.valid) return res.status(400).json({ error: v.error });
+  } else if (file.buffer.length === 0) {
+    return res.status(400).json({ error: 'Tệp tải lên đang bị rỗng.' });
+  }
+
+  const existingList = getEffectiveAttachments(doc);
+  const existingIdx = attachmentId ? existingList.findIndex((a) => a.id === attachmentId) : -1;
+  if (attachmentId && existingIdx === -1) {
+    return res.status(404).json({ error: 'Không tìm thấy mục tệp đính kèm cần thay thế.' });
+  }
+  const isReplacing = existingIdx !== -1;
+
+  if (isReplacing) {
+    const canReplace =
+      isSystemAdmin(currentUser) ||
+      hasBookPermission(currentUser, targetBook.id, 'replace_file') ||
+      hasBookPermission(currentUser, targetBook.id, 'manage_book');
+    if (!canReplace) {
+      return res.status(403).json({
+        error: `Bạn cần quyền "Thay tệp" trong ${targetBook.name} để thay thế phiên bản tệp.`,
+      });
+    }
+  } else {
+    const canAdd =
+      isSystemAdmin(currentUser) ||
+      hasBookPermission(currentUser, targetBook.id, 'replace_file') ||
+      hasBookPermission(currentUser, targetBook.id, 'edit') ||
+      hasBookPermission(currentUser, targetBook.id, 'manage_book') ||
+      hasBookPermission(currentUser, targetBook.id, 'import_incoming') ||
+      (hasBookPermission(currentUser, targetBook.id, 'issue_number') && doc.issuedByUserId === currentUser.id);
+    if (!canAdd) {
+      return res.status(403).json({
+        error: `Bạn chưa có quyền thêm tệp đính kèm vào hồ sơ trong ${targetBook.name}.`,
+      });
+    }
+  }
+
+  const driveCfg = resolveDriveForBook(targetBook);
+  if (!driveCfg.isConfigured) {
+    return res.status(502).json({
+      error: driveCfg.missingReason || 'Thư mục Google Drive chưa được cấu hình hợp lệ.',
+      document: doc,
+    });
+  }
+
+  const effectiveGroup: AttachmentGroup = isReplacing ? existingList[existingIdx].group : group;
+  const targetOverrideName = requestedFileName
+    ? sanitizeCustomDriveFileName(requestedFileName, ext)
+    : effectiveGroup === 'appendix'
+    ? sanitizeCustomDriveFileName(
+        `${doc.fullDocNumber} - Phu luc - ${file.originalname.replace(/\.[^.]+$/, '')}`,
+        ext
+      )
+    : buildStandardDriveFileName(doc.fullDocNumber, doc.docName || doc.title, ext);
+
+  // Tải lên Drive trước — nếu thất bại phải giữ nguyên phiên bản cũ và trả lỗi 502
+  try {
+    const uploadResult = await uploadDocumentWithFolderCache({
+      driveCfg,
+      book: targetBook,
+      doc,
+      docCategoryOverride: doc.docCategory || 'outgoing',
+      originalFileName: file.originalname,
+      mimeType: file.mimetype || 'application/octet-stream',
+      buffer: file.buffer,
+      overrideFileName: targetOverrideName,
+      keepPreviousFile: true,
+    });
+
+    const sha256 = crypto.createHash('sha256').update(file.buffer).digest('hex');
+    const nowIso = new Date().toISOString();
+    const prevOfficialId = getOfficialAttachment(doc)?.id;
+
+    if (isReplacing) {
+      const targetAtt = existingList[existingIdx];
+      const nextVersion = (targetAtt.currentVersion || targetAtt.versions.length || 0) + 1;
+      const shouldBeOfficial = setAsOfficial || targetAtt.isOfficial;
+      if (shouldBeOfficial) {
+        existingList.forEach((a) => {
+          a.isOfficial = false;
+        });
+      }
+      const updatedAtt: DocumentAttachment = {
+        ...targetAtt,
+        label: labelInput || targetAtt.label,
+        isOfficial: shouldBeOfficial,
+        currentVersion: nextVersion,
+        fileName: uploadResult.fileName,
+        originalFileName: file.originalname,
+        mimeType: file.mimetype,
+        fileSize: file.size,
+        sha256,
+        driveFileId: uploadResult.fileId,
+        driveFileUrl: uploadResult.webViewLink,
+        driveFolderId: uploadResult.folderId || driveCfg.folderId,
+        driveFolderPath: uploadResult.folderPath,
+        driveStatus: 'saved',
+        driveError: undefined,
+        uploadedBy: currentUser.fullName,
+        uploadedByUsername: currentUser.username,
+        uploadedAt: nowIso,
+        versions: [
+          ...targetAtt.versions,
+          {
+            version: nextVersion,
+            fileName: uploadResult.fileName,
+            originalFileName: file.originalname,
+            mimeType: file.mimetype,
+            fileSize: file.size,
+            sha256,
+            driveFileId: uploadResult.fileId,
+            driveFileUrl: uploadResult.webViewLink,
+            driveFolderId: uploadResult.folderId || driveCfg.folderId,
+            driveFolderPath: uploadResult.folderPath,
+            driveStatus: 'saved',
+            uploadedBy: currentUser.fullName,
+            uploadedByUsername: currentUser.username,
+            uploadedAt: nowIso,
+          },
+        ],
+      };
+      existingList[existingIdx] = updatedAtt;
+    } else {
+      const hasAnyOfficial = existingList.some((a) => a.isOfficial && a.driveStatus === 'saved');
+      const shouldBeOfficial = setAsOfficial || !hasAnyOfficial;
+      if (shouldBeOfficial) {
+        existingList.forEach((a) => {
+          a.isOfficial = false;
+        });
+      }
+      const newAtt: DocumentAttachment = {
+        id: `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+        group: effectiveGroup,
+        label:
+          labelInput ||
+          (effectiveGroup === 'signed_pdf'
+            ? 'PDF đã ký'
+            : effectiveGroup === 'word_draft'
+            ? 'Word soạn thảo'
+            : 'Phụ lục'),
+        isOfficial: shouldBeOfficial,
+        currentVersion: 1,
+        fileName: uploadResult.fileName,
+        originalFileName: file.originalname,
+        mimeType: file.mimetype,
+        fileSize: file.size,
+        sha256,
+        driveFileId: uploadResult.fileId,
+        driveFileUrl: uploadResult.webViewLink,
+        driveFolderId: uploadResult.folderId || driveCfg.folderId,
+        driveFolderPath: uploadResult.folderPath,
+        driveStatus: 'saved',
+        uploadedBy: currentUser.fullName,
+        uploadedByUsername: currentUser.username,
+        uploadedAt: nowIso,
+        versions: [
+          {
+            version: 1,
+            fileName: uploadResult.fileName,
+            originalFileName: file.originalname,
+            mimeType: file.mimetype,
+            fileSize: file.size,
+            sha256,
+            driveFileId: uploadResult.fileId,
+            driveFileUrl: uploadResult.webViewLink,
+            driveFolderId: uploadResult.folderId || driveCfg.folderId,
+            driveFolderPath: uploadResult.folderPath,
+            driveStatus: 'saved',
+            uploadedBy: currentUser.fullName,
+            uploadedByUsername: currentUser.username,
+            uploadedAt: nowIso,
+          },
+        ],
+      };
+      existingList.push(newAtt);
+    }
+
+    doc.attachments = existingList;
+    if (ext === '.pdf') {
+      try {
+        const indexed = await extractPdfPageContentsForIndex(file.buffer);
+        const indexedPagesCount = indexed.pageTexts.filter((p) => (p.text || '').trim().length >= 10).length;
+        doc.pdfPageContents = indexed.pageTexts;
+        doc.pdfContentVersion = (doc.pdfContentVersion || 0) + 1;
+        doc.pdfTextStatus = indexedPagesCount > 0 ? 'indexed' : 'no_text';
+        doc.pdfIndexedPagesCount = indexedPagesCount;
+      } catch (indexErr) {
+        console.warn('[PDF Index] Không trích xuất được nội dung PDF đính kèm mới:', indexErr);
+      }
+    }
+
+    syncRootDriveFieldsFromAttachments(doc);
+
+    recordDocumentHistoryEntry({
+      doc,
+      book: targetBook,
+      actor: currentUser,
+      action: isReplacing ? 'attachment_replace' : 'attachment_add',
+      changes: {
+        attachmentFile: { old: isReplacing ? existingList[existingIdx].versions.at(-2)?.fileName || null : null, new: uploadResult.fileName },
+        officialAttachment: { old: prevOfficialId || null, new: getOfficialAttachment(doc)?.id || null },
+      },
+      reason: isReplacing
+        ? `Tải lên phiên bản mới cho tệp "${uploadResult.fileName}"`
+        : `Đính kèm thêm tệp "${uploadResult.fileName}"`,
+    });
+
+    await saveDatabasePersistent(db);
+    broadcastSSE('document_updated', { document: doc });
+    await syncToGoogleSheets(doc, 'update');
+
+    return res.json({
+      success: true,
+      document: doc,
+    });
+  } catch (err: any) {
+    return res.status(502).json({
+      error: `Tải tệp lên Google Drive thất bại, phiên bản đã lưu trước đó vẫn được giữ nguyên: ${err?.message || 'Lỗi kết nối'}`,
+      document: doc,
+    });
+  }
+});
+
+app.post('/api/documents/:id/attachments/:attId/set-official', requireAuth, async (req, res) => {
+  const { id, attId } = req.params;
+  const currentUser = (req as any).user as User;
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) {
+    return res.status(404).json({ error: 'Không tìm thấy hồ sơ văn bản.' });
+  }
+  const targetBook = resolveStrictBookForDocument(doc);
+  if (!targetBook) {
+    return res.status(400).json({
+      code: 'BOOK_NOT_FOUND',
+      error: 'Không xác định được sổ/đơn vị của hồ sơ văn bản này.',
+    });
+  }
+  const canSet =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, targetBook.id, 'replace_file') ||
+    hasBookPermission(currentUser, targetBook.id, 'edit') ||
+    hasBookPermission(currentUser, targetBook.id, 'manage_book');
+  if (!canSet) {
+    return res.status(403).json({
+      error: `Bạn không có quyền đặt tệp chính thức trong ${targetBook.name}.`,
+    });
+  }
+
+  const list = getEffectiveAttachments(doc);
+  const target = list.find((a) => a.id === attId);
+  if (!target) {
+    return res.status(404).json({ error: 'Không tìm thấy tệp đính kèm trong hồ sơ.' });
+  }
+  if (target.driveStatus !== 'saved' || !target.driveFileUrl) {
+    return res.status(400).json({ error: 'Chỉ có thể đặt làm bản chính thức đối với tệp đã lưu thành công trên Google Drive.' });
+  }
+
+  const prevOfficial = getOfficialAttachment(doc);
+  list.forEach((a) => {
+    a.isOfficial = a.id === attId;
+  });
+  doc.attachments = list;
+  syncRootDriveFieldsFromAttachments(doc);
+
+  recordDocumentHistoryEntry({
+    doc,
+    book: targetBook,
+    actor: currentUser,
+    action: 'attachment_set_official',
+    changes: {
+      officialAttachment: { old: prevOfficial?.fileName || null, new: target.fileName },
+    },
+    reason: `Đặt "${target.fileName}" làm bản chính thức của hồ sơ`,
+  });
+
+  await saveDatabasePersistent(db);
+  broadcastSSE('document_updated', { document: doc });
+  await syncToGoogleSheets(doc, 'update');
+
+  res.json({ success: true, document: doc });
+});
+
+// =========================================================================
+// 14. ĐỐI SOÁT DỮ LIỆU (SỔ VĂN BẢN - GOOGLE DRIVE - GOOGLE TRANG TÍNH)
+// =========================================================================
+async function runWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let idx = 0;
+  async function next() {
+    while (idx < items.length) {
+      const current = idx++;
+      results[current] = await worker(items[current]);
+    }
+  }
+  const runners = Array.from({ length: Math.min(limit, Math.max(1, items.length)) }, () => next());
+  await Promise.all(runners);
+  return results;
+}
+
+app.get('/api/reconciliation', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const bookId = typeof req.query.bookId === 'string' ? req.query.bookId.trim() : 'all';
+  const yearParam = typeof req.query.year === 'string' ? req.query.year.trim() : 'all';
+  const verifyDrive = req.query.verifyDrive === 'true';
+
+  if (bookId && bookId !== 'all') {
+    const targetBook = getBookById(bookId);
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
+      return res.status(403).json({
+        error: `Bạn cần quyền Quản trị sổ (${targetBook.name}) để đối soát dữ liệu.`,
+      });
+    }
+  } else if (
+    !isSystemAdmin(currentUser) &&
+    !db.books.some((b) => hasBookPermission(currentUser, b.id, 'manage_book'))
+  ) {
+    return res.status(403).json({ error: 'Bạn không có quyền truy cập chức năng Đối soát dữ liệu.' });
+  }
+
+  const scopedDocs = db.documents.filter((d) => {
+    const bId = getDocBookId(d);
+    if (bookId && bookId !== 'all' && bId !== bookId) return false;
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, bId, 'manage_book')) return false;
+    if (yearParam && yearParam !== 'all') {
+      if (yearParam === 'unknown') {
+        if (getDocumentFilterYear(d) !== 'unknown') return false;
+      } else {
+        const y = parseInt(yearParam, 10);
+        if (Number.isFinite(y) && getDocumentFilterYear(d) !== y) return false;
+      }
+    }
+    return true;
+  });
+
+  const items: ReconciliationItem[] = [];
+
+  // 1. Phát hiện trùng số trong cùng sổ + năm
+  const seriesGroups = new Map<string, DocumentRecord[]>();
+  for (const d of scopedDocs) {
+    if (d.status === 'deleted' || d.status === 'cancelled') continue;
+    if (d.docCategory === 'incoming' || !d.sequenceNumber || d.sequenceNumber <= 0) continue;
+    const b = getBookById(getDocBookId(d));
+    const seriesType =
+      b.numberMode === 'shared' ? 'SHARED' : resolveCanonicalTypeCode(d.typeCode, db.documentTypes);
+    const key = `${b.id}:${d.year}:${seriesType}:${d.sequenceNumber}`;
+    const arr = seriesGroups.get(key) || [];
+    arr.push(d);
+    seriesGroups.set(key, arr);
+  }
+
+  const duplicateDocMap = new Map<string, string[]>();
+  for (const group of seriesGroups.values()) {
+    if (group.length > 1) {
+      const ids = group.map((x) => x.id);
+      for (const x of group) {
+        duplicateDocMap.set(x.id, ids.filter((idVal) => idVal !== x.id));
+      }
+    }
+  }
+
+  // 2. Kiểm tra Drive nếu verifyDrive=true (giới hạn luồng song song = 5)
+  const driveStatusCache = new Map<
+    string,
+    { state: DriveVerificationState; label: string; error?: string }
+  >();
+
+  if (verifyDrive) {
+    const toVerify = scopedDocs.filter(
+      (d) =>
+        d.status !== 'deleted' &&
+        d.status !== 'cancelled' &&
+        d.driveStatus === 'saved' &&
+        Boolean(d.driveFileId)
+    );
+    await runWithConcurrency(toVerify.slice(0, 60), 5, async (d) => {
+      const book = getBookById(getDocBookId(d));
+      const driveCfg = resolveDriveForBook(book);
+      const check = await checkGoogleDriveFileStatus(driveCfg, d.driveFileId!);
+      driveStatusCache.set(d.id, {
+        state: check.status,
+        label:
+          check.status === 'ok'
+            ? 'Hợp lệ trên Drive'
+            : check.status === 'not_found'
+            ? 'Không tìm thấy trên Drive'
+            : check.status === 'access_denied'
+            ? 'Mất quyền truy cập Drive'
+            : 'Chưa xác minh được tệp Drive',
+        error: check.message,
+      });
+    });
+  }
+
+  let driveFailedCount = 0;
+  let driveLinkIssueCount = 0;
+  let sheetsUnsyncedCount = 0;
+  let duplicateNumberCount = 0;
+
+  for (const d of scopedDocs) {
+    const book = getBookById(getDocBookId(d));
+    const sheetsConfigured = getGoogleSheetsTargets(book).length > 0;
+    const sheetsUnsynced =
+      sheetsConfigured &&
+      (d.status === 'deleted'
+        ? !d.deletedListArchived && d.excelDeleteSyncStatus !== 'synced'
+        : d.syncStatus !== 'synced');
+
+    let driveState: DriveVerificationState = 'ok';
+    let driveStateLabel = 'Đã lưu trên Drive';
+
+    if (d.status !== 'deleted' && d.status !== 'cancelled') {
+      if (d.driveStatus === 'failed') {
+        driveState = 'unsaved';
+        driveStateLabel = 'Lưu thất bại';
+      } else if (d.driveStatus === 'uploading') {
+        driveState = 'unsaved';
+        driveStateLabel = 'Đang lưu (cần đối soát)';
+      } else if (d.driveStatus === 'needs_reconcile') {
+        driveState = 'unverified';
+        driveStateLabel = 'Cần đối soát Drive';
+      } else if (!d.driveFileId || !d.driveStatus || d.driveStatus === 'none') {
+        driveState = 'no_attachment';
+        driveStateLabel = 'Không đính kèm';
+      } else if (driveStatusCache.has(d.id)) {
+        const verified = driveStatusCache.get(d.id)!;
+        driveState = verified.state;
+        driveStateLabel = verified.label;
+      } else {
+        driveState = 'ok';
+        driveStateLabel = 'Đã lưu Drive';
+      }
+
+      if (d.driveStatus === 'failed') {
+        driveFailedCount++;
+        items.push({
+          id: `rec-drivefail-${d.id}`,
+          issueType: 'drive_failed',
+          severity: 'error',
+          bookId: book.id,
+          bookCode: book.code,
+          bookName: book.name,
+          year: d.year,
+          docId: d.id,
+          fullDocNumber: d.fullDocNumber,
+          docName: d.docName || d.title,
+          status: d.status,
+          driveState,
+          driveStateLabel,
+          driveFileId: d.driveFileId,
+          driveFileUrl: d.driveFileUrl,
+          driveError: d.driveError,
+          sheetsSyncState: d.syncStatus,
+          sheetsSyncError: d.syncError,
+          detailMessage: d.driveError || 'Tệp văn bản chưa lưu thành công lên Google Drive.',
+          canRetry: Boolean(d.templateId),
+          retryKind: d.templateId ? 'word_drive' : undefined,
+        });
+      } else if (
+        driveState === 'unsaved' ||
+        driveState === 'no_attachment' ||
+        driveState === 'not_found' ||
+        driveState === 'access_denied' ||
+        driveState === 'unverified'
+      ) {
+        driveLinkIssueCount++;
+        items.push({
+          id: `rec-drivelink-${d.id}`,
+          issueType: 'drive_link_issue',
+          severity:
+            driveState === 'not_found' || driveState === 'access_denied' ? 'error' : 'warning',
+          bookId: book.id,
+          bookCode: book.code,
+          bookName: book.name,
+          year: d.year,
+          docId: d.id,
+          fullDocNumber: d.fullDocNumber,
+          docName: d.docName || d.title,
+          status: d.status,
+          driveState,
+          driveStateLabel,
+          driveFileId: d.driveFileId,
+          driveFileUrl: d.driveFileUrl,
+          driveError: driveStatusCache.get(d.id)?.error || d.driveError,
+          sheetsSyncState: d.syncStatus,
+          sheetsSyncError: d.syncError,
+          detailMessage:
+            driveStatusCache.get(d.id)?.error ||
+            (driveState === 'no_attachment'
+              ? 'Hồ sơ chưa đính kèm tệp trên Google Drive.'
+              : 'Liên kết tệp trên Google Drive cần kiểm tra lại.'),
+          canRetry: false,
+        });
+      }
+    }
+
+    if (sheetsUnsynced) {
+      sheetsUnsyncedCount++;
+      const errMsg = d.status === 'deleted' ? d.excelSyncError : d.syncError;
+      items.push({
+        id: `rec-sheets-${d.id}`,
+        issueType: 'sheets_unsynced',
+        severity: d.syncStatus === 'error' || d.excelDeleteSyncStatus === 'failed' ? 'error' : 'warning',
+        bookId: book.id,
+        bookCode: book.code,
+        bookName: book.name,
+        year: d.year,
+        docId: d.id,
+        fullDocNumber: d.fullDocNumber,
+        docName: d.docName || d.title,
+        status: d.status,
+        driveState,
+        driveStateLabel,
+        driveFileId: d.driveFileId,
+        driveFileUrl: d.driveFileUrl,
+        sheetsSyncState: d.status === 'deleted' ? d.excelDeleteSyncStatus || 'pending' : d.syncStatus,
+        sheetsSyncError: errMsg,
+        detailMessage: errMsg || 'Bản ghi chưa đồng bộ thành công lên Google Trang tính.',
+        canRetry: true,
+        retryKind: 'sheets',
+      });
+    }
+
+    const dupIds = duplicateDocMap.get(d.id);
+    if (dupIds && dupIds.length > 0) {
+      duplicateNumberCount++;
+      items.push({
+        id: `rec-dup-${d.id}`,
+        issueType: 'duplicate_number',
+        severity: 'error',
+        bookId: book.id,
+        bookCode: book.code,
+        bookName: book.name,
+        year: d.year,
+        docId: d.id,
+        fullDocNumber: d.fullDocNumber,
+        docName: d.docName || d.title,
+        status: d.status,
+        driveState,
+        driveStateLabel,
+        driveFileId: d.driveFileId,
+        driveFileUrl: d.driveFileUrl,
+        sheetsSyncState: d.syncStatus,
+        duplicateDocIds: dupIds,
+        detailMessage: `Phát hiện ${dupIds.length + 1} hồ sơ cùng số thứ tự ${d.sequenceNumber} trong cùng dãy (${book.name}, năm ${d.year}).`,
+        canRetry: false,
+      });
+    }
+  }
+
+  const report: ReconciliationReport = {
+    checkedAt: new Date().toISOString(),
+    bookId,
+    year: yearParam,
+    driveChecked: verifyDrive,
+    summary: {
+      totalDocumentsScanned: scopedDocs.length,
+      totalIssues: items.length,
+      driveFailedCount,
+      driveLinkIssueCount,
+      sheetsUnsyncedCount,
+      duplicateNumberCount,
+    },
+    items,
+  };
+
+  res.json(report);
+});
+
+// Công cụ quản trị: Đối soát trạng thái Google Drive cho dữ liệu cũ / bản ghi bị kẹt
+app.post('/api/admin/drive-reconcile', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  await ensureLatestDb({ maxAgeMs: 0 });
+
+  const requestedBookId = typeof req.body?.bookId === 'string' && req.body.bookId.trim() ? req.body.bookId.trim() : 'all';
+  const requestedYear = typeof req.body?.year === 'string' && req.body.year.trim() ? req.body.year.trim() : 'all';
+  const includeSavedVerify = Boolean(req.body?.includeSavedVerify);
+
+  const manageableBooks = db.books.filter(
+    (b) => isSystemAdmin(currentUser) || hasBookPermission(currentUser, b.id, 'manage_book')
+  );
+  if (manageableBooks.length === 0) {
+    return res.status(403).json({ error: 'Bạn cần quyền Quản trị sổ để chạy đối soát trạng thái Google Drive.' });
+  }
+
+  let targetBookIds: string[];
+  let scopeBookName = `Tất cả sổ quản trị (${manageableBooks.length})`;
+  if (requestedBookId !== 'all') {
+    const allowed = manageableBooks.find((b) => b.id === requestedBookId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Bạn không có quyền quản trị sổ văn bản này.' });
+    }
+    targetBookIds = [allowed.id];
+    scopeBookName = allowed.name;
+  } else {
+    targetBookIds = manageableBooks.map((b) => b.id);
+  }
+
+  const allowedBookSet = new Set(targetBookIds);
+  const candidates = db.documents.filter((d) => {
+    if (d.status === 'deleted' || d.status === 'cancelled') return false;
+    const bId = getDocBookId(d);
+    if (!allowedBookSet.has(bId)) return false;
+    if (requestedYear !== 'all') {
+      if (requestedYear === 'unknown') {
+        if (getDocumentFilterYear(d) !== 'unknown') return false;
+      } else {
+        const yr = parseInt(requestedYear, 10);
+        if (Number.isFinite(yr) && getDocumentFilterYear(d) !== yr) return false;
+      }
+    }
+    const st = d.driveStatus || 'none';
+    if (st === 'uploading' || st === 'failed' || st === 'needs_reconcile') return true;
+    if (st === 'saved' && (!d.driveFileId || !d.driveFileUrl)) return true;
+    if (includeSavedVerify && st === 'saved' && Boolean(d.driveFileId)) return true;
+    return false;
+  });
+
+  const startedAt = new Date().toISOString();
+  const itemResults: DriveReconciliationItemResult[] = [];
+  const updatedDocs: DocumentRecord[] = [];
+  let verifiedSavedCount = 0;
+  let failedCount = 0;
+  let needsReconcileCount = 0;
+  let unchangedCount = 0;
+
+  // Chạy tối đa 4 bản ghi song song để an toàn hạn mức Google Drive API
+  await runWithConcurrency(candidates.slice(0, 150), 4, async (cand) => {
+    const book = getBookById(getDocBookId(cand));
+    const resItem = await reconcileSingleDocumentDriveStatus(cand.id, {
+      actor: currentUser,
+      forceCheck: false,
+      allowNotFoundTransitionToFailed: true,
+      auditReason: 'Đối soát trạng thái Google Drive từ công cụ Quản trị',
+    });
+
+    if (resItem.outcome === 'verified_saved') verifiedSavedCount++;
+    else if (resItem.outcome === 'failed') failedCount++;
+    else if (resItem.outcome === 'needs_reconcile') needsReconcileCount++;
+    else unchangedCount++;
+
+    const finalDoc = resItem.document || cand;
+    if (resItem.document) {
+      updatedDocs.push(resItem.document);
+    }
+
+    itemResults.push({
+      docId: finalDoc.id,
+      bookId: book.id,
+      bookCode: book.code,
+      bookName: book.name,
+      year: finalDoc.year,
+      fullDocNumber: finalDoc.fullDocNumber,
+      docName: finalDoc.docName || finalDoc.title,
+      previousStatus: resItem.previousStatus,
+      newStatus: resItem.newStatus,
+      outcome: resItem.outcome,
+      driveFileId: finalDoc.driveFileId,
+      driveFileUrl: finalDoc.driveFileUrl,
+      driveFileName: finalDoc.driveFileName,
+      matchedBy: resItem.matchedBy,
+      message: resItem.message,
+      needsReviewPreserved: Boolean(finalDoc.needsReview),
+    });
+  });
+
+  const completedAt = new Date().toISOString();
+  const historyEntry: DriveReconciliationHistoryEntry = {
+    id: `drvrec-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+    startedAt,
+    completedAt,
+    completedAtVietnam: formatVietnamDateTime(new Date(completedAt)),
+    actorUserId: currentUser.id,
+    actorName: currentUser.displayName?.trim() || currentUser.fullName,
+    actorUsername: currentUser.username,
+    bookId: requestedBookId,
+    bookName: scopeBookName,
+    year: requestedYear,
+    totalScanned: candidates.length,
+    verifiedSavedCount,
+    failedCount,
+    needsReconcileCount,
+    unchangedCount,
+    items: itemResults.slice(0, 150),
+  };
+
+  const releaseHist = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    if (!Array.isArray(db.driveReconcileHistory)) db.driveReconcileHistory = [];
+    db.driveReconcileHistory.unshift(historyEntry);
+    if (db.driveReconcileHistory.length > 100) {
+      db.driveReconcileHistory = db.driveReconcileHistory.slice(0, 100);
+    }
+    appendSystemAuditLog({
+      actorUserId: currentUser.id,
+      actorName: historyEntry.actorName,
+      action: 'drive_reconcile',
+      bookId: requestedBookId !== 'all' ? requestedBookId : undefined,
+      details: `Đối soát trạng thái Google Drive (${scopeBookName}, năm ${requestedYear}): quét ${historyEntry.totalScanned}, xác minh Đã lưu Drive ${verifiedSavedCount}, thất bại ${failedCount}, cần đối soát ${needsReconcileCount}.`,
+    });
+    await saveDatabasePersistent(db, { verifyWrite: true });
+  } finally {
+    releaseHist();
+  }
+
+  res.json({
+    success: true,
+    run: historyEntry,
+    documents: updatedDocs.map(stripLargeIndexFieldsForList),
+  });
+});
+
+app.get('/api/admin/drive-reconcile/history', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  await ensureLatestDb({ maxAgeMs: 0 });
+
+  const manageableBookIds = new Set(
+    db.books
+      .filter((b) => isSystemAdmin(currentUser) || hasBookPermission(currentUser, b.id, 'manage_book'))
+      .map((b) => b.id)
+  );
+  if (manageableBookIds.size === 0) {
+    return res.status(403).json({ error: 'Bạn cần quyền Quản trị sổ để xem lịch sử đối soát Google Drive.' });
+  }
+
+  const bookId = typeof req.query.bookId === 'string' && req.query.bookId.trim() ? req.query.bookId.trim() : 'all';
+  const rawHistory = Array.isArray(db.driveReconcileHistory) ? db.driveReconcileHistory : [];
+  const filtered = rawHistory.filter((h) => {
+    if (bookId !== 'all' && h.bookId !== bookId) return false;
+    if (isSystemAdmin(currentUser)) return true;
+    return h.bookId !== 'all' && manageableBookIds.has(h.bookId);
+  });
+
+  res.json({ history: filtered.slice(0, 30) });
+});
+
+app.post('/api/reconciliation/retry-item', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { docId, retryKind } = req.body || {};
+  const doc = db.documents.find((d) => d.id === docId);
+  if (!doc) {
+    return res.status(404).json({ error: 'Không tìm thấy hồ sơ văn bản.' });
+  }
+  const targetBook = getBookById(getDocBookId(doc));
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
+    return res.status(403).json({
+      error: `Bạn cần quyền Quản trị sổ (${targetBook.name}) để thử đồng bộ lại.`,
+    });
+  }
+
+  if (retryKind === 'word_drive') {
+    const tpl = doc.templateId ? (db.wordTemplates || []).find((t) => t.id === doc.templateId) : undefined;
+    if (!tpl) {
+      return res.status(400).json({ error: 'Hồ sơ này không gắn mẫu Word để tự tạo lại.' });
+    }
+    const genRes = await generateAndUploadWordFromTemplate({
+      doc,
+      book: targetBook,
+      template: tpl,
+      actor: currentUser,
+    });
+    if (!genRes.ok) {
+      doc.wordGenerationStatus = 'failed';
+      doc.wordGenerationError = genRes.error;
+      await saveDatabasePersistent(db);
+      return res.status(502).json({ error: genRes.error || 'Chưa tải được lên Drive.', document: doc });
+    }
+    await saveDatabasePersistent(db);
+    broadcastSSE('document_updated', { document: doc });
+    await syncToGoogleSheets(doc, 'update');
+    return res.json({ success: true, document: doc });
+  }
+
+  const action =
+    doc.status === 'deleted' ? 'delete' : doc.status === 'cancelled' ? 'cancel' : 'update';
+  const result = await syncToGoogleSheets(doc, action);
+  if (!result.attempted) {
+    return res.status(400).json({ error: 'Sổ này chưa bật đồng bộ Google Trang tính.' });
+  }
+  recordDocumentHistoryEntry({
+    doc,
+    book: targetBook,
+    actor: currentUser,
+    action: 'reconcile_sync',
+    changes: {
+      syncStatus: { old: 'error', new: doc.syncStatus },
+    },
+    reason: result.ok ? 'Đồng bộ lại Google Trang tính từ Đối soát dữ liệu' : `Thử đồng bộ lại thất bại: ${result.error || ''}`,
+  });
+  await saveDatabasePersistent(db);
+  broadcastSSE('document_updated', { document: doc });
+
+  if (!result.ok) {
+    return res.status(502).json({ error: result.error || 'Chưa đồng bộ được lên Google Trang tính.', document: doc });
+  }
+  return res.json({ success: true, document: doc });
+});
+
+app.post('/api/reconciliation/bulk-sync', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { docIds } = req.body || {};
+  if (!Array.isArray(docIds) || docIds.length === 0) {
+    return res.status(400).json({ error: 'Vui lòng chọn ít nhất một hồ sơ để đồng bộ.' });
+  }
+
+  let succeeded = 0;
+  let failed = 0;
+  const uniqueIds = Array.from(new Set(docIds.filter((x) => typeof x === 'string' && x.trim())));
+
+  for (const docId of uniqueIds) {
+    const doc = db.documents.find((d) => d.id === docId);
+    if (!doc) {
+      failed++;
+      continue;
+    }
+    const targetBook = getBookById(getDocBookId(doc));
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
+      failed++;
+      continue;
+    }
+    const action =
+      doc.status === 'deleted' ? 'delete' : doc.status === 'cancelled' ? 'cancel' : 'update';
+    const result = await syncToGoogleSheets(doc, action);
+    if (result.attempted && result.ok) {
+      succeeded++;
+    } else if (result.attempted) {
+      failed++;
+    }
+  }
+
+  await saveDatabasePersistent(db);
+  res.json({
+    total: uniqueIds.length,
+    succeeded,
+    failed,
+  });
+});
+
+// =========================================================================
+// 11. CHAT TRA CỨU CÓ DẪN NGUỒN (GROUNDED DOCUMENT Q&A)
+// =========================================================================
+app.post('/api/documents/ask', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const question = typeof req.body?.question === 'string' ? req.body.question.trim() : '';
+  const requestedBookIds: string[] = Array.isArray(req.body?.bookIds)
+    ? req.body.bookIds.filter((id: any) => typeof id === 'string' && id.trim()).map((id: string) => id.trim())
+    : [];
+
+  if (!question || question.length < 2) {
+    return res.status(400).json({ error: 'Vui lòng nhập câu hỏi tra cứu.' });
+  }
+
+  // Strictly enforce book 'view' permission BEFORE searching or constructing AI context
+  const permittedBooks = db.books.filter(
+    (b) => b.isActive && (isSystemAdmin(currentUser) || hasBookPermission(currentUser, b.id, 'view'))
+  );
+  if (permittedBooks.length === 0) {
+    return res.status(403).json({ error: 'Tài khoản chưa được cấp quyền "Xem" ở bất kỳ sổ văn bản nào.' });
+  }
+
+  const permittedBookMap = new Map(permittedBooks.map((b) => [b.id, b]));
+  let scopedBooks = permittedBooks;
+  if (requestedBookIds.length > 0) {
+    const allowedRequested = requestedBookIds
+      .map((id) => permittedBookMap.get(id))
+      .filter((b): b is RegistryBook => Boolean(b));
+    if (allowedRequested.length === 0) {
+      return res.status(403).json({
+        error: 'Bạn không có quyền xem các sổ văn bản đã chọn.',
+      });
+    }
+    scopedBooks = allowedRequested;
+  }
+
+  const allowedBookIdSet = new Set(scopedBooks.map((b) => b.id));
+  const permittedDocs = db.documents.filter((d) => {
+    if (d.status === 'deleted') return false;
+    return allowedBookIdSet.has(getDocBookId(d));
+  });
+
+  const result = await answerDocumentQuestion({
+    question,
+    permittedDocs,
+    booksById: permittedBookMap,
+    searchedBooks: scopedBooks.map((b) => ({ id: b.id, code: b.code, name: b.name })),
+  });
+
+  return res.json(result);
+});
+
+// Tải luồng PDF nội bộ cho trình xem đúng trang (chỉ hỗ trợ Service Account + kiểm tra quyền Xem)
+app.get('/api/documents/:id/pdf-file', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const { id } = req.params;
+  const attachmentId = typeof req.query.attachmentId === 'string' ? req.query.attachmentId.trim() : '';
+  const currentUser = (req as any).user as User;
+  const doc = db.documents.find((d) => d.id === id);
+  if (!doc) return res.status(404).json({ error: 'Không tìm thấy văn bản.' });
+
+  const targetBook = getBookById(getDocBookId(doc));
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'view')) {
+    return res.status(403).json({ error: 'Bạn không có quyền xem tệp thuộc sổ này.' });
+  }
+
+  const atts = getEffectiveAttachments(doc);
+  const pickedAtt = attachmentId
+    ? atts.find((a) => a.id === attachmentId && a.driveStatus === 'saved' && a.driveFileId)
+    : atts.find((a) => a.driveStatus === 'saved' && a.driveFileId && (a.group === 'signed_pdf' || a.fileName.toLowerCase().endsWith('.pdf'))) ||
+      atts.find((a) => a.driveStatus === 'saved' && a.driveFileId);
+
+  const fileId = pickedAtt?.driveFileId || doc.driveFileId;
+  if (!fileId) {
+    return res.status(404).json({ error: 'Hồ sơ này chưa có mã tệp Google Drive.' });
+  }
+
+  const driveCfg = resolveDriveForBook(targetBook);
+  const downloaded = await downloadDriveFileBuffer(driveCfg, fileId);
+  if (!downloaded.ok || !downloaded.buffer) {
+    return res.status(404).json({
+      error: downloaded.error || 'Chế độ Drive hiện tại chưa hỗ trợ phát trực tiếp — hãy mở trên Google Drive.',
+    });
+  }
+
+  res.setHeader('Content-Type', downloaded.mimeType || 'application/pdf');
+  res.setHeader('Content-Disposition', 'inline');
+  return res.send(downloaded.buffer);
+});
+
+// =========================================================================
+// 12. NHẬP KHO VĂN BẢN CŨ TỪ EXCEL & GOOGLE DRIVE
+// =========================================================================
+app.get('/api/archive/template', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const canImportAny =
+    isSystemAdmin(currentUser) ||
+    db.books.some((b) => hasBookPermission(currentUser, b.id, 'import_archive'));
+  if (!canImportAny) {
+    return res.status(403).json({ error: 'Bạn chưa được cấp quyền "Nhập kho văn bản cũ".' });
+  }
+  const buf = await buildArchiveTemplateWorkbookBuffer();
+  res.setHeader(
+    'Content-Type',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  );
+  res.setHeader('Content-Disposition', 'attachment; filename="Mau_nhap_kho_van_ban_cu.xlsx"');
+  return res.send(buf);
+});
+
+app.post('/api/archive/parse-excel', requireAuth, handleWordUploadMulter, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const canImportAny =
+    isSystemAdmin(currentUser) ||
+    db.books.some((b) => hasBookPermission(currentUser, b.id, 'import_archive'));
+  if (!canImportAny) {
+    return res.status(403).json({ error: 'Bạn chưa được cấp quyền "Nhập kho văn bản cũ".' });
+  }
+  const file = (req as any).file as Express.Multer.File | undefined;
+  if (!file || !file.buffer) {
+    return res.status(400).json({ error: 'Vui lòng chọn tệp Excel (.xlsx).' });
+  }
+  const lower = (file.originalname || '').toLowerCase();
+  if (!lower.endsWith('.xlsx')) {
+    return res.status(400).json({ error: 'Định dạng không hỗ trợ. Vui lòng dùng tệp Excel .xlsx.' });
+  }
+  try {
+    const parsed = await parseArchiveExcelBuffer(file.buffer, file.originalname);
+    if (parsed.sheets.length === 0) {
+      return res.status(400).json({ error: 'Không tìm thấy sheet dữ liệu hợp lệ trong tệp Excel.' });
+    }
+    return res.json(parsed);
+  } catch (err: any) {
+    return res.status(400).json({
+      error: `Không đọc được tệp Excel: ${err?.message || 'Tệp bị lỗi hoặc sai định dạng.'}`,
+    });
+  }
+});
+
+app.post('/api/archive/preview', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const { bookId, folderUrlOrId, rows } = req.body || {};
+
+  const targetBook = findBookExplicitly(bookId);
+  if (!targetBook) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản mục tiêu.' });
+  }
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'import_archive')) {
+    return res.status(403).json({
+      error: `Bạn cần quyền "Nhập kho văn bản cũ" trong ${targetBook.name}.`,
+    });
+  }
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: 'Danh sách dòng xem trước đang trống.' });
+  }
+
+  const customFolderId = folderUrlOrId ? extractGoogleDriveFolderId(String(folderUrlOrId)) : '';
+  const driveCfg = resolveDriveForBook(targetBook);
+
+  const sanitizedRows: ArchiveImportEditableRow[] = rows.slice(0, 1000).map((r: any, i: number) => ({
+    rowNumber: Number(r.rowNumber) || i + 2,
+    docCategory: r.docCategory === 'incoming' ? 'incoming' : 'outgoing',
+    fullDocNumber: String(r.fullDocNumber || '').trim(),
+    docName: String(r.docName || '').trim(),
+    issueDate: String(r.issueDate || '').trim(),
+    year: String(r.year || '').trim(),
+    issuingAgency: String(r.issuingAgency || '').trim(),
+    signer: String(r.signer || '').trim(),
+    signerRole: r.signerRole ? String(r.signerRole).trim() : '',
+    typeCode: r.typeCode ? String(r.typeCode).trim() : '',
+    parentAgency: r.parentAgency ? String(r.parentAgency).trim() : '',
+    title: r.title ? String(r.title).trim() : '',
+    notes: r.notes ? String(r.notes).trim() : '',
+    driveLinkOrFileName: String(r.driveLinkOrFileName || '').trim(),
+    driveHyperlink: r.driveHyperlink ? String(r.driveHyperlink).trim() : undefined,
+    selectedDriveFileId: r.selectedDriveFileId ? String(r.selectedDriveFileId).trim() : undefined,
+  }));
+
+  const preview = await previewArchiveImportRows({
+    book: targetBook,
+    folderIdOverride: customFolderId || undefined,
+    driveConfig: driveCfg,
+    rows: sanitizedRows,
+    existingDocuments: db.documents,
+    documentTypes: db.documentTypes,
+    archiveImportedFingerprints: db.archiveImportedFingerprints,
+  });
+
+  return res.json(preview);
+});
+
+app.post('/api/archive/commit', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { bookId, batchId: rawBatchId, rows } = req.body || {};
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: 'Không có dòng nào được chọn để nhập kho.' });
+  }
+
+  const batchId =
+    typeof rawBatchId === 'string' && rawBatchId.trim()
+      ? rawBatchId.trim()
+      : `arch-batch-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+
+  const results: ArchiveImportCommitRowResult[] = [];
+  const createdDocuments: DocumentRecord[] = [];
+  let updatedBookForClient: RegistryBook | undefined;
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const targetBook = findBookExplicitly(bookId);
+    if (!targetBook) {
+      return res.status(404).json({ error: 'Không tìm thấy sổ văn bản mục tiêu.' });
+    }
+    const freshUser = db.users.find((u) => u.id === currentUser.id);
+    if (!freshUser || !freshUser.isActive) {
+      return res.status(401).json({ error: 'Tài khoản không còn hiệu lực.' });
+    }
+    const actor = toSafeUser(freshUser);
+    if (!isSystemAdmin(actor) && !hasBookPermission(actor, targetBook.id, 'import_archive')) {
+      return res.status(403).json({
+        error: `Bạn cần quyền "Nhập kho văn bản cũ" trong ${targetBook.name}.`,
+      });
+    }
+
+    if (!db.archiveImportedFingerprints) {
+      db.archiveImportedFingerprints = {};
+    }
+
+    const nowIso = new Date().toISOString();
+    const actorDisplay = actor.displayName?.trim() || actor.fullName;
+
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || {};
+      const rowId = String(r.rowId || `row-${i}`);
+      const rowNumber = Number(r.rowNumber) || i + 2;
+      const docCategory: 'outgoing' | 'incoming' = r.docCategory === 'incoming' ? 'incoming' : 'outgoing';
+      const fullDocNumber = String(r.fullDocNumber || '').trim();
+      const docName = String(r.docName || '').trim();
+      const rawIssueDate = String(r.issueDate || '').trim();
+      const normalizedIssueDate = rawIssueDate ? normalizeDateOnlyDdMmYyyy(rawIssueDate) : '';
+      const issuingAgency = String(r.issuingAgency || '').trim();
+      const signer = String(r.signer || '').trim();
+      const signerRole = String(r.signerRole || '').trim();
+      const parentAgency = String(r.parentAgency || '').trim();
+      const title = String(r.title || '').trim();
+      const notes = String(r.notes || '').trim();
+
+      let yearNum = parseInt(String(r.year || '').trim(), 10);
+      if (!Number.isFinite(yearNum) && normalizedIssueDate) {
+        const yp = parseInt(normalizedIssueDate.split('/')[2], 10);
+        if (Number.isFinite(yp)) yearNum = yp;
+      }
+
+      if (!fullDocNumber || !docName || !Number.isFinite(yearNum)) {
+        results.push({
+          rowId,
+          rowNumber,
+          fullDocNumber,
+          docName,
+          status: 'error',
+          message: 'Thiếu thông tin bắt buộc (Số/Ký hiệu, Tên văn bản hoặc Năm).',
+        });
+        continue;
+      }
+
+      const fingerprint = computeArchiveRowFingerprint(targetBook.id, {
+        docCategory,
+        fullDocNumber,
+        docName,
+        issueDate: normalizedIssueDate || rawIssueDate,
+        year: yearNum,
+        issuingAgency,
+      });
+
+      // Idempotent guard: skip if this exact archive record already committed & still active/cancelled
+      const existingFpDocId = db.archiveImportedFingerprints[fingerprint];
+      const existingFpDoc =
+        existingFpDocId && db.documents.find((d) => d.id === existingFpDocId && d.status !== 'deleted');
+      if (existingFpDoc) {
+        results.push({
+          rowId,
+          rowNumber,
+          fullDocNumber,
+          docName,
+          status: 'skipped_duplicate',
+          docId: existingFpDoc.id,
+          message: `Bỏ qua: dòng dữ liệu này đã được nhập trước đó (${existingFpDoc.id}).`,
+        });
+        continue;
+      }
+
+      // Check existing registry duplicate unless user explicitly forced overwrite/duplicate bypass
+      const allowDuplicateOverride = Boolean(r.allowDuplicate);
+      const normNum = normalizeDocNumberForCompare(fullDocNumber);
+      const normAgency = normalizeCompareText(issuingAgency);
+      const duplicateInDb = db.documents.find((d) => {
+        if (d.status === 'deleted' || getDocBookId(d) !== targetBook.id) return false;
+        if (normalizeDocNumberForCompare(d.fullDocNumber) !== normNum) return false;
+        if (docCategory === 'incoming') {
+          if (d.docCategory !== 'incoming') return false;
+          const dAgency = normalizeCompareText(d.issuingAgency || '');
+          if (normAgency && dAgency) return normAgency === dAgency;
+          return getDocumentFilterYear(d) === yearNum;
+        }
+        if (d.docCategory === 'incoming') return false;
+        return getDocumentFilterYear(d) === yearNum;
+      });
+
+      if (duplicateInDb && !allowDuplicateOverride) {
+        results.push({
+          rowId,
+          rowNumber,
+          fullDocNumber,
+          docName,
+          status: 'skipped_duplicate',
+          docId: duplicateInDb.id,
+          message: `Bỏ qua do trùng hồ sơ hiện có (${duplicateInDb.fullDocNumber}).`,
+        });
+        continue;
+      }
+
+      const inferredType = inferArchiveTypeCode(
+        r.typeCode,
+        fullDocNumber,
+        docName,
+        db.documentTypes
+      );
+
+      let sequenceNumber = 0;
+      if (docCategory === 'outgoing') {
+        const parsedSeq = parseHistoricalOutgoingSequenceNumber(fullDocNumber, targetBook);
+        sequenceNumber = parsedSeq ?? 0;
+      }
+
+      const matchedDrive = r.matchedDriveFile && r.matchedDriveFile.fileId ? r.matchedDriveFile : null;
+      const docId = `doc-arch-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+      const globalStt = db.documents.length + 1;
+
+      const attachments: DocumentAttachment[] = matchedDrive
+        ? [
+            {
+              id: `att-${crypto.randomBytes(4).toString('hex')}`,
+              group: matchedDrive.fileName.toLowerCase().endsWith('.pdf') ? 'signed_pdf' : 'word_draft',
+              label: 'Tệp kho cũ liên kết từ Drive',
+              isOfficial: true,
+              currentVersion: 1,
+              fileName: matchedDrive.fileName,
+              mimeType: matchedDrive.mimeType,
+              driveFileId: matchedDrive.fileId,
+              driveFileUrl: matchedDrive.webViewLink,
+              driveStatus: 'saved',
+              uploadedBy: actorDisplay,
+              uploadedByUsername: actor.username,
+              uploadedAt: nowIso,
+              versions: [
+                {
+                  version: 1,
+                  fileName: matchedDrive.fileName,
+                  mimeType: matchedDrive.mimeType,
+                  driveFileId: matchedDrive.fileId,
+                  driveFileUrl: matchedDrive.webViewLink,
+                  driveStatus: 'saved',
+                  uploadedBy: actorDisplay,
+                  uploadedByUsername: actor.username,
+                  uploadedAt: nowIso,
+                },
+              ],
+            },
+          ]
+        : [];
+
+      const newDoc: DocumentRecord = {
+        id: docId,
+        bookId: targetBook.id,
+        bookCode: targetBook.code,
+        bookName: targetBook.name,
+        stt: globalStt,
+        year: yearNum,
+        issueDate: normalizedIssueDate || rawIssueDate,
+        receivedAt: nowIso,
+        receivedDate: getRequestVietnamTimeInfo(req).formattedDate,
+        createdAt: nowIso,
+        docCategory,
+        parentAgency: parentAgency || undefined,
+        issuingAgency: issuingAgency || (docCategory === 'outgoing' ? targetBook.unitName : undefined),
+        typeCode: inferredType.code,
+        typeName: inferredType.name,
+        sequenceNumber,
+        fullDocNumber, // Preserve verbatim (including leading zeros!)
+        docName,
+        title: title || docName,
+        signer: signer || '—',
+        signerRole: signerRole || (docCategory === 'outgoing' ? 'Người ký' : 'Lãnh đạo cơ quan ban hành'),
+        issuedBy: actorDisplay,
+        issuedByUserId: actor.id,
+        issuedByUsername: actor.username,
+        status: 'active',
+        syncStatus: getGoogleSheetsTargets(targetBook).length > 0 ? 'pending' : 'not_configured',
+        idempotencyKey: `arch-${batchId}-${fingerprint}`,
+        driveStatus: matchedDrive ? 'saved' : 'none',
+        driveFileId: matchedDrive?.fileId,
+        driveFileName: matchedDrive?.fileName,
+        driveFileUrl: matchedDrive?.webViewLink,
+        attachments,
+        notes: notes || `Nhập kho văn bản cũ (${batchId})`,
+        auditLogs: [],
+      };
+
+      // Note: because computeSeriesSequenceState calculates maxIssuedSequence from all outgoing docs
+      // matching (bookId, year, canonicalTypeCode or SHARED), storing sequenceNumber on outgoing archived docs
+      // automatically guarantees future auto-issued numbers never collide or re-issue that number.
+      recordDocumentHistoryEntry({
+        doc: newDoc,
+        book: targetBook,
+        actor,
+        action: 'archive_import',
+        changes: {
+          fullDocNumber: { old: null, new: newDoc.fullDocNumber },
+          docName: { old: null, new: newDoc.docName || newDoc.title },
+          ...(matchedDrive ? { driveFileName: { old: null, new: matchedDrive.fileName } } : {}),
+        },
+        reason: `Nhập kho văn bản cũ từ Excel (${batchId})`,
+        timestampIso: nowIso,
+      });
+
+      db.documents.unshift(newDoc);
+      db.archiveImportedFingerprints[fingerprint] = newDoc.id;
+      createdDocuments.push(newDoc);
+      results.push({
+        rowId,
+        rowNumber,
+        fullDocNumber: newDoc.fullDocNumber,
+        docName: newDoc.docName || newDoc.title,
+        status: 'imported',
+        docId: newDoc.id,
+        message: matchedDrive
+          ? `Đã nhập kho và liên kết tệp "${matchedDrive.fileName}".`
+          : 'Đã nhập kho (chưa đính kèm tệp Drive).',
+      });
+    }
+
+    if (createdDocuments.length > 0) {
+      bumpBookVersion(targetBook);
+      syncDefaultBookToLegacySettings(targetBook);
+      updatedBookForClient = sanitizeBookForUser(targetBook, actor);
+
+      db.systemAuditLogs.unshift({
+        id: `sys-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+        timestamp: nowIso,
+        actorUserId: actor.id,
+        actorName: actorDisplay,
+        action: 'archive_import',
+        bookId: targetBook.id,
+        bookCode: targetBook.code,
+        details: `Nhập kho ${createdDocuments.length} văn bản cũ vào ${targetBook.name} (lô ${batchId}).`,
+      });
+      await saveDatabasePersistent(db);
+    }
+  } finally {
+    releaseLock();
+  }
+
+  for (const doc of createdDocuments) {
+    broadcastSSE('document_issued', { document: doc });
+  }
+  if (createdDocuments.length > 0 && updatedBookForClient) {
+    broadcastSSE('book_updated', { book: updatedBookForClient });
+  }
+
+  // Best-effort Google Sheets sync in batches (up to 30 inline; rest remain pending for reconciliation)
+  for (const doc of createdDocuments.slice(0, 30)) {
+    await syncToGoogleSheets(doc, 'create').catch(() => {});
+  }
+  if (createdDocuments.length > 0) {
+    await saveDatabasePersistent(db).catch(() => {});
+  }
+
+  const importedCount = results.filter((r) => r.status === 'imported').length;
+  const skippedDuplicateCount = results.filter((r) => r.status === 'skipped_duplicate').length;
+  const errorCount = results.filter((r) => r.status === 'error').length;
+
+  return res.json({
+    batchId,
+    totalRequested: rows.length,
+    importedCount,
+    skippedDuplicateCount,
+    errorCount,
+    results,
+    createdDocuments,
+    bookUpdated: updatedBookForClient,
+  });
+});
+
+// =========================================================================
+// 13. CHỐT SỔ & BÀN GIAO CUỐI NĂM (IMMUTABLE SNAPSHOT + ERRATA + EXCEL)
+// =========================================================================
+app.get('/api/closing/preview', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const bookId = typeof req.query.bookId === 'string' ? req.query.bookId.trim() : '';
+  const yearParam = typeof req.query.year === 'string' ? req.query.year.trim() : '';
+  const targetBook = findBookExplicitly(bookId);
+  if (!targetBook) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản.' });
+  }
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'close_book')) {
+    return res.status(403).json({
+      error: `Bạn cần quyền "Chốt sổ & Bàn giao cuối năm" trong ${targetBook.name}.`,
+    });
+  }
+
+  const vnYear = getRequestVietnamTimeInfo(req).year;
+  const targetYear = yearParam ? parseInt(yearParam, 10) : vnYear;
+  if (!Number.isFinite(targetYear) || targetYear < 1990 || targetYear > 2100) {
+    return res.status(400).json({ error: 'Năm chốt sổ không hợp lệ.' });
+  }
+
+  const { summary, documents } = buildClosingSummaryAndDocs(db.documents, targetBook, targetYear);
+  const existingSnapshotsCount = (db.closingSnapshots || []).filter(
+    (s) => s.bookId === targetBook.id && s.year === targetYear
+  ).length;
+
+  return res.json({
+    bookId: targetBook.id,
+    bookCode: targetBook.code,
+    bookName: targetBook.name,
+    year: targetYear,
+    summary,
+    documents,
+    existingSnapshotsCount,
+  });
+});
+
+app.post('/api/closing/confirm', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { bookId, year, note } = req.body || {};
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const targetBook = findBookExplicitly(bookId);
+    if (!targetBook) {
+      return res.status(404).json({ error: 'Không tìm thấy sổ văn bản.' });
+    }
+    const freshUser = db.users.find((u) => u.id === currentUser.id);
+    if (!freshUser || !freshUser.isActive) {
+      return res.status(401).json({ error: 'Tài khoản không còn hiệu lực.' });
+    }
+    const actor = toSafeUser(freshUser);
+    if (!isSystemAdmin(actor) && !hasBookPermission(actor, targetBook.id, 'close_book')) {
+      return res.status(403).json({
+        error: `Bạn cần quyền "Chốt sổ & Bàn giao cuối năm" trong ${targetBook.name}.`,
+      });
+    }
+
+    const targetYear = Number(year);
+    if (!Number.isFinite(targetYear) || targetYear < 1990 || targetYear > 2100) {
+      return res.status(400).json({ error: 'Năm chốt sổ không hợp lệ.' });
+    }
+
+    if (!Array.isArray(db.closingSnapshots)) {
+      db.closingSnapshots = [];
+    }
+
+    const { summary, documents } = buildClosingSummaryAndDocs(db.documents, targetBook, targetYear);
+    const sameSeriesCount = db.closingSnapshots.filter(
+      (s) => s.bookId === targetBook.id && s.year === targetYear
+    ).length;
+
+    const nowIso = new Date().toISOString();
+    const closedAtVietnam = formatVietnamDateTime(new Date(nowIso));
+    const closingCode = `CHOT-${targetBook.code}-${targetYear}-${String(sameSeriesCount + 1).padStart(2, '0')}`;
+    const actorDisplay = actor.displayName?.trim() || actor.fullName;
+
+    // Deep clone frozen data so later live edits can NEVER mutate the closed snapshot
+    const snapshot: YearEndClosingSnapshot = JSON.parse(
+      JSON.stringify({
+        id: `close-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+        closingCode,
+        bookId: targetBook.id,
+        bookCode: targetBook.code,
+        bookName: targetBook.name,
+        year: targetYear,
+        closedBy: actorDisplay,
+        closedByUserId: actor.id,
+        closedByUsername: actor.username,
+        closedAt: nowIso,
+        closedAtVietnam,
+        note: typeof note === 'string' && note.trim() ? note.trim() : undefined,
+        summary,
+        documents,
+        amendments: [],
+      })
+    );
+
+    db.closingSnapshots.unshift(snapshot);
+    db.systemAuditLogs.unshift({
+      id: `sys-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      timestamp: nowIso,
+      actorUserId: actor.id,
+      actorName: actorDisplay,
+      action: 'book_close',
+      bookId: targetBook.id,
+      bookCode: targetBook.code,
+      details: `Chốt sổ cuối năm ${targetYear} cho ${targetBook.name} (${closingCode}) · ${summary.totalActiveAndCancelled} văn bản.`,
+    });
+
+    await saveDatabasePersistent(db);
+    return res.status(201).json({ snapshot });
+  } finally {
+    releaseLock();
+  }
+});
+
+app.get('/api/closing/snapshots', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const bookId = typeof req.query.bookId === 'string' ? req.query.bookId.trim() : '';
+  const yearParam = typeof req.query.year === 'string' ? req.query.year.trim() : '';
+
+  if (bookId && bookId !== 'all') {
+    const targetBook = getBookById(bookId);
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'close_book') && !hasBookPermission(currentUser, targetBook.id, 'view')) {
+      return res.status(403).json({ error: `Bạn không có quyền xem bản chốt của ${targetBook.name}.` });
+    }
+  }
+
+  const list = (db.closingSnapshots || []).filter((s) => {
+    if (bookId && bookId !== 'all' && s.bookId !== bookId) return false;
+    if (yearParam && yearParam !== 'all') {
+      const y = parseInt(yearParam, 10);
+      if (Number.isFinite(y) && s.year !== y) return false;
+    }
+    return (
+      isSystemAdmin(currentUser) ||
+      hasBookPermission(currentUser, s.bookId, 'close_book') ||
+      hasBookPermission(currentUser, s.bookId, 'view')
+    );
+  });
+
+  return res.json({ snapshots: list });
+});
+
+app.get('/api/closing/snapshots/:id', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const snapshot = (db.closingSnapshots || []).find((s) => s.id === req.params.id);
+  if (!snapshot) {
+    return res.status(404).json({ error: 'Không tìm thấy bản chốt sổ.' });
+  }
+  if (
+    !isSystemAdmin(currentUser) &&
+    !hasBookPermission(currentUser, snapshot.bookId, 'close_book') &&
+    !hasBookPermission(currentUser, snapshot.bookId, 'view')
+  ) {
+    return res.status(403).json({ error: 'Bạn không có quyền xem bản chốt sổ này.' });
+  }
+  return res.json({ snapshot });
+});
+
+app.post('/api/closing/snapshots/:id/amendments', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { id } = req.params;
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+  const rawChanges = Array.isArray(req.body?.changes) ? req.body.changes : [];
+
+  if (!reason) {
+    return res.status(400).json({ error: 'Vui lòng nhập lý do đính chính sau khi chốt sổ.' });
+  }
+
+  const cleanChanges: ClosingAmendmentChange[] = rawChanges
+    .map((c: any) => ({
+      docId: c?.docId ? String(c.docId).trim() : undefined,
+      fullDocNumber: c?.fullDocNumber ? String(c.fullDocNumber).trim() : undefined,
+      fieldLabel: String(c?.fieldLabel || '').trim(),
+      beforeValue: String(c?.beforeValue || '').trim(),
+      afterValue: String(c?.afterValue || '').trim(),
+    }))
+    .filter((c: ClosingAmendmentChange) => Boolean(c.fieldLabel && (c.beforeValue || c.afterValue)));
+
+  if (cleanChanges.length === 0) {
+    return res.status(400).json({ error: 'Vui lòng nhập ít nhất một nội dung thay đổi (trường thông tin, giá trị trước/sau).' });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const snapshot = (db.closingSnapshots || []).find((s) => s.id === id);
+    if (!snapshot) {
+      return res.status(404).json({ error: 'Không tìm thấy bản chốt sổ.' });
+    }
+    const freshUser = db.users.find((u) => u.id === currentUser.id);
+    if (!freshUser || !freshUser.isActive) {
+      return res.status(401).json({ error: 'Tài khoản không còn hiệu lực.' });
+    }
+    const actor = toSafeUser(freshUser);
+    if (!isSystemAdmin(actor) && !hasBookPermission(actor, snapshot.bookId, 'close_book')) {
+      return res.status(403).json({
+        error: `Bạn cần quyền "Chốt sổ & Bàn giao cuối năm" trong ${snapshot.bookName} để ghi đính chính.`,
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+    const amendedAtVietnam = formatVietnamDateTime(new Date(nowIso));
+    const actorDisplay = actor.displayName?.trim() || actor.fullName;
+
+    const record: ClosingAmendmentRecord = {
+      id: `amend-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+      reason,
+      amendedBy: actorDisplay,
+      amendedByUserId: actor.id,
+      amendedByUsername: actor.username,
+      amendedAt: nowIso,
+      amendedAtVietnam,
+      changes: cleanChanges,
+    };
+
+    // Append to immutable errata log WITHOUT altering frozen snapshot.summary or snapshot.documents
+    if (!Array.isArray(snapshot.amendments)) snapshot.amendments = [];
+    snapshot.amendments.unshift(record);
+
+    db.systemAuditLogs.unshift({
+      id: `sys-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      timestamp: nowIso,
+      actorUserId: actor.id,
+      actorName: actorDisplay,
+      action: 'book_amendment',
+      bookId: snapshot.bookId,
+      bookCode: snapshot.bookCode,
+      details: `Đính chính bản chốt ${snapshot.closingCode}: ${reason}`,
+    });
+
+    await saveDatabasePersistent(db);
+    return res.status(201).json({ snapshot, amendment: record });
+  } finally {
+    releaseLock();
+  }
+});
+
+app.get('/api/closing/snapshots/:id/export-excel', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const currentUser = (req as any).user as User;
+  const snapshot = (db.closingSnapshots || []).find((s) => s.id === req.params.id);
+  if (!snapshot) {
+    return res.status(404).json({ error: 'Không tìm thấy bản chốt sổ.' });
+  }
+
+  const canExport =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, snapshot.bookId, 'close_book') ||
+    hasBookPermission(currentUser, snapshot.bookId, 'export') ||
+    hasBookPermission(currentUser, snapshot.bookId, 'view');
+  if (!canExport) {
+    return res.status(403).json({ error: 'Bạn không có quyền tải Excel bàn giao của sổ này.' });
+  }
+
+  const canOpenDriveLinks =
+    isSystemAdmin(currentUser) || hasBookPermission(currentUser, snapshot.bookId, 'view');
+
+  const buf = await buildYearEndHandoverWorkbookBuffer(snapshot, { canOpenDriveLinks });
+  const safeCode = snapshot.closingCode.replace(/[^A-Za-z0-9_-]+/g, '_');
+  res.setHeader(
+    'Content-Type',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  );
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="Ban_giao_${safeCode}.xlsx"`
+  );
+  return res.send(buf);
+});
+
+// Catch-all JSON 404 for unknown /api/* routes (never fall through to SPA index.html)
+app.all('/api/*', (req, res) => {
+  res.status(404).json({
+    error: `Không tìm thấy tuyến API (${req.method} ${req.originalUrl}).`,
+  });
+});
+
+// Global JSON error handler (malformed JSON, Multer file size limit, StorageError, unexpected errors)
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) return next(err);
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({
+      code: 'INVALID_JSON',
+      error: 'Dữ liệu JSON gửi lên không đúng định dạng.',
+    });
+  }
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({
+      code: 'FILE_TOO_LARGE',
+      error: 'Dung lượng tệp tải lên vượt quá giới hạn cho phép của hệ thống.',
+    });
+  }
+  if (err && err.name === 'MulterError') {
+    return res.status(400).json({
+      code: err.code || 'UPLOAD_ERROR',
+      error: `Lỗi tải tệp lên: ${err.message || 'Không hợp lệ.'}`,
+    });
+  }
+  if (err instanceof StorageError) {
+    return res.status(err.statusCode || 503).json({
+      code: err.code,
+      error: scrubSecretsFromText(err.message),
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
+  if (err instanceof AppsScriptAuthError) {
+    return res.status(err.code === 'MISSING_APPS_SCRIPT_TOKEN' ? 500 : 502).json({
+      code: err.code,
+      error: scrubSecretsFromText(err.message),
+    });
+  }
+  console.error(`[API Error] ${req.method} ${req.originalUrl}:`, sanitizeErrorForLog(err));
+  if (req.originalUrl.startsWith('/api/')) {
+    return res.status(err?.statusCode || err?.status || 500).json({
+      code: err?.code || 'INTERNAL_SERVER_ERROR',
+      error: scrubSecretsFromText(err?.message || 'Đã xảy ra lỗi hệ thống ngoài ý muốn. Vui lòng thử lại.'),
+    });
+  }
+  return next(err);
+});
+
+// --- Vite Middleware in Dev or Static Serve in Prod ---
+async function startServer() {
+  if (process.env.NODE_ENV === 'production') {
+    const distPath = path.resolve(__dirname, 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.resolve(distPath, 'index.html'));
+    });
+  } else {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[ĐOÀN TRƯỜNG THPT NGUYỄN CHÍ THANH] Máy chủ đang chạy tại cổng ${PORT}`);
+  });
+}
+
+if (!IS_SERVERLESS) {
+  startServer().catch((err) => {
+    console.error('Lỗi khởi động máy chủ:', err);
+  });
+}
+
+export { app };
+export default app;
