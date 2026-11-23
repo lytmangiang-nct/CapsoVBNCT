@@ -849,6 +849,8 @@ export interface PersistenceStatus {
     | 'REMOTE_WEBHOOK'
     | 'LOCAL_DISK'
     | 'NONE';
+  detectedEnvKeyPair?: string;
+  detectedDiagnosticVars?: string[];
   dbKey?: string;
   maskedHost?: string;
   schemaVersion?: number;

@@ -894,6 +894,8 @@ interface StorageAdapterConfig {
   durable: boolean;
   label: string;
   envPairUsed: NonNullable<PersistenceStatus['envPairUsed']>;
+  detectedEnvKeyPair?: string;
+  detectedDiagnosticVars?: string[];
   kvUrl?: string;
   kvToken?: string;
   kvKey: string;
@@ -909,95 +911,254 @@ function normalizeRestUrl(raw?: string): string {
   return (raw || '').trim().replace(/\/+$/, '');
 }
 
-function getStorageAdapterConfig(): StorageAdapterConfig {
-  const upstashUrl = normalizeRestUrl(process.env.UPSTASH_REDIS_REST_URL);
-  const upstashToken = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
-  const kvUrl = normalizeRestUrl(process.env.KV_REST_API_URL);
-  const kvToken = (process.env.KV_REST_API_TOKEN || '').trim();
+function isValidHttpRestUrl(rawUrl: string): boolean {
+  if (!rawUrl) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
 
+interface DiscoveredRedisCandidate {
+  kind: 'UPSTASH_REDIS_REST' | 'KV_REST_API';
+  pairLabel: string;
+  urlKey: string;
+  tokenKey: string;
+  url: string;
+  token: string;
+  priority: number;
+}
+
+function discoverStorageEnvCandidates(env: NodeJS.ProcessEnv): {
+  redisPairs: DiscoveredRedisCandidate[];
+  partialRedisVars: string[];
+  invalidRedisUrlVars: string[];
+  tcpOnlyRedisVars: string[];
+  blobTokens: Array<{ key: string; token: string; priority: number }>;
+} {
+  const envKeys = Object.keys(env).sort();
+  const isClientPublicKey = (k: string) => k.startsWith('VITE_') || k.startsWith('NEXT_PUBLIC_');
+
+  const pairSpecs = new Map<
+    string,
+    {
+      kind: 'UPSTASH_REDIS_REST' | 'KV_REST_API';
+      pairLabel: string;
+      urlKey: string;
+      tokenKey: string;
+      priority: number;
+    }
+  >();
+
+  const registerPair = (
+    urlKey: string,
+    tokenKey: string,
+    kind: 'UPSTASH_REDIS_REST' | 'KV_REST_API',
+    pairLabel: string,
+    priority: number
+  ) => {
+    if (!pairSpecs.has(pairLabel)) {
+      pairSpecs.set(pairLabel, { kind, pairLabel, urlKey, tokenKey, priority });
+    }
+  };
+
+  // 1. Standard non-prefixed pairs (highest priority)
+  registerPair('UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN', 'UPSTASH_REDIS_REST', 'UPSTASH_REDIS_REST_*', 1);
+  registerPair('KV_REST_API_URL', 'KV_REST_API_TOKEN', 'KV_REST_API', 'KV_REST_API_*', 2);
+  registerPair('REDIS_REST_API_URL', 'REDIS_REST_API_TOKEN', 'UPSTASH_REDIS_REST', 'REDIS_REST_API_*', 3);
+
+  // 2. Auto-discover any Vercel Marketplace custom prefix (e.g. STORAGE_KV_REST_API_*, SOVB_UPSTASH_REDIS_REST_*, MYAPP_REDIS_REST_API_*)
+  const prefixedPatterns: Array<{
+    regex: RegExp;
+    kind: 'UPSTASH_REDIS_REST' | 'KV_REST_API';
+    basePriority: number;
+  }> = [
+    { regex: /^([A-Z0-9_]+)_(UPSTASH_REDIS_REST)_(URL|TOKEN)$/, kind: 'UPSTASH_REDIS_REST', basePriority: 10 },
+    { regex: /^([A-Z0-9_]+)_(KV_REST_API)_(URL|TOKEN)$/, kind: 'KV_REST_API', basePriority: 20 },
+    { regex: /^([A-Z0-9_]+)_(REDIS_REST_API)_(URL|TOKEN)$/, kind: 'UPSTASH_REDIS_REST', basePriority: 30 },
+  ];
+
+  const blobTokens: Array<{ key: string; token: string; priority: number }> = [];
+  const tcpOnlyRedisVars: string[] = [];
+
+  for (const key of envKeys) {
+    if (isClientPublicKey(key)) continue;
+    const rawVal = (env[key] || '').trim();
+
+    for (const pat of prefixedPatterns) {
+      const m = key.match(pat.regex);
+      if (m) {
+        const prefix = m[1];
+        const stem = m[2];
+        const base = `${prefix}_${stem}`;
+        registerPair(`${base}_URL`, `${base}_TOKEN`, pat.kind, `${base}_*`, pat.basePriority);
+      }
+    }
+
+    if (key === 'BLOB_READ_WRITE_TOKEN' && rawVal) {
+      blobTokens.push({ key, token: rawVal, priority: 1 });
+    } else if (/^[A-Z0-9_]+_BLOB_READ_WRITE_TOKEN$/.test(key) && rawVal) {
+      blobTokens.push({ key, token: rawVal, priority: 10 });
+    }
+
+    if (
+      (key === 'REDIS_URL' ||
+        key === 'KV_URL' ||
+        /^[A-Z0-9_]+_(REDIS_URL|KV_URL)$/.test(key)) &&
+      /^rediss?:\/\//i.test(rawVal)
+    ) {
+      tcpOnlyRedisVars.push(key);
+    }
+  }
+
+  const redisPairs: DiscoveredRedisCandidate[] = [];
+  const partialRedisVars: string[] = [];
+  const invalidRedisUrlVars: string[] = [];
+
+  for (const spec of pairSpecs.values()) {
+    const url = normalizeRestUrl(env[spec.urlKey]);
+    const token = (env[spec.tokenKey] || '').trim();
+    if (url && token) {
+      if (!isValidHttpRestUrl(url)) {
+        invalidRedisUrlVars.push(spec.urlKey);
+      } else {
+        redisPairs.push({
+          kind: spec.kind,
+          pairLabel: spec.pairLabel,
+          urlKey: spec.urlKey,
+          tokenKey: spec.tokenKey,
+          url,
+          token,
+          priority: spec.priority,
+        });
+      }
+    } else if (url && !token) {
+      partialRedisVars.push(`${spec.urlKey} (thiếu ${spec.tokenKey})`);
+    } else if (!url && token) {
+      partialRedisVars.push(`${spec.tokenKey} (thiếu ${spec.urlKey})`);
+    }
+  }
+
+  redisPairs.sort((a, b) => a.priority - b.priority || a.pairLabel.localeCompare(b.pairLabel));
+  blobTokens.sort((a, b) => a.priority - b.priority || a.key.localeCompare(b.key));
+
+  return {
+    redisPairs,
+    partialRedisVars,
+    invalidRedisUrlVars,
+    tcpOnlyRedisVars,
+    blobTokens,
+  };
+}
+
+function getStorageAdapterConfig(): StorageAdapterConfig {
   const kvKey = (process.env.PERSISTENT_DB_KEY || 'nct_vanban_registry_db_v1').trim() || 'nct_vanban_registry_db_v1';
-  const blobToken = (process.env.BLOB_READ_WRITE_TOKEN || '').trim();
   const blobPathname =
     (process.env.PERSISTENT_BLOB_PATHNAME || 'nct-registry/db.json').trim().replace(/^\/+/, '') ||
     'nct-registry/db.json';
   const webhookUrl = normalizeRestUrl(process.env.PERSISTENT_DB_WEBHOOK_URL);
   const webhookSecret = (process.env.PERSISTENT_DB_SECRET || '').trim();
 
-  const hasUpstashComplete = Boolean(upstashUrl && upstashToken);
-  const hasUpstashPartial = Boolean(upstashUrl) !== Boolean(upstashToken);
-  const hasKvComplete = Boolean(kvUrl && kvToken);
-  const hasKvPartial = Boolean(kvUrl) !== Boolean(kvToken);
+  const discovered = discoverStorageEnvCandidates(process.env);
 
-  if (hasUpstashComplete && hasKvComplete) {
-    const sameEndpoint = upstashUrl.toLowerCase() === kvUrl.toLowerCase() && upstashToken === kvToken;
-    if (!sameEndpoint) {
+  // Deduplicate complete Redis REST pairs by normalized (url, token) so Vercel's simultaneous
+  // UPSTASH_REDIS_REST_* + KV_REST_API_* (or prefixed variants) pointing to the SAME DB never conflict
+  if (discovered.redisPairs.length > 0) {
+    const uniqueEndpoints = new Map<string, DiscoveredRedisCandidate>();
+    const allDistinctLabels: string[] = [];
+
+    for (const candidate of discovered.redisPairs) {
+      const signature = `${candidate.url.toLowerCase()}||${candidate.token}`;
+      if (!uniqueEndpoints.has(signature)) {
+        uniqueEndpoints.set(signature, candidate);
+        allDistinctLabels.push(candidate.pairLabel);
+      }
+    }
+
+    if (uniqueEndpoints.size > 1) {
       return {
         mode: 'ephemeral_tmp',
         durable: false,
-        label: 'Cấu hình Redis mâu thuẫn giữa UPSTASH_REDIS_REST_* và KV_REST_API_*',
+        label: `Cấu hình Redis mâu thuẫn giữa ${allDistinctLabels.join(' và ')}`,
         envPairUsed: 'NONE',
+        detectedDiagnosticVars: allDistinctLabels,
         kvKey,
         blobPathname,
-        configConflictError:
-          'Phát hiện cấu hình Redis bị mâu thuẫn: UPSTASH_REDIS_REST_* và KV_REST_API_* đang trỏ tới hai database hoặc token khác nhau. Vui lòng giữ lại đúng 1 cặp biến cho database chính trên Vercel Environment Variables rồi Redeploy.',
+        configConflictError: `Phát hiện cấu hình Redis bị mâu thuẫn: các cặp biến ${allDistinctLabels.join(
+          ', '
+        )} đang trỏ tới nhiều database hoặc token khác nhau. Vui lòng giữ lại đúng 1 cặp biến cho database chính trên Vercel Environment Variables rồi Redeploy.`,
       };
     }
+
+    const chosen = Array.from(uniqueEndpoints.values())[0];
+    const isStandardLabel =
+      chosen.pairLabel === 'UPSTASH_REDIS_REST_*' || chosen.pairLabel === 'KV_REST_API_*';
     return {
       mode: 'upstash_kv',
       durable: true,
-      label: 'Upstash Redis (Bền vững dùng chung)',
-      envPairUsed: 'UPSTASH_REDIS_REST',
-      kvUrl: upstashUrl,
-      kvToken: upstashToken,
+      label:
+        chosen.kind === 'KV_REST_API'
+          ? isStandardLabel
+            ? 'Vercel KV / Upstash Redis (Bền vững dùng chung)'
+            : `Upstash Redis / Vercel KV (${chosen.pairLabel})`
+          : isStandardLabel
+          ? 'Upstash Redis (Bền vững dùng chung)'
+          : `Upstash Redis (${chosen.pairLabel})`,
+      envPairUsed: chosen.kind,
+      detectedEnvKeyPair: chosen.pairLabel,
+      kvUrl: chosen.url,
+      kvToken: chosen.token,
       kvKey,
       blobPathname,
     };
   }
 
-  if (hasUpstashComplete) {
-    return {
-      mode: 'upstash_kv',
-      durable: true,
-      label: 'Upstash Redis (Bền vững dùng chung)',
-      envPairUsed: 'UPSTASH_REDIS_REST',
-      kvUrl: upstashUrl,
-      kvToken: upstashToken,
-      kvKey,
-      blobPathname,
-    };
-  }
-
-  if (hasKvComplete) {
-    return {
-      mode: 'upstash_kv',
-      durable: true,
-      label: 'Vercel KV / Upstash Redis (Bền vững dùng chung)',
-      envPairUsed: 'KV_REST_API',
-      kvUrl,
-      kvToken,
-      kvKey,
-      blobPathname,
-    };
-  }
-
-  if (blobToken) {
+  // Fallback 1: Vercel Blob (exact or custom-prefixed token)
+  if (discovered.blobTokens.length > 0) {
+    const uniqueBlobs = new Map<string, { key: string; token: string }>();
+    for (const item of discovered.blobTokens) {
+      if (!uniqueBlobs.has(item.token)) {
+        uniqueBlobs.set(item.token, { key: item.key, token: item.token });
+      }
+    }
+    if (uniqueBlobs.size > 1) {
+      const keys = Array.from(uniqueBlobs.values()).map((x) => x.key);
+      return {
+        mode: 'ephemeral_tmp',
+        durable: false,
+        label: `Cấu hình Vercel Blob mâu thuẫn giữa ${keys.join(' và ')}`,
+        envPairUsed: 'NONE',
+        detectedDiagnosticVars: keys,
+        kvKey,
+        blobPathname,
+        configConflictError: `Phát hiện nhiều token Vercel Blob khác nhau (${keys.join(
+          ', '
+        )}). Vui lòng giữ lại đúng 1 biến lưu trữ chính trên Vercel rồi Redeploy.`,
+      };
+    }
+    const chosenBlob = Array.from(uniqueBlobs.values())[0];
     return {
       mode: 'vercel_blob',
       durable: true,
       label: 'Vercel Blob Store (Bền vững dùng chung)',
       envPairUsed: 'VERCEL_BLOB',
+      detectedEnvKeyPair: chosenBlob.key,
       kvKey,
-      blobToken,
+      blobToken: chosenBlob.token,
       blobPathname,
     };
   }
 
+  // Fallback 2: Remote Storage Webhook
   if (webhookUrl) {
     return {
       mode: 'remote_webhook',
       durable: true,
       label: 'Remote Storage Webhook (Bền vững dùng chung)',
       envPairUsed: 'REMOTE_WEBHOOK',
+      detectedEnvKeyPair: 'PERSISTENT_DB_WEBHOOK_URL',
       kvKey,
       blobPathname,
       webhookUrl,
@@ -1005,10 +1166,26 @@ function getStorageAdapterConfig(): StorageAdapterConfig {
     };
   }
 
-  const partialHint =
-    hasUpstashPartial || hasKvPartial
-      ? 'Phát hiện cặp biến Redis bị thiếu một nửa (cần khai báo đủ cả *_URL và *_TOKEN trong cùng một cặp UPSTASH_REDIS_REST_* hoặc KV_REST_API_*).'
-      : undefined;
+  const diagnosticVars: string[] = [
+    ...discovered.partialRedisVars,
+    ...discovered.invalidRedisUrlVars.map((k) => `${k} (URL không hợp lệ)`),
+    ...discovered.tcpOnlyRedisVars,
+  ];
+
+  let diagnosticHint: string | undefined;
+  if (discovered.partialRedisVars.length > 0) {
+    diagnosticHint = `Phát hiện cặp biến Redis bị thiếu một nửa: ${discovered.partialRedisVars.join(
+      ', '
+    )}. Cần khai báo đủ cả *_URL và *_TOKEN trong cùng một cặp biến rồi Redeploy.`;
+  } else if (discovered.invalidRedisUrlVars.length > 0) {
+    diagnosticHint = `Biến ${discovered.invalidRedisUrlVars.join(
+      ', '
+    )} không phải địa chỉ REST HTTPS hợp lệ của Upstash Redis.`;
+  } else if (discovered.tcpOnlyRedisVars.length > 0) {
+    diagnosticHint = `Phát hiện biến Redis dạng TCP (${discovered.tcpOnlyRedisVars.join(
+      ', '
+    )}) nhưng thiếu cặp REST API (*_REST_URL + *_REST_TOKEN hoặc *_KV_REST_API_URL + *_KV_REST_API_TOKEN). Trên Vercel Serverless vui lòng gắn "Upstash for Redis" hỗ trợ REST API rồi Redeploy.`;
+  }
 
   if (!IS_SERVERLESS || Boolean(process.env.DATA_DIR)) {
     return {
@@ -1016,9 +1193,11 @@ function getStorageAdapterConfig(): StorageAdapterConfig {
       durable: true,
       label: 'Ổ đĩa máy chủ (data/db.json)',
       envPairUsed: 'LOCAL_DISK',
+      detectedEnvKeyPair: 'LOCAL_DISK',
+      detectedDiagnosticVars: diagnosticVars.length > 0 ? diagnosticVars : undefined,
       kvKey,
       blobPathname,
-      missingConfigError: partialHint,
+      missingConfigError: diagnosticHint,
     };
   }
 
@@ -1027,11 +1206,12 @@ function getStorageAdapterConfig(): StorageAdapterConfig {
     durable: false,
     label: 'Chưa gắn lưu trữ bền vững cho Vercel Production',
     envPairUsed: 'NONE',
+    detectedDiagnosticVars: diagnosticVars.length > 0 ? diagnosticVars : undefined,
     kvKey,
     blobPathname,
     missingConfigError:
-      partialHint ||
-      'Thiếu cặp biến UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN (hoặc KV_REST_API_URL + KV_REST_API_TOKEN) trên Vercel Production.',
+      diagnosticHint ||
+      'Thiếu cặp biến Upstash Redis REST (UPSTASH_REDIS_REST_* hoặc KV_REST_API_* hoặc bản có tiền tố từ Vercel Marketplace) trên Vercel Production.',
   };
 }
 
@@ -1127,6 +1307,8 @@ function getPersistenceStatus(): PersistenceStatus {
     connectionState,
     connectionLabel: CONNECTION_LABELS[connectionState],
     envPairUsed: cfg.envPairUsed,
+    detectedEnvKeyPair: cfg.detectedEnvKeyPair,
+    detectedDiagnosticVars: cfg.detectedDiagnosticVars,
     dbKey: cfg.mode === 'upstash_kv' || cfg.mode === 'remote_webhook' ? cfg.kvKey : undefined,
     maskedHost: maskUrlHostname(cfg.kvUrl || cfg.webhookUrl),
     schemaVersion: db?.meta?.schemaVersion || CURRENT_SCHEMA_VERSION,

@@ -327,7 +327,7 @@ export const RedisStorageSection: React.FC<RedisStorageSectionProps> = ({
           <div className="space-y-0.5 min-w-0">
             <span className="text-[11px] font-semibold text-slate-500 uppercase">Cặp biến môi trường</span>
             <p className="font-mono text-slate-800 break-all">
-              {status?.envPairUsed || 'NONE'}
+              {status?.detectedEnvKeyPair || status?.envPairUsed || 'NONE'}
               {status?.maskedHost ? ` · ${status.maskedHost}` : ''}
             </p>
           </div>
@@ -374,9 +374,14 @@ export const RedisStorageSection: React.FC<RedisStorageSectionProps> = ({
         {status?.errorDetail && connState !== 'connected' && (
           <div className={`p-3 rounded-lg border text-xs flex items-start gap-2.5 ${badgeMeta.boxClass}`}>
             <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
-            <div className="space-y-1 min-w-0">
+            <div className="space-y-1.5 min-w-0">
               <strong className="block font-bold">{badgeMeta.label}</strong>
               <p className="break-words">{status.errorDetail}</p>
+              {status.detectedDiagnosticVars && status.detectedDiagnosticVars.length > 0 && (
+                <p className="text-[11px] font-mono opacity-90 break-all">
+                  Biến đã phát hiện (chỉ tên biến): {status.detectedDiagnosticVars.join(', ')}
+                </p>
+              )}
             </div>
           </div>
         )}
@@ -615,22 +620,47 @@ export const RedisStorageSection: React.FC<RedisStorageSectionProps> = ({
         <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 sm:p-5 space-y-3 text-xs text-slate-800">
           <div className="flex items-start gap-2">
             <Info className="w-4 h-4 text-sky-700 shrink-0 mt-0.5" />
-            <div className="space-y-2 min-w-0">
+            <div className="space-y-2.5 min-w-0 flex-1">
               <strong className="block font-bold text-slate-900">
-                Hướng dẫn gắn Upstash Redis cho project trên Vercel
+                Hướng dẫn 4 bước gắn Upstash Redis &amp; khởi tạo dự án Vercel mới
               </strong>
               <p className="font-semibold text-sky-900 bg-sky-50 border border-sky-200 rounded-lg px-3 py-2">
-                Vercel → Marketplace → Upstash for Redis → Kết nối đúng project → Redeploy
+                Vercel Project → Storage → Create Database → Upstash for Redis → Connect Project → Redeploy
               </p>
-              <p className="text-slate-600">
-                Biến môi trường Production cần có (chỉ dùng 1 cặp URL + Token thuộc cùng một database):
-              </p>
-              <ul className="list-disc pl-5 space-y-1 font-mono text-[11px] text-slate-800">
-                <li>UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN (ưu tiên)</li>
-                <li>Hoặc KV_REST_API_URL + KV_REST_API_TOKEN</li>
-                <li>PERSISTENT_DB_KEY (tùy chọn, mặc định: nct_vanban_registry_db_v1)</li>
-                <li>SESSION_SECRET (chuỗi bí mật cố định để giữ phiên đăng nhập giữa các bản triển khai)</li>
-              </ul>
+              <ol className="list-decimal pl-5 space-y-1.5 text-slate-700">
+                <li>
+                  Trong dự án Vercel mới, vào tab <strong>Storage</strong> (hoặc <strong>Marketplace</strong>) → chọn{' '}
+                  <strong>Upstash for Redis</strong> → tạo database mới và kết nối vào đúng project này (tích chọn{' '}
+                  <strong>Production</strong>). Hệ thống <strong>tự động nhận mọi tiền tố biến</strong> do Vercel sinh ra
+                  (không cần đổi tên biến thủ công).
+                </li>
+                <li>
+                  Kiểm tra thêm 2 biến trong <strong>Settings → Environment Variables</strong>:{' '}
+                  <span className="font-mono text-slate-900">NCT_API_TOKEN</span> (khớp với Google Apps Script) và{' '}
+                  <span className="font-mono text-slate-900">SESSION_SECRET</span> (chuỗi bí mật cố định).
+                </li>
+                <li>
+                  Vào tab <strong>Deployments</strong> → bấm <strong>Redeploy</strong> ở bản triển khai mới nhất để máy chủ
+                  nhận cặp biến Redis vừa gắn.
+                </li>
+                <li>
+                  Quay lại trang này → bấm <strong>Kiểm tra kết nối</strong> → tại mục{' '}
+                  <strong>2. Khởi tạo hệ thống mới</strong>, tích xác nhận và nhập{' '}
+                  <span className="font-mono font-semibold text-slate-900">XÁC NHẬN HỆ THỐNG MỚI</span> để tạo sạch 3 sổ mặc
+                  định (Đoàn trường, Chi bộ, Nhà trường).
+                </li>
+              </ol>
+              <div className="pt-1 border-t border-slate-200 space-y-1">
+                <p className="text-[11px] font-semibold text-slate-600">
+                  Các định dạng biến lưu trữ hệ thống tự động nhận diện (chỉ dùng 1 kho dữ liệu chính):
+                </p>
+                <ul className="list-disc pl-5 space-y-0.5 font-mono text-[11px] text-slate-700">
+                  <li>UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN (hoặc &lt;TIỀN_TỐ&gt;_UPSTASH_REDIS_REST_*)</li>
+                  <li>KV_REST_API_URL + KV_REST_API_TOKEN (hoặc &lt;TIỀN_TỐ&gt;_KV_REST_API_*)</li>
+                  <li>REDIS_REST_API_URL + REDIS_REST_API_TOKEN (hoặc &lt;TIỀN_TỐ&gt;_REDIS_REST_API_*)</li>
+                  <li>Hoặc Vercel Blob: BLOB_READ_WRITE_TOKEN (hoặc &lt;TIỀN_TỐ&gt;_BLOB_READ_WRITE_TOKEN)</li>
+                </ul>
+              </div>
             </div>
           </div>
         </div>
