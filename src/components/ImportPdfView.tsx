@@ -19,8 +19,10 @@ import {
   RotateCcw,
   Send,
   Upload,
+  X,
 } from 'lucide-react';
 import { api } from '../api';
+import { useAutoDismiss } from '../hooks/useAutoDismiss';
 import type {
   DocumentRecord,
   ExtractableFieldKey,
@@ -827,6 +829,14 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  // Tự động ẩn thông báo đã nhập PDF & lưu Drive thành công sau 30 giây (giữ lại nếu đang lưu hoặc lỗi cần thử lại)
+  useAutoDismiss(
+    savedDoc && savedDoc.driveStatus === 'saved' && !retryingDrive ? savedDoc : null,
+    handleReset
+  );
+  useAutoDismiss(analyzeError, () => setAnalyzeError(null));
+  useAutoDismiss(submitError, () => setSubmitError(null));
+
   const openLocalPdfPicker = () => {
     if (analyzing) return;
     fileInputRef.current?.click();
@@ -1055,6 +1065,17 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 >
                   <FileCheck2 className="w-4 h-4 text-purple-700" />
                   <span>Xem hồ sơ vừa nhập</span>
+                </button>
+              )}
+              {savedDoc.driveStatus === 'saved' && (
+                <button
+                  type="button"
+                  onClick={handleReset}
+                  aria-label="Đóng thông báo"
+                  title="Đóng thông báo"
+                  className="inline-flex items-center justify-center w-9 h-9 rounded-lg text-emerald-700/70 hover:text-emerald-900 hover:bg-emerald-100 transition-colors shrink-0 self-end sm:self-center"
+                >
+                  <X className="w-4 h-4" />
                 </button>
               )}
             </div>

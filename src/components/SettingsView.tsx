@@ -29,6 +29,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../api';
+import { useAutoDismiss } from '../hooks/useAutoDismiss';
 import type {
   BookPermission,
   DocumentTypeConfig,
@@ -317,6 +318,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [bookGsWebhookUrl, setBookGsWebhookUrl] = useState<string>(selectedBook.googleSheetsConfig?.webhookUrl || '');
   const [bookGsSaving, setBookGsSaving] = useState(false);
   const [bookGsMessage, setBookGsMessage] = useState<string | null>(null);
+
+  // Tự động ẩn các thông báo lưu cấu hình / kiểm tra kết nối sau 30 giây
+  useAutoDismiss(bookMessage, () => setBookMessage(null));
+  useAutoDismiss(seqSaveSuccessNotice, () => setSeqSaveSuccessNotice(null));
+  useAutoDismiss(gdSaveMessage, () => setGdSaveMessage(null));
+  useAutoDismiss(gdTestResult, () => setGdTestResult(null));
+  useAutoDismiss(gsTestResult, () => setGsTestResult(null));
+  useAutoDismiss(gsSyncResult, () => setGsSyncResult(null));
+  useAutoDismiss(bookGsMessage, () => setBookGsMessage(null));
 
   // Dirty-state & optimistic concurrency tracking
   const [generalDirty, setGeneralDirty] = useState(false);
@@ -1521,6 +1531,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   const [userFeedback, setUserFeedback] = useState<{ success: boolean; message: string } | null>(null);
+  useAutoDismiss(userFeedback, () => setUserFeedback(null));
 
   // 8. User Management Handlers (Admin Only)
   const handleCreateUser = async (e: React.FormEvent) => {

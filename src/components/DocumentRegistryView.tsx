@@ -38,6 +38,7 @@ import {
   MessageSquareText,
 } from 'lucide-react';
 import { api } from '../api';
+import { useAutoDismiss } from '../hooks/useAutoDismiss';
 import { DocumentChatDrawer } from './DocumentChatDrawer';
 import { PdfPreviewPane } from './PdfPreviewPane';
 import type {
@@ -636,6 +637,18 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   // Export Excel loading state
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+
+  // Tự động ẩn các thông báo trạng thái sau 30 giây để giao diện luôn gọn
+  useAutoDismiss(driveVerifyNotice, () => setDriveVerifyNotice(null));
+  useAutoDismiss(syncRetryNotice, () => setSyncRetryNotice(null));
+  useAutoDismiss(archiveNotice, () => setArchiveNotice(null));
+  useAutoDismiss(cleanupNotice, () => setCleanupNotice(null));
+  useAutoDismiss(
+    bulkSyncResult && bulkSyncResult.failedCount === 0 ? bulkSyncResult : null,
+    () => setBulkSyncResult(null)
+  );
+  useAutoDismiss(fileActionError, () => setFileActionError(null));
+  useAutoDismiss(exportError, () => setExportError(null));
 
   // Detail Modal: Multi-attachment & Tasks state
   const [detailTasks, setDetailTasks] = useState<DocumentTask[]>([]);

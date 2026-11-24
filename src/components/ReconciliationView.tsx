@@ -15,6 +15,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { api } from '../api';
+import { useAutoDismiss } from '../hooks/useAutoDismiss';
 import type {
   DriveReconciliationHistoryEntry,
   DriveReconciliationItemResult,
@@ -97,6 +98,7 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
   const [verifyingDrive, setVerifyingDrive] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [actionBanner, setActionBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  useAutoDismiss(actionBanner, () => setActionBanner(null));
   const [retryingItemId, setRetryingItemId] = useState<string | null>(null);
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>([]);
   const [bulkSyncing, setBulkSyncing] = useState<boolean>(false);

@@ -3,6 +3,7 @@ import { Navbar, type AppTab, type RegistrySection } from './components/Navbar';
 import type { SettingsSubTab } from './components/settings/settingsConstants';
 import { LoginModal } from './components/LoginModal';
 import { api, buildApiUrl, clearAuth, getStoredToken, getStoredUser, updateStoredUser } from './api';
+import { NOTIFICATION_AUTO_DISMISS_MS } from './hooks/useAutoDismiss';
 
 const IssueNumberView = lazy(() =>
   import('./components/IssueNumberView').then((m) => ({ default: m.IssueNumberView }))
@@ -351,6 +352,10 @@ export default function App() {
     };
   }, [applyServerTime]);
 
+  const isCompletedIssueTask = (t: IssuedUploadTask): boolean =>
+    t.driveStatus === 'none' ||
+    (t.driveStatus === 'saved' && Boolean(t.driveFileId) && Boolean(t.driveFileUrl));
+
   // Load & persist recentIssueTasks per user in sessionStorage
   useEffect(() => {
     if (!currentUser?.id) {
@@ -366,16 +371,24 @@ export default function App() {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         const now = Date.now();
-        // Keep tasks from the last 6 hours, max 5
+        // Completed notifications auto-expire after 30s; active/failed tasks kept up to 6h for retry
         const valid = parsed
-          .filter(
-            (t: any) =>
-              t &&
-              typeof t.docId === 'string' &&
-              typeof t.fullDocNumber === 'string' &&
-              typeof t.issuedAtMs === 'number' &&
-              now - t.issuedAtMs < 6 * 60 * 60 * 1000
-          )
+          .filter((t: any) => {
+            if (
+              !t ||
+              typeof t.docId !== 'string' ||
+              typeof t.fullDocNumber !== 'string' ||
+              typeof t.issuedAtMs !== 'number'
+            ) {
+              return false;
+            }
+            if (isCompletedIssueTask(t)) {
+              const completedAt =
+                typeof t.driveCompletedAtMs === 'number' ? t.driveCompletedAtMs : t.issuedAtMs;
+              return now - completedAt < NOTIFICATION_AUTO_DISMISS_MS;
+            }
+            return now - t.issuedAtMs < 6 * 60 * 60 * 1000;
+          })
           .slice(0, 5);
         setRecentIssueTasks(valid);
       }
@@ -397,6 +410,36 @@ export default function App() {
       // ignore sessionStorage quota errors
     }
   }, [recentIssueTasks, currentUser?.id]);
+
+  // Tự động ẩn thông báo đã cấp số / lưu Drive thành công sau 30 giây
+  useEffect(() => {
+    if (recentIssueTasks.length === 0) return;
+    const now = Date.now();
+    let earliestExpireAt = Infinity;
+    for (const t of recentIssueTasks) {
+      if (!isCompletedIssueTask(t)) continue;
+      const completedAt = t.driveCompletedAtMs || t.issuedAtMs;
+      const expireAt = completedAt + NOTIFICATION_AUTO_DISMISS_MS;
+      if (expireAt < earliestExpireAt) {
+        earliestExpireAt = expireAt;
+      }
+    }
+    if (!Number.isFinite(earliestExpireAt)) return;
+    const delay = Math.max(0, earliestExpireAt - now);
+    const timer = window.setTimeout(() => {
+      const cutoff = Date.now();
+      setRecentIssueTasks((prev) =>
+        prev.filter((t) => {
+          if (!isCompletedIssueTask(t)) return true;
+          const completedAt = t.driveCompletedAtMs || t.issuedAtMs;
+          return cutoff - completedAt < NOTIFICATION_AUTO_DISMISS_MS;
+        })
+      );
+    }, delay);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [recentIssueTasks]);
 
   const mergeMonotoneDocument = useCallback(
     (existing: DocumentRecord | undefined, incoming: DocumentRecord): DocumentRecord => {
@@ -1153,7 +1196,7 @@ export default function App() {
             : undefined,
         issuedAtMs: Date.now(),
         issueMs,
-        driveCompletedAtMs: verifiedSaved ? Date.now() : undefined,
+        driveCompletedAtMs: verifiedSaved || initialStatus === 'none' ? Date.now() : undefined,
       };
 
       setRecentIssueTasks((prev) => {

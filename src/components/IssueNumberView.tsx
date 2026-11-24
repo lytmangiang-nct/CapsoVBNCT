@@ -25,6 +25,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { api } from '../api';
+import { useAutoDismiss } from '../hooks/useAutoDismiss';
 import type {
   DocumentRecord,
   DocumentTypeConfig,
@@ -232,6 +233,12 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   } | null>(null);
   const [downloadingDraft, setDownloadingDraft] = useState<boolean>(false);
   const [draftError, setDraftError] = useState<string | null>(null);
+
+  // Tự động ẩn các thông báo kết quả / lỗi tạm sau 30 giây
+  useAutoDismiss(requestSuccess, () => setRequestSuccess(null));
+  useAutoDismiss(submitError, () => setSubmitError(null));
+  useAutoDismiss(queueError, () => setQueueError(null));
+  useAutoDismiss(draftError, () => setDraftError(null));
 
   // Pre-Issue Confirmation Modal State
   const [checkingPreIssue, setCheckingPreIssue] = useState<boolean>(false);
@@ -1325,10 +1332,20 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
       {/* Request Submitted Confirmation */}
       {requestSuccess && (
-        <div className="p-5 bg-emerald-50 border border-emerald-200 rounded-xl shadow-xs space-y-2 text-xs text-emerald-950">
-          <div className="flex items-center gap-2 font-bold text-sm text-emerald-900">
-            <CheckCircle2 className="w-5 h-5 text-emerald-600" />
-            <span>Đã gửi yêu cầu xin số thành công!</span>
+        <div className="p-4 sm:p-5 bg-emerald-50 border border-emerald-200 rounded-xl shadow-xs space-y-2 text-xs text-emerald-950">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 font-bold text-sm text-emerald-900">
+              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+              <span>Đã gửi yêu cầu xin số thành công!</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setRequestSuccess(null)}
+              aria-label="Đóng thông báo"
+              className="inline-flex items-center justify-center w-7 h-7 rounded-md text-emerald-700/70 hover:text-emerald-900 hover:bg-emerald-100 transition-colors shrink-0"
+            >
+              <X className="w-4 h-4" />
+            </button>
           </div>
           <p>
             Văn bản: <strong>{requestSuccess.docName}</strong> ({requestSuccess.typeName}) · Sổ:{' '}

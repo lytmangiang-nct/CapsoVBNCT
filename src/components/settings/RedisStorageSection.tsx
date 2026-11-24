@@ -13,6 +13,7 @@ import {
   Upload,
 } from 'lucide-react';
 import { api } from '../../api';
+import { useAutoDismiss } from '../../hooks/useAutoDismiss';
 import type {
   LegacySnapshotSummary,
   PersistenceStatus,
@@ -101,6 +102,9 @@ export const RedisStorageSection: React.FC<RedisStorageSectionProps> = ({
     success: boolean;
     message: string;
   } | null>(null);
+
+  useAutoDismiss(actionFeedback, () => setActionFeedback(null));
+  useAutoDismiss(testResult, () => setTestResult(null));
 
   const [initConfirmText, setInitConfirmText] = useState('');
   const [initChecked, setInitChecked] = useState(false);
