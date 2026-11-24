@@ -328,6 +328,7 @@ export const api = {
     serverTimeVietnam?: { year: number; month: number; day: number; formattedDate: string };
     persistenceStatus?: PersistenceStatus;
     legacyReconciliationWarnings?: string[];
+    sseSupported?: boolean;
   }> => {
     return request('/api/bootstrap', { timeoutMs: 25000 });
   },

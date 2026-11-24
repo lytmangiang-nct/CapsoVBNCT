@@ -4,8 +4,17 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { fileURLToPath } from 'url';
-import ExcelJS from 'exceljs';
+import type ExcelJS from 'exceljs';
 import crypto from 'crypto';
+
+let cachedExcelJs: typeof ExcelJS | null = null;
+async function getExcelJS(): Promise<typeof ExcelJS> {
+  if (!cachedExcelJs) {
+    const mod: any = await import('exceljs');
+    cachedExcelJs = mod.default || mod;
+  }
+  return cachedExcelJs!;
+}
 import zlib from 'zlib';
 import multer from 'multer';
 import type {
@@ -208,13 +217,24 @@ app.use('/api', async (req, res, next) => {
     const forceFresh =
       req.path.startsWith('/settings/start-sequence') ||
       req.path.startsWith('/documents/preview');
+    const isReadOnlyMethod = req.method === 'GET' || req.method === 'HEAD';
     const isFastReadBurst =
-      req.method === 'GET' &&
+      isReadOnlyMethod &&
       (req.path === '/bootstrap' ||
         req.path === '/settings' ||
         req.path === '/books' ||
-        req.path === '/documents');
-    await ensureLatestDb({ maxAgeMs: forceFresh ? 0 : isFastReadBurst ? 250 : 500 });
+        req.path === '/documents' ||
+        req.path === '/number-requests');
+    // Với các request ghi (POST/PUT/DELETE), handler sẽ khóa atomicLock và gọi ensureLatestDb({ maxAgeMs: 0 }) riêng;
+    // middleware chỉ cần đảm bảo DB đã hydrate sẵn để tránh gọi 2 lượt Upstash GET nối tiếp trong cùng 1 request.
+    const maxAgeMs = forceFresh
+      ? 0
+      : !isReadOnlyMethod
+      ? 5000
+      : isFastReadBurst
+      ? 2500
+      : 1000;
+    await ensureLatestDb({ maxAgeMs });
     next();
   } catch (err: any) {
     console.error('[Primary Storage Error]:', sanitizeErrorForLog(err));
@@ -1243,6 +1263,13 @@ function summarizeDatabaseObject(candidate: Partial<DatabaseSchema>): LegacySnap
   };
 }
 
+let cachedBundledSnapshotMeta: {
+  mtimeMs: number;
+  size: number;
+  hasBundled: boolean;
+  summary?: LegacySnapshotSummary;
+} | null = null;
+
 function getBundledLegacySnapshot(): Partial<DatabaseSchema> | null {
   try {
     if (!fs.existsSync(BUNDLED_DB_FILE)) return null;
@@ -1252,6 +1279,43 @@ function getBundledLegacySnapshot(): Partial<DatabaseSchema> | null {
     return parsed;
   } catch {
     return null;
+  }
+}
+
+function getCachedBundledLegacyInfo(): { hasBundled: boolean; summary?: LegacySnapshotSummary } {
+  try {
+    if (IS_SERVERLESS && cachedBundledSnapshotMeta) {
+      return {
+        hasBundled: cachedBundledSnapshotMeta.hasBundled,
+        summary: cachedBundledSnapshotMeta.summary,
+      };
+    }
+    if (!fs.existsSync(BUNDLED_DB_FILE)) {
+      cachedBundledSnapshotMeta = { mtimeMs: 0, size: 0, hasBundled: false };
+      return { hasBundled: false };
+    }
+    const stat = fs.statSync(BUNDLED_DB_FILE);
+    if (
+      cachedBundledSnapshotMeta &&
+      cachedBundledSnapshotMeta.mtimeMs === stat.mtimeMs &&
+      cachedBundledSnapshotMeta.size === stat.size
+    ) {
+      return {
+        hasBundled: cachedBundledSnapshotMeta.hasBundled,
+        summary: cachedBundledSnapshotMeta.summary,
+      };
+    }
+    const parsed = getBundledLegacySnapshot();
+    const summary = parsed ? summarizeDatabaseObject(parsed) : undefined;
+    cachedBundledSnapshotMeta = {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      hasBundled: Boolean(parsed),
+      summary,
+    };
+    return { hasBundled: Boolean(parsed), summary };
+  } catch {
+    return { hasBundled: false };
   }
 }
 
@@ -1276,9 +1340,7 @@ const CONNECTION_LABELS: Record<StorageConnectionState, string> = {
 
 function getPersistenceStatus(): PersistenceStatus {
   const cfg = getStorageAdapterConfig();
-  const bundledLegacy = getBundledLegacySnapshot();
-  const hasBundled = Boolean(bundledLegacy);
-  const legacySummary = bundledLegacy ? summarizeDatabaseObject(bundledLegacy) : undefined;
+  const { hasBundled, summary: legacySummary } = getCachedBundledLegacyInfo();
   const sessionSecretConfigured = Boolean((process.env.SESSION_SECRET || process.env.AUTH_SECRET || '').trim());
 
   let connectionState: StorageConnectionState = 'connected';
@@ -1360,6 +1422,7 @@ async function executeUpstashCommand<T = any>(
       headers: {
         Authorization: `Bearer ${cfg.kvToken}`,
         'Content-Type': 'application/json',
+        'Accept-Encoding': 'gzip',
       },
       body: JSON.stringify(command),
     },
@@ -1402,7 +1465,10 @@ end
 if cur ~= ARGV[1] then
   return 'ERR_CONFLICT'
 end
-redis.call('SET', KEYS[1], ARGV[2])
+local ok = redis.call('SET', KEYS[1], ARGV[2])
+if not ok then
+  return 'ERR_SET_FAILED'
+end
 return 'OK'
 `;
 
@@ -1538,15 +1604,8 @@ async function writeToPrimaryRemoteNX(
     if (result !== 'OK') {
       throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, 'Upstash Redis không xác nhận ghi khởi tạo thành công.');
     }
-    const readBack = await readRawFromPrimaryRemote(cfg);
-    if (!readBack.parsed || readBack.parsed.meta?.revision !== expectedRevision || !readBack.raw) {
-      throw new StorageError(
-        'PRIMARY_STORAGE_UNAVAILABLE',
-        503,
-        'Đọc lại từ Upstash Redis sau khi khởi tạo không khớp phiên bản dữ liệu.'
-      );
-    }
-    return readBack.raw;
+    // SET NX nguyên tử trong Redis đã đảm bảo chính xác dữ liệu serialized vừa ghi, không cần thêm 1 lượt GET tải lại toàn bộ DB
+    return serialized;
   }
 
   await writeToPrimaryRemoteDirectAndVerify(cfg, serialized, expectedRevision);
@@ -1596,15 +1655,8 @@ async function writeToPrimaryRemoteCAS(
     if (evalResult !== 'OK') {
       throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, 'Upstash Redis không xác nhận ghi dữ liệu thành công.');
     }
-    const readBack = await readRawFromPrimaryRemote(cfg);
-    if (!readBack.parsed || readBack.parsed.meta?.revision !== expectedRevision || !readBack.raw) {
-      throw new StorageError(
-        'PRIMARY_STORAGE_UNAVAILABLE',
-        503,
-        'Đọc lại từ Upstash Redis không khớp phiên bản dữ liệu vừa lưu.'
-      );
-    }
-    return readBack.raw;
+    // Lua CAS đơn luồng trong Redis đã so sánh & ghi nguyên tử chính xác chuỗi serialized trong 1 vòng mạng duy nhất
+    return serialized;
   }
 
   await writeToPrimaryRemoteDirectAndVerify(cfg, serialized, expectedRevision);
@@ -1947,7 +1999,7 @@ async function ensureLatestDb(options: { maxAgeMs?: number } = {}): Promise<void
           updatedAt: new Date().toISOString(),
           schemaVersion: CURRENT_SCHEMA_VERSION,
         };
-        const upgradedSerialized = JSON.stringify(migrated, null, 2);
+        const upgradedSerialized = JSON.stringify(migrated);
         try {
           lastRemoteRawPayload = await writeToPrimaryRemoteCAS(cfg, remoteResult.raw, upgradedSerialized, upgradeRev);
         } catch (casErr: any) {
@@ -2045,7 +2097,8 @@ async function saveDatabasePersistent(
   const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const updatedAt = new Date().toISOString();
   data.meta = { revision, updatedAt, schemaVersion: CURRENT_SCHEMA_VERSION };
-  const serialized = JSON.stringify(data, null, 2);
+  // Nén JSON gọn cho lưu trữ từ xa (giảm ~35% băng thông & thời gian ghi/đọc Upstash Redis)
+  const serialized = cfg.mode === 'local_disk' ? JSON.stringify(data, null, 2) : JSON.stringify(data);
 
   if (cfg.mode === 'local_disk') {
     saveDatabaseSync(data);
@@ -5492,11 +5545,18 @@ app.get('/api/events', requireAuth, (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
+    Connection: IS_SERVERLESS ? 'close' : 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
   if (typeof (res as any).flushHeaders === 'function') {
     (res as any).flushHeaders();
+  }
+
+  // Trên Vercel Serverless không giữ kết nối SSE kéo dài (tránh treo Lambda 60s & nghẽn luồng trình duyệt)
+  if (IS_SERVERLESS) {
+    res.write(`event: serverless_mode\ndata: ${JSON.stringify({ sseSupported: false })}\n\n`);
+    res.end();
+    return;
   }
 
   while (sseClients.length >= MAX_SSE_CLIENTS) {
@@ -5524,7 +5584,7 @@ app.get('/api/events', requireAuth, (req, res) => {
 
 // 5. System Settings, Books, Document Types, Signers
 app.get('/api/books', requireAuth, async (req, res) => {
-  await ensureLatestDb({ maxAgeMs: 250 });
+  await ensureLatestDb({ maxAgeMs: 2500 });
   const currentUser = (req as any).user as User;
   const accessible = db.books.filter(
     (b) => isSystemAdmin(currentUser) || (b.isActive && getUserBookPermissions(currentUser, b.id).length > 0)
@@ -5704,7 +5764,7 @@ app.put('/api/books/:id', requireAuth, async (req, res) => {
 });
 
 app.get('/api/bootstrap', requireAuth, async (req, res) => {
-  await ensureLatestDb({ maxAgeMs: 250 });
+  await ensureLatestDb({ maxAgeMs: 2500 });
   const currentUser = (req as any).user as User;
   const admin = isSystemAdmin(currentUser);
 
@@ -5721,13 +5781,15 @@ app.get('/api/bootstrap', requireAuth, async (req, res) => {
       .map((b) => b.id)
   );
 
-  // Reconcile any stale uploading docs once for all accessible docs
-  const staleDocs = db.documents.filter((d) => {
-    const bId = getDocBookId(d);
-    return (admin || viewableBookIds.has(bId)) && isDocumentStaleUploading(d);
-  });
-  if (staleDocs.length > 0) {
-    await reconcileStaleUploadingDocuments(staleDocs, 5).catch(() => {});
+  // Không chặn phản hồi /api/bootstrap để chờ gọi Google Apps Script; chỉ đối soát nền khi chạy máy chủ thường trực
+  if (!IS_SERVERLESS) {
+    const staleDocs = db.documents.filter((d) => {
+      const bId = getDocBookId(d);
+      return (admin || viewableBookIds.has(bId)) && isDocumentStaleUploading(d);
+    });
+    if (staleDocs.length > 0) {
+      void reconcileStaleUploadingDocuments(staleDocs, 3).catch(() => {});
+    }
   }
 
   const activeDocs: DocumentRecord[] = [];
@@ -5774,11 +5836,12 @@ app.get('/api/bootstrap', requireAuth, async (req, res) => {
     serverTimeVietnam: getRequestVietnamTimeInfo(req),
     persistenceStatus: getPersistenceStatus(),
     legacyReconciliationWarnings: [...currentReconciliationWarnings],
+    sseSupported: !IS_SERVERLESS,
   });
 });
 
 app.get('/api/settings', requireAuth, async (req, res) => {
-  await ensureLatestDb({ maxAgeMs: 250 });
+  await ensureLatestDb({ maxAgeMs: 2500 });
   const currentUser = (req as any).user as User;
   res.json({
     settings: sanitizeSettingsForUser(db.settings, currentUser),
@@ -9207,15 +9270,12 @@ app.get('/api/documents', requireAuth, async (req, res) => {
     return isSystemAdmin(currentUser) || hasBookPermission(currentUser, bId, 'view');
   });
 
-  // Tự động đối soát nhanh các bản ghi bị kẹt quá lâu ở trạng thái 'uploading' (không thuộc tiến trình đang tải)
-  const staleInList = list.filter((d) => isDocumentStaleUploading(d));
-  if (staleInList.length > 0) {
-    await reconcileStaleUploadingDocuments(staleInList, 5).catch(() => {});
-    list = db.documents.filter((d) => {
-      const bId = getDocBookId(d);
-      if (bookId && bookId !== 'all' && bId !== bookId) return false;
-      return isSystemAdmin(currentUser) || hasBookPermission(currentUser, bId, 'view');
-    });
+  // Không chặn tải danh sách văn bản bằng các cuộc gọi Google Drive kéo dài; chỉ đối soát nền khi chạy server thường trực
+  if (!IS_SERVERLESS) {
+    const staleInList = list.filter((d) => isDocumentStaleUploading(d));
+    if (staleInList.length > 0) {
+      void reconcileStaleUploadingDocuments(staleInList, 3).catch(() => {});
+    }
   }
 
   if (year === 'unknown') {
@@ -11164,7 +11224,8 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
   }
 
   try {
-    const workbook = new ExcelJS.Workbook();
+    const Excel = await getExcelJS();
+    const workbook = new Excel.Workbook();
     workbook.creator = 'Đoàn Trường THPT Nguyễn Chí Thanh';
     workbook.created = new Date();
 

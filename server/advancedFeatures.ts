@@ -1,6 +1,22 @@
 import crypto from 'crypto';
-import ExcelJS from 'exceljs';
-import { GoogleGenAI, Type } from '@google/genai';
+import type ExcelJS from 'exceljs';
+
+let cachedExcelJs: typeof ExcelJS | null = null;
+async function getExcelJS(): Promise<typeof ExcelJS> {
+  if (!cachedExcelJs) {
+    const mod: any = await import('exceljs');
+    cachedExcelJs = mod.default || mod;
+  }
+  return cachedExcelJs!;
+}
+
+let cachedGenAiMod: typeof import('@google/genai') | null = null;
+async function getGenAiModule(): Promise<typeof import('@google/genai')> {
+  if (!cachedGenAiMod) {
+    cachedGenAiMod = await import('@google/genai');
+  }
+  return cachedGenAiMod;
+}
 import type {
   ArchiveDriveCandidate,
   ArchiveImportColumnMapping,
@@ -488,6 +504,7 @@ export async function answerDocumentQuestion(params: {
   const apiKey = (process.env.GEMINI_API_KEY || '').trim();
   if (apiKey) {
     try {
+      const { GoogleGenAI, Type } = await getGenAiModule();
       const ai = new GoogleGenAI({
         apiKey,
         httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
@@ -654,7 +671,8 @@ const TEMPLATE_HEADERS = [
 ];
 
 export async function buildArchiveTemplateWorkbookBuffer(): Promise<Buffer> {
-  const wb = new ExcelJS.Workbook();
+  const Excel = await getExcelJS();
+  const wb = new Excel.Workbook();
   wb.creator = 'Sổ văn bản Trường THPT Nguyễn Chí Thanh';
   wb.created = new Date();
 
@@ -840,7 +858,8 @@ export async function parseArchiveExcelBuffer(
   buffer: Buffer,
   fileName: string
 ): Promise<ArchiveParseExcelResponse> {
-  const wb = new ExcelJS.Workbook();
+  const Excel = await getExcelJS();
+  const wb = new Excel.Workbook();
   await wb.xlsx.load(buffer as any);
 
   const sheets: ArchiveParseExcelResponse['sheets'] = [];
@@ -1508,7 +1527,8 @@ export async function buildYearEndHandoverWorkbookBuffer(
   snapshot: YearEndClosingSnapshot,
   options: { canOpenDriveLinks: boolean }
 ): Promise<Buffer> {
-  const wb = new ExcelJS.Workbook();
+  const Excel = await getExcelJS();
+  const wb = new Excel.Workbook();
   wb.creator = 'Sổ văn bản Trường THPT Nguyễn Chí Thanh';
   wb.created = new Date(snapshot.closedAt);
 

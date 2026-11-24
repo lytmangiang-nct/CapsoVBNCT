@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, Suspense, lazy } from
 import { Navbar, type AppTab, type RegistrySection } from './components/Navbar';
 import type { SettingsSubTab } from './components/settings/settingsConstants';
 import { LoginModal } from './components/LoginModal';
-import { api, buildApiUrl, clearAuth, getStoredToken, updateStoredUser } from './api';
+import { api, buildApiUrl, clearAuth, getStoredToken, getStoredUser, updateStoredUser } from './api';
 
 const IssueNumberView = lazy(() =>
   import('./components/IssueNumberView').then((m) => ({ default: m.IssueNumberView }))
@@ -76,9 +76,75 @@ function getClientVietnamTimeFallback() {
   }
 }
 
+const BOOTSTRAP_CACHE_KEY = 'nct_bootstrap_cache_v1';
+const BOOTSTRAP_CACHE_TTL_MS = 30 * 60 * 1000;
+
+interface CachedBootstrapPayload {
+  cachedAt: number;
+  userId: string;
+  user: User;
+  settings: SystemSettings;
+  documentTypes: DocumentTypeConfig[];
+  signers: SignerConfig[];
+  books: RegistryBook[];
+  documents: DocumentRecord[];
+  deletedDocuments: DocumentRecord[];
+  numberRequests: NumberRequest[];
+  serverTimeVietnam?: { year: number; month: number; day: number; formattedDate: string };
+  persistenceStatus?: PersistenceStatus;
+  legacyReconciliationWarnings?: string[];
+  sseSupported?: boolean;
+}
+
+function readBootstrapCache(expectedUserId: string): CachedBootstrapPayload | null {
+  try {
+    const raw = window.sessionStorage.getItem(BOOTSTRAP_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as CachedBootstrapPayload;
+    if (!parsed || parsed.userId !== expectedUserId) return null;
+    if (typeof parsed.cachedAt !== 'number' || Date.now() - parsed.cachedAt > BOOTSTRAP_CACHE_TTL_MS) {
+      return null;
+    }
+    if (!Array.isArray(parsed.books) || !Array.isArray(parsed.documents)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeBootstrapCache(payload: Omit<CachedBootstrapPayload, 'cachedAt'>) {
+  try {
+    const serialized = JSON.stringify({ ...payload, cachedAt: Date.now() });
+    // Chỉ lưu đệm khi nhỏ hơn 1.8 MB để không làm chậm trình duyệt hoặc đầy sessionStorage
+    if (serialized.length < 1_800_000) {
+      window.sessionStorage.setItem(BOOTSTRAP_CACHE_KEY, serialized);
+    }
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function clearBootstrapCache() {
+  try {
+    window.sessionStorage.removeItem(BOOTSTRAP_CACHE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 export default function App() {
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [authChecking, setAuthChecking] = useState<boolean>(true);
+  const initialStoredUser = useMemo(() => getStoredUser(), []);
+  const initialCachedBoot = useMemo(
+    () => (initialStoredUser?.id ? readBootstrapCache(initialStoredUser.id) : null),
+    [initialStoredUser?.id]
+  );
+
+  const [currentUser, setCurrentUser] = useState<User | null>(initialCachedBoot?.user || null);
+  const [authChecking, setAuthChecking] = useState<boolean>(!initialCachedBoot);
+  const [sseSupported, setSseSupported] = useState<boolean | null>(
+    typeof initialCachedBoot?.sseSupported === 'boolean' ? initialCachedBoot.sseSupported : null
+  );
+  const skipNextAutoLoadForUserRef = React.useRef<string | null>(null);
   const [activeTab, setActiveTab] = useState<AppTab>('issue');
   const [registrySection, setRegistrySection] = useState<RegistrySection>('active');
   const [registryScopeAll, setRegistryScopeAll] = useState<boolean>(false);
@@ -91,27 +157,41 @@ export default function App() {
   serverYearRef.current = serverYear;
   const [serverFormattedDate, setServerFormattedDate] = useState<string>(initialVnTime.formattedDate);
 
-  // Core Data
-  const [settings, setSettings] = useState<SystemSettings>({
-    unitName: 'Đoàn Trường THPT Nguyễn Chí Thanh',
-    unitCode: 'ĐTN',
-    numberMode: 'separate',
-    numberFormat: '{so}-{loai}/{don_vi}',
-    customStartSequences: {},
-  });
-  const [books, setBooks] = useState<RegistryBook[]>([]);
+  // Core Data (khởi tạo tức thì từ bộ nhớ đệm phiên nếu có, sau đó tự đồng bộ nền mới nhất)
+  const [settings, setSettings] = useState<SystemSettings>(
+    initialCachedBoot?.settings || {
+      unitName: 'Đoàn Trường THPT Nguyễn Chí Thanh',
+      unitCode: 'ĐTN',
+      numberMode: 'separate',
+      numberFormat: '{so}-{loai}/{don_vi}',
+      customStartSequences: {},
+    }
+  );
+  const [books, setBooks] = useState<RegistryBook[]>(initialCachedBoot?.books || []);
   const [activeBookId, setActiveBookId] = useState<string>(DEFAULT_BOOK_ID);
-  const [numberRequests, setNumberRequests] = useState<NumberRequest[]>([]);
-  const [documentTypes, setDocumentTypes] = useState<DocumentTypeConfig[]>([]);
-  const [signers, setSigners] = useState<SignerConfig[]>([]);
-  const [documents, setDocuments] = useState<DocumentRecord[]>([]);
-  const [deletedDocuments, setDeletedDocuments] = useState<DocumentRecord[]>([]);
+  const [numberRequests, setNumberRequests] = useState<NumberRequest[]>(
+    initialCachedBoot?.numberRequests || []
+  );
+  const [documentTypes, setDocumentTypes] = useState<DocumentTypeConfig[]>(
+    initialCachedBoot?.documentTypes || []
+  );
+  const [signers, setSigners] = useState<SignerConfig[]>(initialCachedBoot?.signers || []);
+  const [documents, setDocuments] = useState<DocumentRecord[]>(initialCachedBoot?.documents || []);
+  const [deletedDocuments, setDeletedDocuments] = useState<DocumentRecord[]>(
+    initialCachedBoot?.deletedDocuments || []
+  );
   const [loadingData, setLoadingData] = useState<boolean>(false);
-  const [settingsLoaded, setSettingsLoaded] = useState<boolean>(false);
-  const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
+  const [settingsLoaded, setSettingsLoaded] = useState<boolean>(Boolean(initialCachedBoot));
+  const [lastSyncAt, setLastSyncAt] = useState<Date | null>(
+    initialCachedBoot ? new Date(initialCachedBoot.cachedAt) : null
+  );
   const [syncError, setSyncError] = useState<string | null>(null);
-  const [persistenceStatus, setPersistenceStatus] = useState<PersistenceStatus | null>(null);
-  const [legacyReconciliationWarnings, setLegacyReconciliationWarnings] = useState<string[]>([]);
+  const [persistenceStatus, setPersistenceStatus] = useState<PersistenceStatus | null>(
+    initialCachedBoot?.persistenceStatus || null
+  );
+  const [legacyReconciliationWarnings, setLegacyReconciliationWarnings] = useState<string[]>(
+    initialCachedBoot?.legacyReconciliationWarnings || []
+  );
   const [requestedSettingsTab, setRequestedSettingsTab] = useState<SettingsSubTab | null>(null);
   const syncInFlightRef = React.useRef<boolean>(false);
   const lastSyncMsRef = React.useRef<number>(0);
@@ -156,25 +236,104 @@ export default function App() {
     }
   }, []);
 
-  // 1. Initial Auth Check
+  // 1. Single-Roundtrip Initial Auth + Bootstrap (cắt giảm 50% độ trễ khởi động, giữ dự phòng cho Admin khi Redis chưa cấu hình)
   useEffect(() => {
-    const checkAuth = async () => {
+    let cancelled = false;
+    const initApp = async () => {
+      syncInFlightRef.current = true;
+      setLoadingData(true);
       try {
-        const res = await api.getCurrentUser();
-        setCurrentUser(res.user);
-      } catch {
-        clearAuth();
-        setCurrentUser(null);
+        const boot = await api.getBootstrap();
+        if (cancelled) return;
+
+        if (!boot.user.isActive) {
+          clearAuth();
+          clearBootstrapCache();
+          setCurrentUser(null);
+          setSettingsLoaded(false);
+          return;
+        }
+
+        skipNextAutoLoadForUserRef.current = boot.user.id;
+        updateStoredUser(boot.user);
+        setCurrentUser(boot.user);
+        setSettings(boot.settings);
+        setDocumentTypes(boot.documentTypes);
+        setSigners(boot.signers);
+        setDocuments(boot.documents);
+        setDeletedDocuments(boot.deletedDocuments || []);
+        setBooks(boot.books);
+        setNumberRequests(boot.numberRequests || []);
+        if (boot.persistenceStatus) {
+          setPersistenceStatus(boot.persistenceStatus);
+        }
+        setLegacyReconciliationWarnings(boot.legacyReconciliationWarnings || []);
+        if (typeof boot.sseSupported === 'boolean') {
+          setSseSupported(boot.sseSupported);
+        }
+        applyServerTime(boot.serverTimeVietnam);
+        setSettingsLoaded(true);
+        setSyncError(null);
+        lastSyncMsRef.current = Date.now();
+        setLastSyncAt(new Date());
+        writeBootstrapCache({
+          userId: boot.user.id,
+          user: boot.user,
+          settings: boot.settings,
+          documentTypes: boot.documentTypes,
+          signers: boot.signers,
+          books: boot.books,
+          documents: boot.documents,
+          deletedDocuments: boot.deletedDocuments || [],
+          numberRequests: boot.numberRequests || [],
+          serverTimeVietnam: boot.serverTimeVietnam,
+          persistenceStatus: boot.persistenceStatus,
+          legacyReconciliationWarnings: boot.legacyReconciliationWarnings || [],
+          sseSupported: boot.sseSupported,
+        });
+      } catch (err: any) {
+        if (cancelled) return;
+        if (err?.status === 401) {
+          clearAuth();
+          clearBootstrapCache();
+          setCurrentUser(null);
+          setSettingsLoaded(false);
+        } else {
+          // Trường hợp Redis chưa cấu hình (503) hoặc tạm lỗi: vẫn xác thực Admin qua /api/auth/me để vào Cài đặt xử lý
+          if (err?.persistenceStatus) {
+            setPersistenceStatus(err.persistenceStatus);
+          }
+          if (err?.message) {
+            setSyncError(err.message);
+          }
+          try {
+            const me = await api.getCurrentUser();
+            if (cancelled) return;
+            skipNextAutoLoadForUserRef.current = me.user.id;
+            setCurrentUser(me.user);
+          } catch {
+            if (cancelled) return;
+            clearAuth();
+            clearBootstrapCache();
+            setCurrentUser(null);
+          }
+        }
       } finally {
-        setAuthChecking(false);
+        if (!cancelled) {
+          syncInFlightRef.current = false;
+          setLoadingData(false);
+          setAuthChecking(false);
+        }
       }
     };
 
-    checkAuth();
+    void initApp();
 
     const handleExpired = () => {
+      clearBootstrapCache();
       setCurrentUser(null);
       setSettingsLoaded(false);
+      setSseSupported(null);
       setPersistenceStatus(null);
       setLegacyReconciliationWarnings([]);
       setBooks([]);
@@ -186,8 +345,11 @@ export default function App() {
       activeClientUploadsRef.current.clear();
     };
     window.addEventListener('auth_expired', handleExpired);
-    return () => window.removeEventListener('auth_expired', handleExpired);
-  }, []);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('auth_expired', handleExpired);
+    };
+  }, [applyServerTime]);
 
   // Load & persist recentIssueTasks per user in sessionStorage
   useEffect(() => {
@@ -389,12 +551,30 @@ export default function App() {
           setPersistenceStatus(boot.persistenceStatus);
         }
         setLegacyReconciliationWarnings(boot.legacyReconciliationWarnings || []);
+        if (typeof boot.sseSupported === 'boolean') {
+          setSseSupported(boot.sseSupported);
+        }
         applyServerTime(boot.serverTimeVietnam);
 
         setSettingsLoaded(true);
         setSyncError(null);
         lastSyncMsRef.current = Date.now();
         setLastSyncAt(new Date());
+        writeBootstrapCache({
+          userId: boot.user.id,
+          user: boot.user,
+          settings: boot.settings,
+          documentTypes: boot.documentTypes,
+          signers: boot.signers,
+          books: boot.books,
+          documents: boot.documents,
+          deletedDocuments: boot.deletedDocuments || [],
+          numberRequests: boot.numberRequests || [],
+          serverTimeVietnam: boot.serverTimeVietnam,
+          persistenceStatus: boot.persistenceStatus,
+          legacyReconciliationWarnings: boot.legacyReconciliationWarnings || [],
+          sseSupported: boot.sseSupported,
+        });
       } catch (err: any) {
         console.error('Lỗi khi tải dữ liệu ứng dụng:', err);
         if (err?.persistenceStatus) {
@@ -416,9 +596,12 @@ export default function App() {
   }, [loadAppData]);
 
   useEffect(() => {
-    if (currentUser?.id) {
-      void loadAppData({ force: true });
+    if (!currentUser?.id) return;
+    if (skipNextAutoLoadForUserRef.current === currentUser.id) {
+      skipNextAutoLoadForUserRef.current = null;
+      return;
     }
+    void loadAppData({ force: true });
   }, [currentUser?.id, loadAppData]);
 
   // Tự động nạp dữ liệu mới nhất khi mở Sổ theo dõi / Thống kê / Cài đặt (có cooldown 20s; SSE cập nhật tức thời)
@@ -429,17 +612,18 @@ export default function App() {
     }
   }, [activeTab, currentUser?.id, settingsLoaded, loadAppData]);
 
-  // 3. Server-Sent Events (SSE) for Real-Time Multi-Device Updates (Authenticated + Exponential Backoff)
+  // 3. Server-Sent Events (SSE) chỉ bật khi máy chủ hỗ trợ kết nối dài (tắt tự động trên Vercel Serverless để tránh treo 60s)
   useEffect(() => {
     if (!currentUser) return;
 
     let eventSource: EventSource | null = null;
     let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
     let isClosed = false;
+    let sseDisabledByServer = sseSupported === false;
     let retryDelayMs = 3000;
 
     const connectSSE = () => {
-      if (isClosed) return;
+      if (isClosed || sseDisabledByServer || sseSupported !== true) return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
       if (eventSource) {
         try {
@@ -455,6 +639,15 @@ export default function App() {
         ? `${baseEventsUrl}${baseEventsUrl.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`
         : baseEventsUrl;
       eventSource = new EventSource(eventsUrl, { withCredentials: true });
+
+      eventSource.addEventListener('serverless_mode', () => {
+        sseDisabledByServer = true;
+        setSseSupported(false);
+        if (eventSource) {
+          eventSource.close();
+          eventSource = null;
+        }
+      });
 
       eventSource.addEventListener('connected', () => {
         retryDelayMs = 3000;
@@ -631,7 +824,7 @@ export default function App() {
           eventSource.close();
           eventSource = null;
         }
-        if (isClosed) return;
+        if (isClosed || sseDisabledByServer) return;
         if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
         if (reconnectTimeout) clearTimeout(reconnectTimeout);
         const delay = retryDelayMs;
@@ -640,15 +833,18 @@ export default function App() {
       };
     };
 
-    connectSSE();
+    if (sseSupported === true) {
+      connectSSE();
+    }
 
-    // Kiểm tra lại định kỳ mỗi 60 giây khi tab đang mở + khi quay lại tab hoặc có mạng trở lại
+    // Kiểm tra lại định kỳ (45s trên Vercel Serverless, 60s khi có SSE) + khi quay lại tab hoặc có mạng trở lại
     const syncLiveState = () => {
       if (document.visibilityState !== 'visible') return;
       void loadAppData();
     };
 
-    const pollInterval = setInterval(syncLiveState, 60000);
+    const pollIntervalMs = sseSupported === false ? 45000 : 60000;
+    const pollInterval = setInterval(syncLiveState, pollIntervalMs);
     const midnightCheckInterval = setInterval(() => {
       if (document.visibilityState !== 'visible') return;
       const clientVn = getClientVietnamTimeFallback();
@@ -662,7 +858,7 @@ export default function App() {
     };
     const handleOnline = () => {
       retryDelayMs = 3000;
-      if (!eventSource && !isClosed) {
+      if (!eventSource && !isClosed && !sseDisabledByServer && sseSupported === true) {
         connectSSE();
       }
       void loadAppData({ force: true });
@@ -681,7 +877,7 @@ export default function App() {
       window.removeEventListener('online', handleOnline);
       document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
     };
-  }, [currentUser?.id, loadAppData, refreshBooks, refreshRequests, applyServerTime, showToast, mergeMonotoneDocument, syncIssueTasksWithDocs]);
+  }, [currentUser?.id, sseSupported, loadAppData, refreshBooks, refreshRequests, applyServerTime, showToast, mergeMonotoneDocument, syncIssueTasksWithDocs]);
 
   const accessibleBooks = useMemo(
     () => getAccessibleBooks(currentUser, books),
@@ -777,8 +973,10 @@ export default function App() {
   // Handlers
   const handleLogout = async () => {
     await api.logout();
+    clearBootstrapCache();
     setCurrentUser(null);
     setSettingsLoaded(false);
+    setSseSupported(null);
     setLastSyncAt(null);
     setSyncError(null);
     setPersistenceStatus(null);
