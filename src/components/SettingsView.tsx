@@ -3536,7 +3536,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </h3>
               <ol className="list-decimal pl-5 space-y-1.5 text-slate-700">
                 <li>Mở Google Trang tính &rarr; Tiện ích mở rộng &rarr; Apps Script.</li>
-                <li>Dán đoạn mã bên dưới, bấm Lưu và Triển khai dạng Ứng dụng web (Execute as: Tôi, Access: Bất kỳ ai).</li>
+                <li>Dán đoạn mã bên dưới, bấm Lưu và Triển khai (hoặc Quản lý mục triển khai &rarr; Phiên bản mới) dạng Ứng dụng web (Execute as: Tôi, Access: Bất kỳ ai).</li>
+                <li>Bấm <strong>Kiểm tra kết nối</strong> để tự động chuẩn hóa bảng tính về 1 cột <strong>STT (1, 2, 3...)</strong>, bỏ cột <em>Số thứ tự</em> thừa, xóa dòng <code>00-TEST</code> cũ và chuẩn hóa ngày <code>dd/MM/yyyy</code>.</li>
               </ol>
 
               <div className="rounded-lg overflow-hidden border border-slate-800 bg-slate-900 min-w-0">

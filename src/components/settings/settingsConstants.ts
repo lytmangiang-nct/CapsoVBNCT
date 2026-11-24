@@ -176,7 +176,34 @@ export const PERMISSION_PRESETS: Array<{ label: string; perms: BookPermission[] 
   { label: 'Bỏ hết', perms: [] },
 ];
 
-export const GOOGLE_APPS_SCRIPT_TEMPLATE = `function getOrCreateSheetWithHeaders(ss, name, headers, headerBg) {
+export const GOOGLE_APPS_SCRIPT_TEMPLATE = `function parseDdMmYyyyToDate(val) {
+  if (val instanceof Date) return val;
+  var str = (val === null || val === undefined ? "" : String(val)).trim();
+  if (!str) return "";
+  var m = str.match(/^(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})$/);
+  if (!m) return str;
+  var day = parseInt(m[1], 10);
+  var month = parseInt(m[2], 10);
+  var year = parseInt(m[3], 10);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return str;
+  var dt = new Date(year, month - 1, day);
+  if (dt.getFullYear() !== year || dt.getMonth() !== month - 1 || dt.getDate() !== day) {
+    return str;
+  }
+  return dt;
+}
+
+function resolveCategoryLabel(data) {
+  if (data && data.categoryLabel && String(data.categoryLabel).trim()) {
+    return String(data.categoryLabel).trim();
+  }
+  var raw = (data && data.docCategory ? String(data.docCategory) : "").trim().toLowerCase();
+  if (raw === "incoming" || raw === "văn bản đến") return "Văn bản đến";
+  if (raw === "outgoing" || raw === "văn bản đi") return "Văn bản đi";
+  return raw ? String(data.docCategory).trim() : "Văn bản đi";
+}
+
+function getOrCreateSheetWithHeaders(ss, name, headers, headerBg) {
   var sheet = ss.getSheetByName(name);
   if (!sheet) {
     sheet = ss.insertSheet(name);
@@ -187,6 +214,18 @@ export const GOOGLE_APPS_SCRIPT_TEMPLATE = `function getOrCreateSheetWithHeaders
     headerRange.setBackground(headerBg || "#005BAA");
     headerRange.setFontColor("#FFFFFF");
     headerRange.setFontWeight("bold");
+    return sheet;
+  }
+
+  // Tự động chuẩn hóa sheet cũ: gộp bỏ cột thừa "Số thứ tự" khi đã có cột "STT"
+  var lastCol = sheet.getLastColumn();
+  if (lastCol > 0) {
+    var existingHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+    var sttIdx = existingHeaders.indexOf("STT");
+    var dupSeqIdx = existingHeaders.indexOf("Số thứ tự");
+    if (sttIdx !== -1 && dupSeqIdx !== -1) {
+      sheet.deleteColumn(dupSeqIdx + 1);
+    }
   }
   return sheet;
 }
@@ -203,6 +242,98 @@ function findRowBySystemId(sheet, docId, fallbackIdx) {
     }
   }
   return -1;
+}
+
+function removeStaleTestRows(sheet) {
+  var rows = sheet.getDataRange().getValues();
+  if (!rows || rows.length <= 1) return;
+  var headerRow = rows[0] || [];
+  var idColIdx = headerRow.indexOf("Mã hệ thống");
+  if (idColIdx === -1) idColIdx = 18;
+  var numColIdx = headerRow.indexOf("Số/Ký hiệu");
+  if (numColIdx === -1) numColIdx = 6;
+  for (var i = rows.length - 1; i >= 1; i--) {
+    var sysId = String(rows[i][idColIdx] || "").trim();
+    var docNo = String(rows[i][numColIdx] || "").trim();
+    if (sysId.indexOf("test-sample-") === 0 || docNo.indexOf("00-TEST/") === 0) {
+      sheet.deleteRow(i + 1);
+    }
+  }
+}
+
+function renumberSttColumn(sheet) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+  var count = lastRow - 1;
+  var sttValues = [];
+  for (var i = 0; i < count; i++) {
+    sttValues.push([i + 1]);
+  }
+  var sttRange = sheet.getRange(2, 1, count, 1);
+  sttRange.setValues(sttValues);
+  sttRange.setNumberFormat("0");
+}
+
+function normalizeExistingSheetRows(sheet) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+  var count = lastRow - 1;
+  var headerRow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var issueCol = headerRow.indexOf("Ngày ban hành") + 1;
+  var signCol = headerRow.indexOf("Ngày ký") + 1;
+  var catCol = headerRow.indexOf("Nhóm VB") + 1;
+
+  if (issueCol > 0) {
+    var issueRange = sheet.getRange(2, issueCol, count, 1);
+    var issueVals = issueRange.getValues();
+    var issueChanged = false;
+    for (var i = 0; i < issueVals.length; i++) {
+      var parsed = parseDdMmYyyyToDate(issueVals[i][0]);
+      if (parsed instanceof Date && !(issueVals[i][0] instanceof Date)) {
+        issueVals[i][0] = parsed;
+        issueChanged = true;
+      }
+    }
+    if (issueChanged) issueRange.setValues(issueVals);
+    issueRange.setNumberFormat("dd/MM/yyyy");
+  }
+
+  if (signCol > 0) {
+    var signRange = sheet.getRange(2, signCol, count, 1);
+    var signVals = signRange.getValues();
+    var signChanged = false;
+    for (var j = 0; j < signVals.length; j++) {
+      var parsedSign = parseDdMmYyyyToDate(signVals[j][0]);
+      if (parsedSign instanceof Date && !(signVals[j][0] instanceof Date)) {
+        signVals[j][0] = parsedSign;
+        signChanged = true;
+      }
+    }
+    if (signChanged) signRange.setValues(signVals);
+    signRange.setNumberFormat("dd/MM/yyyy");
+  }
+
+  if (catCol > 0) {
+    var catRange = sheet.getRange(2, catCol, count, 1);
+    var catVals = catRange.getValues();
+    var catChanged = false;
+    for (var k = 0; k < catVals.length; k++) {
+      var rawCat = String(catVals[k][0] || "").trim().toLowerCase();
+      if (rawCat === "incoming") {
+        catVals[k][0] = "Văn bản đến";
+        catChanged = true;
+      } else if (rawCat === "outgoing") {
+        catVals[k][0] = "Văn bản đi";
+        catChanged = true;
+      }
+    }
+    if (catChanged) catRange.setValues(catVals);
+  }
+}
+
+function formatDateCellsInRow(sheet, rowIndex) {
+  if (rowIndex <= 1) return;
+  sheet.getRange(rowIndex, 3, 1, 2).setNumberFormat("dd/MM/yyyy");
 }
 
 function verifyOptionalSheetsApiToken(data) {
@@ -242,9 +373,10 @@ function doPost(e) {
     }
     var deletedSheetName = (data.deletedSheetName || "VB đã xóa").toString().trim();
 
+    // Thống nhất DUY NHẤT 1 cột STT (1, 2, 3...) - đã bỏ cột "Số thứ tự" trùng lặp
     var MAIN_HEADERS = [
       "STT", "Năm", "Ngày ban hành", "Ngày ký", "Nhóm VB", "Loại văn bản",
-      "Số thứ tự", "Số/Ký hiệu", "Tên văn bản", "Trích yếu/Nội dung",
+      "Số/Ký hiệu", "Tên văn bản", "Trích yếu/Nội dung",
       "Người ký", "Chức vụ", "Người thao tác", "Trạng thái hồ sơ",
       "Trạng thái tệp Drive", "Tên tệp Drive", "ID tệp Drive", "Liên kết Drive",
       "Ghi chú", "Mã hệ thống", "Mã sổ", "Sổ", "Thời điểm cập nhật"
@@ -252,7 +384,7 @@ function doPost(e) {
 
     var DELETED_HEADERS = [
       "STT", "Năm", "Ngày ban hành", "Ngày ký", "Nhóm VB", "Loại văn bản",
-      "Số thứ tự", "Số/Ký hiệu", "Tên văn bản", "Trích yếu/Nội dung",
+      "Số/Ký hiệu", "Tên văn bản", "Trích yếu/Nội dung",
       "Người ký", "Chức vụ", "Người thao tác", "Trạng thái hồ sơ",
       "Trạng thái tệp Drive", "Tên tệp Drive", "ID tệp Drive", "Liên kết Drive",
       "Ghi chú", "Mã hệ thống", "Mã sổ", "Sổ",
@@ -262,29 +394,37 @@ function doPost(e) {
     var docNameVal = data.docName || data.title || "";
     var titleVal = data.title || "";
     var bookNameVal = data.bookName || sheetName;
+    var categoryLabelVal = resolveCategoryLabel(data);
+    var driveStatusVal = data.driveStatusLabel || data.driveStatus || "Không đính kèm";
+    var issueDateVal = parseDdMmYyyyToDate(data.issueDate || "");
+    var signDateVal = parseDdMmYyyyToDate(data.signDate || "");
     var nowStr = new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" });
     var action = (data.action || "update").toString().trim();
 
     // Bước 1 xóa: Tạo/lấy sheet "VB đã xóa" và ghi dòng theo Mã hệ thống (không trùng lặp), giữ liên kết Drive
     if (action === "delete_append_to_deleted" || action === "delete") {
       var delSheet = getOrCreateSheetWithHeaders(ss, deletedSheetName, DELETED_HEADERS, "#991B1B");
+      var existingDelRow = findRowBySystemId(delSheet, data.id, 18);
+      var delStt = existingDelRow > 0 ? existingDelRow - 1 : Math.max(1, delSheet.getLastRow());
       var delRowValues = [
-        data.stt, data.year, data.issueDate || "", data.signDate || "",
-        data.docCategory || "Văn bản đi", data.typeName || "", data.sequenceNumber,
+        delStt, data.year, issueDateVal, signDateVal,
+        categoryLabelVal, data.typeName || "",
         data.fullDocNumber || "", docNameVal, titleVal,
         data.signer || "", data.signerRole || "", data.issuedBy || "",
-        "Đã xóa", data.driveStatus || "Không đính kèm",
+        "Đã xóa", driveStatusVal,
         data.driveFileName || "", data.driveFileId || "", data.driveFileUrl || "",
         data.notes || "", data.id, sheetName, bookNameVal,
         data.deletedBy || "", data.deletedAtVietnam || nowStr, data.deleteReason || "", nowStr
       ];
-      var existingDelRow = findRowBySystemId(delSheet, data.id, 19);
       if (existingDelRow > 0) {
         delSheet.getRange(existingDelRow, 1, 1, delRowValues.length).setValues([delRowValues]);
+        formatDateCellsInRow(delSheet, existingDelRow);
       } else {
         delSheet.appendRow(delRowValues);
+        formatDateCellsInRow(delSheet, delSheet.getLastRow());
       }
-      var confirmedDelRow = findRowBySystemId(delSheet, data.id, 19);
+      renumberSttColumn(delSheet);
+      var confirmedDelRow = findRowBySystemId(delSheet, data.id, 18);
       if (confirmedDelRow <= 0) {
         throw new Error("Không xác nhận được dòng đã ghi trong sheet " + deletedSheetName);
       }
@@ -298,7 +438,7 @@ function doPost(e) {
     // Bước 2 xóa: Chỉ xóa dòng khỏi sheet chính sau khi đã xác nhận có trong sheet "VB đã xóa"
     if (action === "delete_remove_main" || action === "delete") {
       var verifyDelSheet = ss.getSheetByName(deletedSheetName);
-      var verifiedRow = verifyDelSheet ? findRowBySystemId(verifyDelSheet, data.id, 19) : -1;
+      var verifiedRow = verifyDelSheet ? findRowBySystemId(verifyDelSheet, data.id, 18) : -1;
       if (verifiedRow <= 0) {
         return ContentService.createTextOutput(JSON.stringify({
           result: "error", error: "Chưa tìm thấy hồ sơ trong " + deletedSheetName + ", không xóa khỏi sheet chính."
@@ -306,9 +446,10 @@ function doPost(e) {
       }
       var mainSheetForDelete = ss.getSheetByName(sheetName);
       if (mainSheetForDelete) {
-        var rowToRemove = findRowBySystemId(mainSheetForDelete, data.id, 19);
+        var rowToRemove = findRowBySystemId(mainSheetForDelete, data.id, 18);
         if (rowToRemove > 0) {
           mainSheetForDelete.deleteRow(rowToRemove);
+          renumberSttColumn(mainSheetForDelete);
         }
       }
       return ContentService.createTextOutput(JSON.stringify({
@@ -320,43 +461,45 @@ function doPost(e) {
     if (action === "restore") {
       var delSheetForRestore = ss.getSheetByName(deletedSheetName);
       if (delSheetForRestore) {
-        var delRowIdx = findRowBySystemId(delSheetForRestore, data.id, 19);
+        var delRowIdx = findRowBySystemId(delSheetForRestore, data.id, 18);
         if (delRowIdx > 0) {
           delSheetForRestore.deleteRow(delRowIdx);
+          renumberSttColumn(delSheetForRestore);
         }
       }
     }
 
     var sheet = getOrCreateSheetWithHeaders(ss, sheetName, MAIN_HEADERS, "#005BAA");
 
-    // Thao tác kiểm tra kết nối theo đúng tab của sổ
+    // Kiểm tra kết nối: tự động chuẩn hóa cột, dọn dòng 00-TEST cũ, đánh lại STT 1..N (không thêm dòng rác)
     if (action === "test") {
-      sheet.appendRow([
-        0, data.year, data.issueDate, data.signDate || "", data.docCategory || "Văn bản đi",
-        data.typeName, 0, data.fullDocNumber, docNameVal, titleVal,
-        data.signer, data.signerRole, data.issuedBy, data.status,
-        data.driveStatus || "Không đính kèm", data.driveFileName || "", data.driveFileId || "",
-        data.driveFileUrl || "", data.notes || "", data.id, sheetName, bookNameVal, nowStr
-      ]);
-      return ContentService.createTextOutput(JSON.stringify({result: "success", action: "test", tab: sheetName}))
-        .setMimeType(ContentService.MimeType.JSON);
+      removeStaleTestRows(sheet);
+      normalizeExistingSheetRows(sheet);
+      renumberSttColumn(sheet);
+      return ContentService.createTextOutput(JSON.stringify({
+        result: "success", action: "test", tab: sheetName, normalized: true
+      })).setMimeType(ContentService.MimeType.JSON);
     }
 
-    var foundRowIndex = findRowBySystemId(sheet, data.id, 19);
+    var foundRowIndex = findRowBySystemId(sheet, data.id, 18);
+    var nextStt = foundRowIndex > 0 ? foundRowIndex - 1 : Math.max(1, sheet.getLastRow());
     var rowValues = [
-      data.stt, data.year, data.issueDate, data.signDate || "",
-      data.docCategory || "Văn bản đi", data.typeName, data.sequenceNumber,
-      data.fullDocNumber, docNameVal, titleVal, data.signer, data.signerRole,
-      data.issuedBy, data.status, data.driveStatus || "Không đính kèm",
+      nextStt, data.year, issueDateVal, signDateVal,
+      categoryLabelVal, data.typeName || "",
+      data.fullDocNumber || "", docNameVal, titleVal, data.signer || "", data.signerRole || "",
+      data.issuedBy || "", data.status || "", driveStatusVal,
       data.driveFileName || "", data.driveFileId || "", data.driveFileUrl || "",
       data.notes || "", data.id, sheetName, bookNameVal, nowStr
     ];
 
     if (foundRowIndex > 0) {
       sheet.getRange(foundRowIndex, 1, 1, rowValues.length).setValues([rowValues]);
+      formatDateCellsInRow(sheet, foundRowIndex);
     } else {
       sheet.appendRow(rowValues);
+      formatDateCellsInRow(sheet, sheet.getLastRow());
     }
+    renumberSttColumn(sheet);
 
     return ContentService.createTextOutput(JSON.stringify({result: "success", tab: sheetName}))
       .setMimeType(ContentService.MimeType.JSON);

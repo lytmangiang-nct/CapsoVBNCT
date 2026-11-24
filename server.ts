@@ -11246,7 +11246,7 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
       pageSetup: { orientation: 'landscape', paperSize: 9 },
     });
 
-    worksheet.mergeCells('A1:R1');
+    worksheet.mergeCells('A1:Q1');
     const titleCell = worksheet.getCell('A1');
     titleCell.value = selectedBookObj
       ? `${selectedBookObj.name.toUpperCase()} (${yearLabel})`
@@ -11255,7 +11255,7 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
     titleCell.alignment = { vertical: 'middle', horizontal: 'center' };
     worksheet.getRow(1).height = 30;
 
-    worksheet.mergeCells('A2:R2');
+    worksheet.mergeCells('A2:Q2');
     const subCell = worksheet.getCell('A2');
     subCell.value = `Thời điểm xuất sổ: ${formatVietnamDateTime()} | Văn bản hiệu lực/hủy: ${docs.length} | VB đã xóa: ${deletedDocs.length}`;
     subCell.font = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF555555' } };
@@ -11271,7 +11271,6 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
       { key: 'signDate', width: 16 },
       { key: 'receivedDate', width: 16 },
       { key: 'typeName', width: 20 },
-      { key: 'sequenceNumber', width: 12 },
       { key: 'fullDocNumber', width: 24 },
       { key: 'docName', width: 35 },
       { key: 'title', width: 40 },
@@ -11292,7 +11291,6 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
       'Ngày ký',
       'Ngày tiếp nhận / Cấp',
       'Loại văn bản',
-      'Số thứ tự',
       'Số/Ký hiệu văn bản',
       'Tên văn bản',
       'Trích yếu/Nội dung',
@@ -11370,7 +11368,6 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
         signDate: cleanSignDate,
         receivedDate: cleanReceivedDate,
         typeName: doc.typeName,
-        sequenceNumber: doc.docCategory === 'incoming' ? 'VB đến' : doc.sequenceNumber,
         fullDocNumber: doc.fullDocNumber,
         docName: doc.docName || doc.title,
         title: doc.title || '',
@@ -11385,7 +11382,7 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
       row.height = 24;
 
       if (doc.driveStatus === 'saved' && doc.driveFileUrl) {
-        const driveCell = row.getCell(18);
+        const driveCell = row.getCell(17);
         driveCell.value = {
           text: doc.driveFileName || 'Mở tệp',
           hyperlink: doc.driveFileUrl,
@@ -11401,23 +11398,23 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
           right: { style: 'thin', color: { argb: 'FFE0E0E0' } },
         };
 
-        if ([1, 2, 4, 5, 6, 7, 9].includes(colNumber)) {
+        if ([1, 2, 4, 5, 6, 7].includes(colNumber)) {
           cell.numFmt = '@';
           cell.alignment = { vertical: 'middle', horizontal: 'center' };
-        } else if (colNumber === 10) {
+        } else if (colNumber === 9) {
           cell.numFmt = '@';
           cell.alignment = { vertical: 'middle', horizontal: 'center' };
           cell.font = { name: 'Arial', size: 10, bold: true };
-        } else if (colNumber === 11 || colNumber === 12) {
+        } else if (colNumber === 10 || colNumber === 11) {
           cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
-        } else if (colNumber === 16) {
+        } else if (colNumber === 15) {
           cell.alignment = { vertical: 'middle', horizontal: 'center' };
           if (doc.status === 'cancelled') {
             cell.font = { name: 'Arial', size: 9, italic: true, color: { argb: 'FFDC2626' } };
           } else {
             cell.font = { name: 'Arial', size: 10, color: { argb: 'FF16A34A' } };
           }
-        } else if (colNumber === 18) {
+        } else if (colNumber === 17) {
           cell.alignment = { vertical: 'middle', horizontal: 'left' };
           if (doc.driveStatus === 'saved' && doc.driveFileUrl) {
             cell.font = { name: 'Arial', size: 10, underline: true, color: { argb: 'FF0369A1' } };
@@ -11432,7 +11429,7 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
       });
     });
 
-    worksheet.autoFilter = `A3:R${docs.length + 3}`;
+    worksheet.autoFilter = `A3:Q${docs.length + 3}`;
 
     // Sheet thứ 2: "VB đã xóa" (chứa đầy đủ thông tin + Sổ, Người xóa, Thời điểm xóa, Lý do xóa & liên kết Drive)
     const deletedSheet = workbook.addWorksheet('VB đã xóa', {
@@ -11440,7 +11437,7 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
       pageSetup: { orientation: 'landscape', paperSize: 9 },
     });
 
-    deletedSheet.mergeCells('A1:S1');
+    deletedSheet.mergeCells('A1:R1');
     const delTitleCell = deletedSheet.getCell('A1');
     delTitleCell.value = selectedBookObj
       ? `DANH SÁCH VĂN BẢN ĐÃ XÓA - ${selectedBookObj.name.toUpperCase()} (${yearLabel})`
@@ -11449,7 +11446,7 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
     delTitleCell.alignment = { vertical: 'middle', horizontal: 'center' };
     deletedSheet.getRow(1).height = 30;
 
-    deletedSheet.mergeCells('A2:S2');
+    deletedSheet.mergeCells('A2:R2');
     const delSubCell = deletedSheet.getCell('A2');
     delSubCell.value = `Tổng số văn bản đã xóa: ${deletedDocs.length} | Số đã cấp và tệp Google Drive được giữ nguyên để tra cứu đối chiếu`;
     delSubCell.font = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF555555' } };
@@ -11464,7 +11461,6 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
       { key: 'issueDate', width: 16 },
       { key: 'signDate', width: 16 },
       { key: 'typeName', width: 18 },
-      { key: 'sequenceNumber', width: 12 },
       { key: 'fullDocNumber', width: 24 },
       { key: 'docName', width: 34 },
       { key: 'title', width: 36 },
@@ -11486,7 +11482,6 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
       'Ngày ban hành',
       'Ngày ký',
       'Loại văn bản',
-      'Số thứ tự',
       'Số/Ký hiệu văn bản',
       'Tên văn bản',
       'Trích yếu/Nội dung',
@@ -11543,7 +11538,6 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
         issueDate: cleanIssueDate,
         signDate: cleanSignDate,
         typeName: doc.typeName,
-        sequenceNumber: doc.docCategory === 'incoming' ? 'VB đến' : doc.sequenceNumber,
         fullDocNumber: doc.fullDocNumber,
         docName: doc.docName || doc.title,
         title: doc.title || '',
@@ -11560,7 +11554,7 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
       delRow.height = 24;
 
       if (doc.driveStatus === 'saved' && doc.driveFileUrl) {
-        const driveCell = delRow.getCell(19);
+        const driveCell = delRow.getCell(18);
         driveCell.value = {
           text: doc.driveFileName || 'Mở tệp',
           hyperlink: doc.driveFileUrl,
@@ -11576,16 +11570,16 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
           right: { style: 'thin', color: { argb: 'FFE0E0E0' } },
         };
 
-        if ([1, 2, 4, 5, 6, 8, 16].includes(colNumber)) {
+        if ([1, 2, 4, 5, 6, 15].includes(colNumber)) {
           cell.numFmt = '@';
           cell.alignment = { vertical: 'middle', horizontal: 'center' };
-        } else if (colNumber === 9) {
+        } else if (colNumber === 8) {
           cell.numFmt = '@';
           cell.alignment = { vertical: 'middle', horizontal: 'center' };
           cell.font = { name: 'Arial', size: 10, bold: true };
-        } else if (colNumber === 10 || colNumber === 11 || colNumber === 17) {
+        } else if (colNumber === 9 || colNumber === 10 || colNumber === 16) {
           cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
-        } else if (colNumber === 19) {
+        } else if (colNumber === 18) {
           cell.alignment = { vertical: 'middle', horizontal: 'left' };
           if (doc.driveStatus === 'saved' && doc.driveFileUrl) {
             cell.font = { name: 'Arial', size: 10, underline: true, color: { argb: 'FF0369A1' } };
@@ -11598,7 +11592,7 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
       });
     });
 
-    deletedSheet.autoFilter = `A3:S${deletedDocs.length + 3}`;
+    deletedSheet.autoFilter = `A3:R${deletedDocs.length + 3}`;
 
     const buffer = await workbook.xlsx.writeBuffer();
     const fileName = `SO_VAN_BAN_${
@@ -11729,7 +11723,9 @@ app.post('/api/sync/google-sheets/sync-all', requireAuth, requireAdmin, async (r
     const filteredDocs = targetBook
       ? db.documents.filter((d) => getDocBookId(d) === targetBook.id)
       : db.documents;
-    const sortedDocs = [...filteredDocs].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+    const sortedDocs = [...filteredDocs].sort(
+      (a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
+    );
     let successCount = 0;
 
     for (const doc of sortedDocs) {
