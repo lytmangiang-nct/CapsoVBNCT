@@ -2885,19 +2885,6 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                           Chờ xác nhận ngày
                         </span>
                       )}
-                      {!isCancelled && !pendingDate && doc.needsReview && (
-                        <span
-                          className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.pending.badge}`}
-                          title={(doc.reviewReasons || []).join(' · ')}
-                        >
-                          Cần kiểm tra
-                        </span>
-                      )}
-                      {!isCancelled && !pendingDate && !doc.needsReview && isIncoming && (
-                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded border border-slate-200 bg-slate-50 text-slate-600">
-                          Đã xác minh
-                        </span>
-                      )}
                     </div>
                   </div>
 
@@ -3232,7 +3219,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                                 )}
                               </div>
 
-                              {/* B. Trạng thái xác minh thông tin / hiệu lực hồ sơ (tách biệt hoàn toàn khỏi lưu trữ) */}
+                              {/* B. Trạng thái hiệu lực hồ sơ (tinh gọn) */}
                               {isCancelled ? (
                                 <span
                                   className={`inline-block text-[10px] font-semibold px-2 py-0.5 rounded border whitespace-nowrap ${SEMANTIC_STATUS_STYLES.danger.badge}`}
@@ -3244,21 +3231,6 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                                   className={`inline-block text-[10px] font-semibold px-2 py-0.5 rounded border whitespace-nowrap ${SEMANTIC_STATUS_STYLES.pending.badge}`}
                                 >
                                   Chờ xác nhận ngày
-                                </span>
-                              ) : doc.needsReview ? (
-                                <span
-                                  data-testid={`review-status-${doc.id}`}
-                                  className={`inline-block text-[10px] font-semibold px-2 py-0.5 rounded border whitespace-nowrap ${SEMANTIC_STATUS_STYLES.pending.badge}`}
-                                  title={(doc.reviewReasons || []).join(' · ')}
-                                >
-                                  Cần kiểm tra
-                                </span>
-                              ) : isIncoming ? (
-                                <span
-                                  data-testid={`review-status-${doc.id}`}
-                                  className="inline-block text-[10px] font-medium px-2 py-0.5 rounded border border-slate-200 bg-slate-50 text-slate-600 whitespace-nowrap"
-                                >
-                                  Đã xác minh
                                 </span>
                               ) : null}
                             </div>
@@ -4460,8 +4432,8 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
 
                           {(detailModalDoc.driveStatus === 'uploading' ||
                             detailModalDoc.driveStatus === 'failed' ||
-                            detailModalDoc.driveStatus === 'needs_reconcile' ||
-                            detailModalDoc.driveStatus === 'saved') && (
+                            detailModalDoc.driveStatus === 'needs_reconcile') &&
+                            getNormalizedDriveStatus(detailModalDoc) !== 'saved' && (
                             <button
                               type="button"
                               disabled={verifyingDriveDocId === detailModalDoc.id}
@@ -4970,66 +4942,6 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                 );
               })()}
 
-              {/* Lịch sử thao tác */}
-              <div className="border-t border-slate-100 pt-4">
-                <div className="flex items-center gap-2 mb-3">
-                  <History className="w-4 h-4 text-sky-700" />
-                  <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wide">
-                    Lịch sử thao tác (Lưu vết bất biến)
-                  </h4>
-                </div>
-
-                <div className="space-y-2 text-xs">
-                  {detailModalDoc.auditLogs && detailModalDoc.auditLogs.length > 0 ? (
-                    detailModalDoc.auditLogs.map((log, idx) => {
-                      const actionMeta = getAuditActionMeta(log.action);
-                      return (
-                        <div key={log.id || idx} className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg space-y-1">
-                          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${actionMeta.className}`}>
-                                {actionMeta.label}
-                              </span>
-                              <span className="font-semibold text-slate-800">
-                                {log.userName}
-                                {log.username ? ` (${log.username})` : ''}
-                              </span>
-                            </div>
-                            <span className="font-mono">
-                              {log.timestampVietnam || new Date(log.timestamp).toLocaleString('vi-VN')}
-                            </span>
-                          </div>
-                          {log.reason && (
-                            <p className="text-[11px] text-slate-700">
-                              <strong>Lý do / Ghi nhận:</strong> {log.reason}
-                            </p>
-                          )}
-                          {log.changes && Object.keys(log.changes).length > 0 && (
-                            <div className="space-y-0.5 pl-2">
-                              {Object.entries(log.changes).map(([field, delta]: any, fIdx) => (
-                                <p key={fIdx} className="text-[11px] text-slate-600">
-                                  • {formatAuditFieldLabel(field)}:{' '}
-                                  {delta.old !== null && delta.old !== undefined ? (
-                                    <>
-                                      <del className="text-rose-600">{delta.old || '(trống)'}</del> →{' '}
-                                    </>
-                                  ) : null}
-                                  <ins className="text-emerald-700 no-underline font-medium">
-                                    {delta.new || '(trống)'}
-                                  </ins>
-                                </p>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })
-                  ) : (
-                    <p className="text-slate-400 italic">Không có lịch sử thao tác.</p>
-                  )}
-                </div>
-              </div>
-
               <div className="flex justify-end pt-2 border-t border-slate-100">
                 <button
                   type="button"
@@ -5316,12 +5228,9 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
         </div>
       )}
 
-      {/* MODAL 4: XÓA VĂN BẢN (CHUYỂN SANG VB ĐÃ XÓA + ĐỒNG BỘ CHUYỂN TỆP GOOGLE DRIVE) */}
+      {/* MODAL 4: XÓA VĂN BẢN */}
       {deleteModalDoc && (() => {
         const driveFileCount = countDocumentDriveFiles(deleteModalDoc);
-        const docBook = books.find((b) => b.id === getDocBookId(deleteModalDoc));
-        const docYear = getDocumentFilterYear(deleteModalDoc) || serverYear;
-        const deletedDrivePath = `${docBook?.name || deleteModalDoc.bookName || 'Đoàn trường'}/${docYear}/VB đã xóa`;
 
         return (
           <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4">
@@ -5329,7 +5238,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
               <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                 <h3 className="text-base font-bold text-rose-700 flex items-center gap-2">
                   <Trash2 className="w-5 h-5 text-rose-600 shrink-0" />
-                  <span>Xác nhận xóa văn bản</span>
+                  <span>Xóa văn bản</span>
                 </h3>
                 <button
                   type="button"
@@ -5340,65 +5249,41 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                 </button>
               </div>
 
-              <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-lg text-rose-900 text-xs leading-relaxed space-y-1.5">
-                <p>
-                  Văn bản số{' '}
-                  <strong className="font-mono text-rose-950 font-bold break-all">{deleteModalDoc.fullDocNumber}</strong>{' '}
-                  sẽ được chuyển khỏi danh sách hiệu lực sang mục <strong>VB đã xóa</strong> (và sheet <strong>VB đã xóa</strong> trong Excel).
-                </p>
-                <p className="text-[11px] text-rose-800 break-words">
-                  <strong>Tên văn bản:</strong> {deleteModalDoc.docName || deleteModalDoc.title}
-                </p>
-                {driveFileCount > 0 ? (
-                  <div className="text-[11px] text-sky-950 bg-sky-50 border border-sky-200 rounded-md px-2.5 py-2 leading-relaxed space-y-1.5">
-                    <p>
-                      <strong>Đồng bộ Google Drive:</strong> Toàn bộ <strong>{driveFileCount} tệp</strong> liên quan (gồm tệp chính, phụ lục và phiên bản cũ nếu có) sẽ được chuyển đồng bộ sang thư mục{' '}
-                      <strong className="font-mono">{deletedDrivePath}</strong>. Hệ thống chỉ đánh dấu văn bản đã xóa sau khi toàn bộ tệp được chuyển thành công.
-                    </p>
-                    {(deleteModalDoc.driveDeleteSyncStatus === 'partial' ||
-                      deleteModalDoc.driveDeleteSyncStatus === 'failed') &&
-                      Array.isArray(deleteModalDoc.driveDeleteFileResults) &&
-                      deleteModalDoc.driveDeleteFileResults.length > 0 && (
-                        <div className="bg-amber-50 border border-amber-200 rounded p-2 text-amber-950 space-y-1">
-                          <div className="font-semibold">
-                            Tiến độ chuyển tệp lần trước ({deleteModalDoc.driveDeleteSyncStatus === 'partial' ? 'Chuyển được một phần' : 'Thất bại'}):
-                          </div>
-                          <ul className="space-y-0.5 pl-3 list-disc">
-                            {deleteModalDoc.driveDeleteFileResults.map((fr) => (
-                              <li key={fr.fileId} className="break-words">
-                                <span className="font-mono">{fr.fileName || fr.fileId}</span>:{' '}
-                                {fr.status === 'moved' || fr.status === 'already_in_deleted' ? (
-                                  <span className="text-emerald-700 font-semibold">Đã nằm trong VB đã xóa (sẽ bỏ qua khi thử lại)</span>
-                                ) : fr.status === 'already_missing' ? (
-                                  <span className="text-slate-600">Không còn trên Drive</span>
-                                ) : (
-                                  <span className="text-rose-700 font-semibold">Lỗi: {fr.error || 'Chưa chuyển được'}</span>
-                                )}
-                              </li>
-                            ))}
-                          </ul>
-                          <div className="text-[10px] text-amber-800">
-                            Bấm xác nhận lại để tiếp tục chuyển các tệp còn thiếu mà không tạo bản sao trùng lặp.
-                          </div>
-                        </div>
-                      )}
-                  </div>
-                ) : (
-                  <p className="text-[11px] text-rose-800">
-                    Văn bản này hiện chưa có tệp trên Google Drive. Số đã cấp được giữ nguyên trong dãy và lịch sử xóa sẽ được ghi nhận bất biến theo tài khoản đang đăng nhập.
-                  </p>
-                )}
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-1">
+                <div className="font-mono font-bold text-rose-900 break-all">{deleteModalDoc.fullDocNumber}</div>
+                <div className="text-slate-700 break-words">{deleteModalDoc.docName || deleteModalDoc.title}</div>
+                {(deleteModalDoc.driveDeleteSyncStatus === 'partial' ||
+                  deleteModalDoc.driveDeleteSyncStatus === 'failed') &&
+                  Array.isArray(deleteModalDoc.driveDeleteFileResults) &&
+                  deleteModalDoc.driveDeleteFileResults.length > 0 && (
+                    <div className="mt-2 bg-amber-50 border border-amber-200 rounded p-2 text-[11px] text-amber-950 space-y-1">
+                      <ul className="space-y-0.5 pl-3 list-disc">
+                        {deleteModalDoc.driveDeleteFileResults.map((fr) => (
+                          <li key={fr.fileId} className="break-words">
+                            <span className="font-mono">{fr.fileName || fr.fileId}</span>:{' '}
+                            {fr.status === 'moved' || fr.status === 'already_in_deleted' ? (
+                              <span className="text-emerald-700 font-semibold">Đã chuyển</span>
+                            ) : fr.status === 'already_missing' ? (
+                              <span className="text-slate-600">Không còn trên Drive</span>
+                            ) : (
+                              <span className="text-rose-700 font-semibold">Lỗi: {fr.error || 'Chưa chuyển được'}</span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
               </div>
 
               <form onSubmit={handleConfirmDelete} className="space-y-3.5 text-xs">
                 <div className="space-y-1">
                   <label className="font-bold text-slate-800 block">
-                    Lý do xóa văn bản <span className="text-rose-600">*</span>
+                    Lý do xóa <span className="text-rose-600">*</span>
                   </label>
                   <textarea
                     value={deleteReason}
                     onChange={(e) => setDeleteReason(e.target.value)}
-                    placeholder="Nhập lý do xóa (ví dụ: Nhập trùng hồ sơ, văn bản thu hồi không ban hành...)"
+                    placeholder="Nhập lý do xóa..."
                     rows={3}
                     required
                     disabled={deleteSubmitting}
@@ -5406,17 +5291,16 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                   />
                 </div>
 
-                <label className="flex items-start gap-2.5 p-2.5 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer select-none">
+                <label className="flex items-center gap-2.5 p-2.5 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer select-none">
                   <input
                     type="checkbox"
                     checked={deleteConfirmed}
                     onChange={(e) => setDeleteConfirmed(e.target.checked)}
                     disabled={deleteSubmitting}
-                    className="mt-0.5 w-4 h-4 text-rose-700 border-slate-300 rounded focus:ring-rose-600 shrink-0"
+                    className="w-4 h-4 text-rose-700 border-slate-300 rounded focus:ring-rose-600 shrink-0"
                   />
-                  <span className="text-xs text-slate-700 leading-snug">
-                    Tôi xác nhận xóa văn bản này khỏi sổ hiệu lực, chuyển sang <strong>VB đã xóa</strong>
-                    {driveFileCount > 0 ? ' và chuyển đồng bộ tệp trên Google Drive' : ''}.
+                  <span className="text-xs font-medium text-slate-800">
+                    Xác nhận xóa văn bản này
                   </span>
                 </label>
 
@@ -5439,13 +5323,13 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                     {deleteSubmitting ? (
                       <>
                         <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        <span>{driveFileCount > 0 ? 'Đang chuyển tệp Drive & xóa...' : 'Đang xóa & đồng bộ...'}</span>
+                        <span>{driveFileCount > 0 ? 'Đang xử lý...' : 'Đang xóa...'}</span>
                       </>
                     ) : (
                       <span>
                         {deleteModalDoc.driveDeleteSyncStatus === 'partial'
-                          ? 'Tiếp tục chuyển tệp còn thiếu & xóa'
-                          : 'Xác nhận xóa văn bản'}
+                          ? 'Thử lại chuyển tệp & xóa'
+                          : 'Xác nhận xóa'}
                       </span>
                     )}
                   </button>
@@ -5456,32 +5340,15 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
         );
       })()}
 
-      {/* MODAL 4B: KHÔI PHỤC VĂN BẢN ĐÃ XÓA (ĐỒNG BỘ CHUYỂN TỆP GOOGLE DRIVE VỀ THƯ MỤC GỐC) */}
+      {/* MODAL 4B: KHÔI PHỤC VĂN BẢN ĐÃ XÓA */}
       {restoreModalDoc && (() => {
-        const driveFileCount = countDocumentDriveFiles(restoreModalDoc);
-        const docBook = books.find((b) => b.id === getDocBookId(restoreModalDoc));
-        const docYear = getDocumentFilterYear(restoreModalDoc) || serverYear;
-        const defaultRestorePath = `${docBook?.name || restoreModalDoc.bookName || 'Chưa xác định sổ'}/${docYear}/${
-          restoreModalDoc.docCategory === 'incoming' ? 'Văn bản đến' : 'Văn bản đi'
-        }`;
-        const mappedOriginalPaths = restoreModalDoc.driveOriginalFolderMap
-          ? Array.from(
-              new Set(
-                Object.values(restoreModalDoc.driveOriginalFolderMap)
-                  .map((v) => v?.folderPath)
-                  .filter(Boolean)
-              )
-            )
-          : [];
-        const targetRestorePath = mappedOriginalPaths[0] || defaultRestorePath;
-
         return (
           <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4">
             <div className="bg-white rounded-xl max-w-md w-full p-4 sm:p-6 shadow-xl space-y-4 animate-scaleUp max-h-[92dvh] overflow-y-auto">
               <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                 <h3 className="text-base font-bold text-emerald-700 flex items-center gap-2">
                   <RotateCcw className="w-5 h-5 text-emerald-600 shrink-0" />
-                  <span>Khôi phục văn bản đã xóa</span>
+                  <span>Khôi phục văn bản</span>
                 </h3>
                 <button
                   type="button"
@@ -5492,35 +5359,18 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                 </button>
               </div>
 
-              <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-lg text-emerald-950 text-xs leading-relaxed space-y-1.5">
-                <p>
-                  Khôi phục văn bản số{' '}
-                  <strong className="font-mono font-bold break-all">{restoreModalDoc.fullDocNumber}</strong> về lại sổ hiệu lực.
-                  Số văn bản, lịch sử chỉnh sửa và toàn bộ dữ liệu gốc được giữ nguyên, không cấp số mới.
-                </p>
-                <p className="text-[11px] text-emerald-900 break-words">
-                  <strong>Tên văn bản:</strong> {restoreModalDoc.docName || restoreModalDoc.title}
-                </p>
-                {driveFileCount > 0 ? (
-                  <p className="text-[11px] text-sky-950 bg-sky-50 border border-sky-200 rounded-md px-2.5 py-2 leading-relaxed">
-                    <strong>Đồng bộ Google Drive:</strong> Toàn bộ <strong>{driveFileCount} tệp</strong> sẽ được chuyển từ thư mục{' '}
-                    <strong className="font-mono">{restoreModalDoc.driveDeletedFolderPath || 'VB đã xóa'}</strong> về lại thư mục{' '}
-                    <strong className="font-mono">{targetRestorePath}</strong>.
-                  </p>
-                ) : (
-                  <p className="text-[11px] text-emerald-800">
-                    Văn bản này không có tệp Google Drive đính kèm. Hệ thống sẽ khôi phục bản ghi ngay về sổ hiệu lực.
-                  </p>
-                )}
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-1">
+                <div className="font-mono font-bold text-emerald-900 break-all">{restoreModalDoc.fullDocNumber}</div>
+                <div className="text-slate-700 break-words">{restoreModalDoc.docName || restoreModalDoc.title}</div>
               </div>
 
               <form onSubmit={handleConfirmRestore} className="space-y-3.5 text-xs">
                 <div className="space-y-1">
-                  <label className="font-bold text-slate-800 block">Ghi chú / Lý do khôi phục (không bắt buộc)</label>
+                  <label className="font-bold text-slate-800 block">Ghi chú (không bắt buộc)</label>
                   <textarea
                     value={restoreReason}
                     onChange={(e) => setRestoreReason(e.target.value)}
-                    placeholder="Ví dụ: Xóa nhầm hồ sơ, văn bản vẫn còn hiệu lực..."
+                    placeholder="Nhập ghi chú nếu có..."
                     rows={2}
                     disabled={restoreSubmitting}
                     className="w-full p-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-emerald-600"
@@ -5550,7 +5400,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                     {restoreSubmitting ? (
                       <>
                         <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        <span>{driveFileCount > 0 ? 'Đang chuyển tệp Drive & khôi phục...' : 'Đang khôi phục...'}</span>
+                        <span>Đang khôi phục...</span>
                       </>
                     ) : (
                       <>
