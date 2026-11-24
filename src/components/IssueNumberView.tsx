@@ -204,16 +204,21 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   const [copiedFileName, setCopiedFileName] = useState<boolean>(false);
   const [copiedTaskKey, setCopiedTaskKey] = useState<string | null>(null);
 
-  // Queue Approval State (for issue_number users)
+  // Queue Approval State (for issue_number users — bắt buộc đính kèm tệp Word khi duyệt cấp số)
   const [processingReqId, setProcessingReqId] = useState<string | null>(null);
   const [queueError, setQueueError] = useState<string | null>(null);
   const [rejectingReqId, setRejectingReqId] = useState<string | null>(null);
   const [rejectReasonInput, setRejectReasonInput] = useState<string>('Chưa đủ thông tin văn bản');
+  const [approveModalReq, setApproveModalReq] = useState<NumberRequest | null>(null);
+  const [approveModalFile, setApproveModalFile] = useState<File | null>(null);
+  const [approveModalFileError, setApproveModalFileError] = useState<string | null>(null);
+  const approveFileInputRef = useRef<HTMLInputElement>(null);
 
-  // Word File Attachment State
+  // Word File Attachment State (Bắt buộc khi lấy số văn bản)
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedFileSha256, setSelectedFileSha256] = useState<string | undefined>(undefined);
   const [fileError, setFileError] = useState<string | null>(null);
+  const [isWordDragOver, setIsWordDragOver] = useState<boolean>(false);
   const [filenameConflict, setFilenameConflict] = useState<{
     conflictingFileName: string;
     suggestedSuffixName: string;
@@ -221,6 +226,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     officialDocNumberPreview?: string;
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const wordSectionRef = useRef<HTMLDivElement>(null);
   const retryTaskFileInputRef = useRef<HTMLInputElement>(null);
   const retryPickTargetDocIdRef = useRef<string | null>(null);
 
@@ -738,8 +744,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0] || null;
+  const applySelectedWordFile = (file: File | null) => {
     setFileError(null);
     setSubmitError(null);
     if (!file) return;
@@ -755,6 +760,19 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     setSelectedFile(file);
     setSelectedTemplateId('');
     void computeFileSha256Hex(file).then((hex) => setSelectedFileSha256(hex));
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    applySelectedWordFile(e.target.files?.[0] || null);
+  };
+
+  const handleWordDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsWordDragOver(false);
+    if (isSubmitting) return;
+    const dropped = e.dataTransfer.files?.[0] || null;
+    if (dropped) applySelectedWordFile(dropped);
   };
 
   const handleClearSelectedFile = () => {
@@ -853,20 +871,26 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       return;
     }
 
-    // Luồng 2: Người dùng có quyền "Cấp số" (issue_number) -> cấp số nguyên tử + tùy chọn tải Word lên Drive
-    if (selectedFile) {
-      const validationErr = validateWordFile(selectedFile);
-      if (validationErr) {
-        setFileError(validationErr);
-        setSubmitError(validationErr);
-        return;
-      }
-      if (!driveConfigured) {
-        setSubmitError(
-          `${driveConfig?.lastCheckMessage || 'Thư mục Google Drive chưa được cấu hình hợp lệ.'} Vui lòng bỏ chọn tệp để tiếp tục cấp số hoặc kiểm tra cấu hình Drive của sổ.`
-        );
-        return;
-      }
+    // Luồng 2: Người dùng có quyền "Cấp số" (issue_number) -> bắt buộc đính kèm tệp Word (.doc/.docx) + lưu Drive
+    if (!selectedFile) {
+      const msg = 'Bắt buộc tải lên tệp Word (.doc hoặc .docx) của văn bản trước khi lấy số.';
+      setFileError(msg);
+      setSubmitError(msg);
+      wordSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    const validationErr = validateWordFile(selectedFile);
+    if (validationErr) {
+      setFileError(validationErr);
+      setSubmitError(validationErr);
+      wordSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    if (!driveConfigured) {
+      setSubmitError(
+        `${driveConfig?.lastCheckMessage || 'Thư mục Google Drive chưa được cấu hình hợp lệ cho sổ này.'} Vui lòng cấu hình Google Drive trong Cài đặt trước khi cấp số (bắt buộc lưu tệp Word).`
+      );
+      return;
     }
 
     if (yearRolloverNotice && !yearRolloverNotice.confirmed) {
@@ -897,9 +921,9 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         signerRole: signerRole.trim(),
         notes: notes.trim(),
         idempotencyKey,
-        hasAttachment: Boolean(fileToUpload),
-        attachmentName: fileToUpload?.name,
-        attachmentSize: fileToUpload?.size,
+        hasAttachment: true,
+        attachmentName: fileToUpload.name,
+        attachmentSize: fileToUpload.size,
         fileSha256: effectiveSha,
         conflictAction,
         expectedYear:
@@ -907,7 +931,6 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
           (yearRolloverNotice?.confirmed ? yearRolloverNotice.toYear : formYear),
         expectedNextSeq: overrideExpected?.expectedNextSeq ?? nextSequenceNumber,
         confirmUpdatedSequence,
-        templateId: !fileToUpload && selectedTemplateId ? selectedTemplateId : undefined,
       });
 
       issuedDoc = res.document;
@@ -1048,19 +1071,25 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       setSubmitError('Đang kiểm tra số tiếp theo từ máy chủ hoặc chưa lấy được số mới nhất. Vui lòng thử lại.');
       return;
     }
-    if (selectedFile) {
-      const validationErr = validateWordFile(selectedFile);
-      if (validationErr) {
-        setFileError(validationErr);
-        setSubmitError(validationErr);
-        return;
-      }
-      if (!driveConfigured) {
-        setSubmitError(
-          `${driveConfig?.lastCheckMessage || 'Thư mục Google Drive chưa được cấu hình hợp lệ.'} Vui lòng bỏ chọn tệp để tiếp tục cấp số hoặc kiểm tra cấu hình Drive của sổ.`
-        );
-        return;
-      }
+    if (!selectedFile) {
+      const msg = 'Bắt buộc tải lên tệp Word (.doc hoặc .docx) của văn bản trước khi lấy số.';
+      setFileError(msg);
+      setSubmitError(msg);
+      wordSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    const validationErr = validateWordFile(selectedFile);
+    if (validationErr) {
+      setFileError(validationErr);
+      setSubmitError(validationErr);
+      wordSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    if (!driveConfigured) {
+      setSubmitError(
+        `${driveConfig?.lastCheckMessage || 'Thư mục Google Drive chưa được cấu hình hợp lệ cho sổ này.'} Vui lòng cấu hình Google Drive trong Cài đặt trước khi cấp số (bắt buộc lưu tệp Word).`
+      );
+      return;
     }
     if (yearRolloverNotice && !yearRolloverNotice.confirmed) {
       setSubmitError(
@@ -1071,7 +1100,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
     setCheckingPreIssue(true);
     try {
-      const sha = selectedFile ? selectedFileSha256 || (await computeFileSha256Hex(selectedFile)) : undefined;
+      const sha = selectedFileSha256 || (await computeFileSha256Hex(selectedFile));
       if (sha && sha !== selectedFileSha256) {
         setSelectedFileSha256(sha);
       }
@@ -1094,17 +1123,51 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     }
   };
 
-  const handleApproveRequest = async (reqId: string) => {
-    if (processingReqId) return;
+  const openApproveRequestModal = (reqItem: NumberRequest) => {
+    setQueueError(null);
+    setApproveModalFile(null);
+    setApproveModalFileError(null);
+    setApproveModalReq(reqItem);
+  };
+
+  const handleConfirmApproveRequest = async () => {
+    if (!approveModalReq || processingReqId) return;
+    if (!approveModalFile) {
+      setApproveModalFileError('Bắt buộc tải lên tệp Word (.doc hoặc .docx) của văn bản trước khi duyệt cấp số.');
+      return;
+    }
+    const validationErr = validateWordFile(approveModalFile);
+    if (validationErr) {
+      setApproveModalFileError(validationErr);
+      return;
+    }
+    if (!driveConfigured) {
+      setApproveModalFileError(
+        `${driveConfig?.lastCheckMessage || 'Thư mục Google Drive chưa được cấu hình hợp lệ cho sổ này.'} Vui lòng cấu hình Google Drive trong Cài đặt trước khi cấp số.`
+      );
+      return;
+    }
+
+    const reqId = approveModalReq.id;
+    const fileToUpload = approveModalFile;
     setProcessingReqId(reqId);
+    setApproveModalFileError(null);
     setQueueError(null);
     try {
-      const res = await api.approveNumberRequest(reqId);
+      const sha = await computeFileSha256Hex(fileToUpload);
+      const res = await api.approveNumberRequest(reqId, {
+        hasAttachment: true,
+        attachmentName: fileToUpload.name,
+        attachmentSize: fileToUpload.size,
+        fileSha256: sha,
+      });
+      setApproveModalReq(null);
+      setApproveModalFile(null);
       onDocumentIssued(res.document);
-      onStartIssueUploadTask?.(res.document, null);
+      onStartIssueUploadTask?.(res.document, fileToUpload);
       onRefreshRequests();
     } catch (err: any) {
-      setQueueError(err.message || 'Không thể duyệt và cấp số cho yêu cầu này.');
+      setApproveModalFileError(err.message || 'Không thể duyệt và cấp số cho yêu cầu này.');
     } finally {
       setProcessingReqId(null);
     }
@@ -1406,7 +1469,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                     <button
                       type="button"
                       disabled={processingReqId === reqItem.id}
-                      onClick={() => handleApproveRequest(reqItem.id)}
+                      onClick={() => openApproveRequestModal(reqItem)}
                       className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white font-semibold rounded-lg"
                     >
                       <CheckSquare className="w-3.5 h-3.5" />
@@ -2011,7 +2074,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
               />
             </div>
 
-            {/* Word File Attachment (Optional — available for issue_number users) */}
+            {/* Word File Attachment (Bắt buộc khi lấy số văn bản) */}
             {canIssue && (() => {
               const previewDocNumber =
                 booksLoaded &&
@@ -2025,14 +2088,25 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 : '';
 
               return (
-                <div className="space-y-2.5 p-3.5 sm:p-4 bg-slate-50/80 border border-slate-200 rounded-xl">
+                <div
+                  ref={wordSectionRef}
+                  className={`space-y-2.5 p-3.5 sm:p-4 rounded-xl border transition-colors ${
+                    fileError
+                      ? 'bg-rose-50/50 border-rose-300'
+                      : selectedFile
+                      ? 'bg-sky-50/40 border-sky-200'
+                      : 'bg-slate-50/80 border-slate-200'
+                  }`}
+                >
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <FileUp className="w-4 h-4 text-sky-700 shrink-0" />
                       <span className="text-xs font-bold text-slate-800 uppercase tracking-wide">
-                        Tệp Word đính kèm
+                        Tệp Word của văn bản <span className="text-rose-600">*</span>
                       </span>
-                      <span className="text-[11px] text-slate-500 font-normal">(không bắt buộc)</span>
+                      <span className="text-[11px] text-rose-600 font-semibold bg-rose-50 px-2 py-0.5 rounded border border-rose-200 shrink-0">
+                        Bắt buộc
+                      </span>
                     </div>
                     <span className="text-[11px] font-medium text-slate-600 bg-white px-2 py-0.5 rounded border border-slate-200">
                       .doc, .docx · Tối đa {maxWordFileSizeMB} MB
@@ -2050,31 +2124,49 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                   />
 
                   {!selectedFile ? (
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white border border-dashed border-slate-300 rounded-lg p-3.5">
+                    <div
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        if (!isSubmitting) setIsWordDragOver(true);
+                      }}
+                      onDragLeave={(e) => {
+                        e.preventDefault();
+                        setIsWordDragOver(false);
+                      }}
+                      onDrop={handleWordDrop}
+                      className={`flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white border-2 border-dashed rounded-lg p-3.5 transition-colors ${
+                        isWordDragOver
+                          ? 'border-sky-500 bg-sky-50/60'
+                          : fileError
+                          ? 'border-rose-300 bg-rose-50/30'
+                          : 'border-slate-300 hover:border-sky-400'
+                      }`}
+                    >
                       <div className="text-xs text-slate-600 space-y-0.5 min-w-0">
-                        <p className="font-medium text-slate-800 leading-relaxed">
-                          Đính kèm tệp Word để tự động đổi tên theo số chính thức và lưu vào Google Drive của {activeBook.name}
+                        <p className="font-semibold text-slate-800 leading-relaxed">
+                          Tải lên hoặc kéo thả tệp Word (.doc, .docx) của văn bản này để lấy số
                         </p>
                         <p className="text-[11px] text-slate-500">
-                          Nếu chưa có tệp, bạn vẫn có thể bấm <strong>Cấp số và lưu</strong> bình thường (kể cả khi chưa cấu hình Drive).
+                          Hệ thống tự động đổi tên theo số chính thức và lưu vào Google Drive của{' '}
+                          <strong className="text-slate-700">{activeBook.name}</strong>.
                         </p>
                       </div>
                       <button
                         type="button"
                         onClick={() => fileInputRef.current?.click()}
                         disabled={isSubmitting}
-                        className="inline-flex items-center justify-center gap-1.5 min-h-[44px] px-4 py-2 text-xs font-semibold bg-white hover:bg-sky-50 text-sky-800 border border-sky-300 rounded-lg shadow-2xs transition-colors shrink-0 disabled:opacity-50 w-full sm:w-auto"
+                        className="inline-flex items-center justify-center gap-1.5 min-h-[44px] px-4 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-2xs transition-colors shrink-0 disabled:opacity-50 w-full sm:w-auto"
                       >
                         <Upload className="w-4 h-4" />
-                        <span>Chọn tệp Word</span>
+                        <span>Tải lên tệp Word</span>
                       </button>
                     </div>
                   ) : (
                     <div className="bg-white border border-sky-200 rounded-lg p-3.5 space-y-2.5">
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
                         <div className="flex items-center gap-2.5 min-w-0">
-                          <div className="w-9 h-9 rounded-lg bg-sky-50 border border-sky-200 flex items-center justify-center text-sky-700 shrink-0">
-                            <FileText className="w-4 h-4" />
+                          <div className="w-9 h-9 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-700 shrink-0">
+                            <FileCheck2 className="w-4 h-4" />
                           </div>
                           <div className="min-w-0">
                             <p className="text-xs font-bold text-slate-900 break-all sm:truncate">{selectedFile.name}</p>
@@ -2091,7 +2183,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                             disabled={isSubmitting}
                             className="flex-1 sm:flex-initial min-h-[38px] px-3 py-1.5 text-xs font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-md disabled:opacity-50"
                           >
-                            Chọn lại
+                            Đổi tệp khác
                           </button>
                           <button
                             type="button"
@@ -2099,7 +2191,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                             disabled={isSubmitting}
                             className="flex-1 sm:flex-initial min-h-[38px] px-3 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-md disabled:opacity-50"
                           >
-                            Bỏ chọn
+                            Gỡ tệp
                           </button>
                         </div>
                       </div>
@@ -2110,50 +2202,50 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                         </span>
                         <span className="font-mono font-bold text-sky-900 break-all block">{expectedDriveName}</span>
                       </div>
+                    </div>
+                  )}
 
-                      {!driveConfigured && (
-                        <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs flex items-start gap-2">
-                          <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                          <div className="space-y-1 min-w-0">
-                            <strong className="block font-bold">Thư mục Google Drive chưa được cấu hình hợp lệ</strong>
-                            <p className="text-amber-800 break-words">
-                              {driveConfig?.lastCheckMessage || 'Chưa thiết lập thư mục Google Drive cho sổ này.'}
-                            </p>
-                          </div>
-                        </div>
-                      )}
+                  {!driveConfigured && (
+                    <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                      <div className="space-y-0.5 min-w-0">
+                        <strong className="block font-bold">Chưa cấu hình Google Drive cho {activeBook.name}</strong>
+                        <p className="text-amber-800 break-words">
+                          {driveConfig?.lastCheckMessage || 'Chưa thiết lập thư mục Google Drive cho sổ này.'} Cần cấu hình Drive trong mục Cài đặt để lưu tệp Word bắt buộc khi cấp số.
+                        </p>
+                      </div>
                     </div>
                   )}
 
                   {fileError && (
                     <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg text-rose-800 text-xs flex items-center gap-2">
                       <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
-                      <span className="break-words min-w-0">{fileError}</span>
+                      <span className="break-words min-w-0 font-medium">{fileError}</span>
                     </div>
                   )}
 
-                  {/* Mẫu Word tự động (khi không tải tệp Word thủ công) */}
+                  {/* Hỗ trợ tải bản nháp từ Mẫu Word để soạn trước khi tải lên */}
                   {!selectedFile && matchingTemplates.length > 0 && (
-                    <div className="mt-2 pt-3 border-t border-slate-200 space-y-2.5">
+                    <div className="mt-2 pt-3 border-t border-slate-200 space-y-2">
                       <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                          <FileCheck2 className="w-4 h-4 text-sky-700 shrink-0" />
-                          <span>Hoặc tạo tự động từ Mẫu Word ({matchingTemplates.length} mẫu)</span>
+                        <span className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+                          <Download className="w-3.5 h-3.5 text-sky-700 shrink-0" />
+                          <span>Tải bản nháp từ Mẫu Word ({matchingTemplates.length} mẫu)</span>
                         </span>
                         <span className="text-[11px] text-slate-500">
-                          Tự điền số chính thức &amp; lưu vào Google Drive khi cấp số
+                          Soạn xong tải tệp Word lên khung phía trên để lấy số
                         </span>
                       </div>
 
                       <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                         <select
-                          aria-label="Chọn mẫu Word"
+                          aria-label="Chọn mẫu Word để tải bản nháp"
                           value={selectedTemplateId}
                           onChange={(e) => setSelectedTemplateId(e.target.value)}
                           disabled={isSubmitting}
                           className="flex-1 min-h-[40px] px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-medium text-slate-900"
                         >
-                          <option value="">— Không dùng mẫu Word —</option>
+                          <option value="">— Chọn mẫu Word cần tải nháp —</option>
                           {matchingTemplates.map((tpl) => (
                             <option key={tpl.id} value={tpl.id}>
                               {tpl.name} ({tpl.originalFileName})
@@ -2169,29 +2261,16 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                             className="inline-flex items-center justify-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-semibold bg-white hover:bg-sky-50 text-sky-800 border border-sky-300 rounded-lg shrink-0 disabled:opacity-50"
                           >
                             <Download className="w-3.5 h-3.5 shrink-0" />
-                            <span>{downloadingDraft ? 'Đang tạo nháp...' : 'Tải bản nháp (DỰ THẢO)'}</span>
+                            <span>{downloadingDraft ? 'Đang tạo nháp...' : 'Tải bản nháp (.docx)'}</span>
                           </button>
                         )}
                       </div>
 
-                      {selectedTemplateId && templateDraftCheck && (
-                        <div className="text-[11px] bg-white border border-slate-200 rounded-lg p-2.5 space-y-1">
-                          {templateDraftCheck.missingFields.length > 0 ? (
-                            <p className="text-amber-800 font-medium">
-                              Trường còn trống trong biểu mẫu:{' '}
-                              <span className="font-mono">{templateDraftCheck.missingFields.join(', ')}</span>
-                            </p>
-                          ) : (
-                            <p className="text-emerald-700 font-medium">
-                              Đã đủ dữ liệu điền vào các trường của mẫu Word.
-                            </p>
-                          )}
-                          {!driveConfigured && (
-                            <p className="text-amber-700">
-                              Lưu ý: Drive của sổ chưa cấu hình xong — số vẫn được cấp, trạng thái tệp sẽ là chưa lưu Drive để thử lại sau.
-                            </p>
-                          )}
-                        </div>
+                      {selectedTemplateId && templateDraftCheck && templateDraftCheck.missingFields.length > 0 && (
+                        <p className="text-[11px] text-amber-800 font-medium">
+                          Trường còn trống trong biểu mẫu:{' '}
+                          <span className="font-mono">{templateDraftCheck.missingFields.join(', ')}</span>
+                        </p>
                       )}
 
                       {draftError && (
@@ -2356,7 +2435,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       (previewStatus !== 'ready' ||
                         previewSeriesKey !== currentSeriesKey ||
                         nextSequenceNumber === null ||
-                        Boolean(selectedFile && !driveConfigured))) ||
+                        !driveConfigured)) ||
                     Boolean(yearRolloverNotice && !yearRolloverNotice.confirmed)
                   }
                   className="w-full sm:w-auto sm:min-w-[210px] min-h-[48px] h-12 px-6 bg-sky-700 hover:bg-sky-800 active:bg-sky-900 text-white font-semibold text-base sm:text-sm rounded-lg shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -2567,14 +2646,9 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       {preIssueModalData && (() => {
         const { check, fileSha256 } = preIssueModalData;
         const selectedTypeObj = activeTypes.find((t) => t.code === typeCode);
-        const selectedTplObj = selectedTemplateId
-          ? matchingTemplates.find((t) => t.id === selectedTemplateId)
-          : undefined;
         const expectedWillSaveName = selectedFile
           ? buildStandardDriveFileName(check.previewNumber, docName, selectedFile.name)
-          : selectedTplObj
-          ? buildStandardDriveFileName(check.previewNumber, docName, '.docx')
-          : 'Không đính kèm';
+          : '';
 
         return (
           <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
@@ -2625,12 +2699,12 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                   <dd className="font-semibold text-slate-900 mt-0.5 break-words">{docName.trim()}</dd>
                 </div>
                 <div className="sm:col-span-2">
-                  <dt className="text-slate-500">Tên tệp sẽ lưu</dt>
+                  <dt className="text-slate-500">Tệp Word sẽ lưu lên Drive</dt>
                   <dd className="font-mono font-semibold text-slate-800 mt-0.5 break-all">
                     {expectedWillSaveName}
-                    {selectedTplObj && !selectedFile && (
-                      <span className="ml-1.5 text-[11px] font-sans text-sky-700 font-semibold">
-                        (Tạo từ mẫu: {selectedTplObj.name})
+                    {selectedFile && (
+                      <span className="ml-1.5 text-[11px] font-sans text-slate-500 font-normal">
+                        ({formatFileSize(selectedFile.size)})
                       </span>
                     )}
                   </dd>
@@ -2726,6 +2800,120 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
           </div>
         );
       })()}
+      {/* Modal: Approve Number Request (Bắt buộc tải tệp Word khi duyệt cấp số) */}
+      {approveModalReq && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
+          <div className="bg-white rounded-xl max-w-md w-full p-4 sm:p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Duyệt &amp; Cấp số văn bản</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Bắt buộc đính kèm tệp Word (.doc, .docx) của văn bản trước khi cấp số
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={processingReqId === approveModalReq.id}
+                onClick={() => {
+                  setApproveModalReq(null);
+                  setApproveModalFile(null);
+                  setApproveModalFileError(null);
+                }}
+                className="text-slate-400 hover:text-slate-700 p-1.5 min-w-[36px] min-h-[36px] flex items-center justify-center"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs space-y-1">
+              <div className="font-bold text-slate-900">{approveModalReq.docName}</div>
+              <div className="text-slate-600">
+                Loại: <strong className="font-mono">{approveModalReq.typeName} ({approveModalReq.typeCode})</strong> · Ký: <strong>{approveModalReq.signer}</strong>
+              </div>
+              <div className="text-slate-500">Người xin số: {approveModalReq.requestedBy}</div>
+            </div>
+
+            <div className="space-y-2">
+              <input
+                ref={approveFileInputRef}
+                type="file"
+                accept=".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                className="hidden"
+                onChange={(e) => {
+                  const picked = e.target.files?.[0] || null;
+                  setApproveModalFileError(null);
+                  if (!picked) return;
+                  const err = validateWordFile(picked);
+                  if (err) {
+                    setApproveModalFile(null);
+                    setApproveModalFileError(err);
+                    e.target.value = '';
+                    return;
+                  }
+                  setApproveModalFile(picked);
+                }}
+              />
+
+              {!approveModalFile ? (
+                <button
+                  type="button"
+                  onClick={() => approveFileInputRef.current?.click()}
+                  className="w-full p-4 border-2 border-dashed border-slate-300 hover:border-sky-400 rounded-lg bg-slate-50/70 hover:bg-sky-50/40 text-xs font-semibold text-sky-800 flex flex-col items-center justify-center gap-1.5 transition-colors"
+                >
+                  <Upload className="w-5 h-5 text-sky-700" />
+                  <span>Chọn tệp Word (.doc, .docx) bắt buộc</span>
+                  <span className="text-[11px] font-normal text-slate-500">Tối đa {maxWordFileSizeMB} MB</span>
+                </button>
+              ) : (
+                <div className="p-3 bg-emerald-50/60 border border-emerald-200 rounded-lg flex items-center justify-between gap-2 text-xs">
+                  <div className="min-w-0">
+                    <p className="font-bold text-slate-900 truncate">{approveModalFile.name}</p>
+                    <p className="text-[11px] text-slate-500">{formatFileSize(approveModalFile.size)}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => approveFileInputRef.current?.click()}
+                    className="px-2.5 py-1 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-700 hover:bg-slate-50 shrink-0"
+                  >
+                    Đổi tệp
+                  </button>
+                </div>
+              )}
+
+              {approveModalFileError && (
+                <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg text-rose-800 text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{approveModalFileError}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                disabled={processingReqId === approveModalReq.id}
+                onClick={() => {
+                  setApproveModalReq(null);
+                  setApproveModalFile(null);
+                  setApproveModalFileError(null);
+                }}
+                className="min-h-[40px] px-4 py-2 text-xs font-semibold bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 rounded-lg"
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                disabled={processingReqId === approveModalReq.id || !driveConfigured}
+                onClick={handleConfirmApproveRequest}
+                className="min-h-[40px] px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg inline-flex items-center gap-1.5"
+              >
+                <CheckSquare className="w-3.5 h-3.5" />
+                <span>{processingReqId === approveModalReq.id ? 'Đang cấp số...' : 'Xác nhận duyệt & cấp số'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

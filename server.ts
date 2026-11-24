@@ -6585,6 +6585,7 @@ app.post('/api/number-requests', requireAuth, async (req, res) => {
 app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
   const { id } = req.params;
   const currentUser = (req as any).user as User;
+  const { hasAttachment, attachmentName, attachmentSize, fileSha256 } = req.body || {};
   await ensureLatestDb({ maxAgeMs: 0 });
   const preReqItem = db.numberRequests.find((r) => r.id === id);
   if (!preReqItem) {
@@ -6613,6 +6614,37 @@ app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
       error: 'Yêu cầu xin số này đã được xử lý trước đó.',
       ...(existingDoc ? { document: existingDoc } : {}),
       request: preReqItem,
+    });
+  }
+
+  // Bắt buộc tải lên tệp Word (.doc hoặc .docx) khi duyệt & cấp số văn bản
+  if (!hasAttachment || !String(attachmentName || '').trim()) {
+    return res.status(400).json({
+      code: 'WORD_FILE_REQUIRED',
+      error: 'Bắt buộc tải lên tệp Word (.doc hoặc .docx) của văn bản trước khi duyệt và cấp số.',
+    });
+  }
+  const reqAttachmentExt = getWordFileExtension(String(attachmentName || ''));
+  if (!reqAttachmentExt) {
+    return res.status(400).json({
+      error: 'Định dạng tệp đính kèm không hợp lệ. Chỉ chấp nhận tệp Word (.doc hoặc .docx).',
+    });
+  }
+  const reqSizeNum = Number(attachmentSize);
+  if (!Number.isFinite(reqSizeNum) || reqSizeNum <= 0) {
+    return res.status(400).json({
+      error: 'Tệp Word đính kèm không hợp lệ hoặc bị rỗng.',
+    });
+  }
+  if (reqSizeNum > getMaxWordFileSizeBytes()) {
+    return res.status(400).json({
+      error: `Dung lượng tệp vượt quá giới hạn tối đa ${getMaxWordFileSizeMB()} MB.`,
+    });
+  }
+  const preDriveCfg = resolveDriveForBook(preBook);
+  if (!preDriveCfg.isConfigured) {
+    return res.status(400).json({
+      error: `${preDriveCfg.missingReason || 'Chưa cấu hình thư mục Google Drive hợp lệ cho sổ này.'} Vui lòng cấu hình Google Drive trong Cài đặt trước khi cấp số (bắt buộc lưu tệp Word).`,
     });
   }
 
@@ -6654,6 +6686,20 @@ app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
       canonicalReqType,
       lockedBook.unitCode
     );
+
+    let reqResolvedDriveFileName = buildStandardDriveFileName(
+      fullDocNumber,
+      reqItem.docName || reqItem.title,
+      reqAttachmentExt
+    );
+    if (findConflictingDocumentByDriveFileName(reqResolvedDriveFileName, undefined, lockedBook.id)) {
+      reqResolvedDriveFileName = resolveUniqueDriveFileName(
+        reqResolvedDriveFileName,
+        undefined,
+        lockedBook.id
+      );
+    }
+
     const docId = `doc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
     const newDocument: DocumentRecord = {
       id: docId,
@@ -6682,7 +6728,12 @@ app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
       auditLogs: [],
       syncStatus: getGoogleSheetsTargets(lockedBook).length > 0 ? 'pending' : 'not_configured',
       idempotencyKey: `req-issue-${reqItem.id}`,
-      driveStatus: 'none',
+      driveStatus: 'uploading',
+      driveUploadStartedAt: new Date().toISOString(),
+      driveFileName: reqResolvedDriveFileName,
+      driveOriginalFileName: String(attachmentName || ''),
+      driveFileSize: reqSizeNum,
+      fileSha256: typeof fileSha256 === 'string' && fileSha256.trim() ? fileSha256.trim() : undefined,
     };
 
     recordDocumentHistoryEntry({
@@ -6887,9 +6938,6 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
   // Khóa giao dịch nguyên tử tại máy chủ - ngăn chặn 100% việc trùng số khi nhiều người cùng bấm
   const issueStartMs = Date.now();
   let issuedDocForPostActions: DocumentRecord | null = null;
-  let issuedBookForPostActions: RegistryBook | null = null;
-  let issuedActorForPostActions: User | null = null;
-  let selectedTemplateForPost: WordTemplate | null = null;
   let issuedNextPreview: PreviewNumberResponse | null = null;
 
   const releaseLock = await atomicLock.acquire();
@@ -6949,40 +6997,36 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
       }
     }
 
-    if (templateId && typeof templateId === 'string') {
-      const tpl = (db.wordTemplates || []).find((t) => t.id === templateId && t.bookId === targetBook.id);
-      if (!tpl) {
-        return res.status(400).json({ error: 'Mẫu Word đã chọn không còn tồn tại trong sổ này.' });
-      }
-      selectedTemplateForPost = tpl;
+    // Bắt buộc tải lên tệp Word (.doc hoặc .docx) của văn bản khi lấy số
+    if (!hasAttachment || !String(attachmentName || '').trim()) {
+      return res.status(400).json({
+        code: 'WORD_FILE_REQUIRED',
+        error: 'Bắt buộc tải lên tệp Word (.doc hoặc .docx) của văn bản trước khi lấy số.',
+      });
     }
 
-    // Kiểm tra tệp và cấu hình Drive nếu có đính kèm thủ công
-    let attachmentExt: '.doc' | '.docx' | null = null;
-    if (hasAttachment) {
-      attachmentExt = getWordFileExtension(String(attachmentName || ''));
-      if (!attachmentExt) {
-        return res.status(400).json({
-          error: 'Định dạng tệp đính kèm không hợp lệ. Chỉ chấp nhận tệp Word (.doc hoặc .docx).',
-        });
-      }
-      const sizeNum = Number(attachmentSize);
-      if (!Number.isFinite(sizeNum) || sizeNum <= 0) {
-        return res.status(400).json({
-          error: 'Tệp Word đính kèm không hợp lệ hoặc bị rỗng.',
-        });
-      }
-      if (sizeNum > getMaxWordFileSizeBytes()) {
-        return res.status(400).json({
-          error: `Dung lượng tệp vượt quá giới hạn tối đa ${getMaxWordFileSizeMB()} MB.`,
-        });
-      }
-      const driveCfg = resolveDriveForBook(targetBook);
-      if (!driveCfg.isConfigured) {
-        return res.status(400).json({
-          error: `${driveCfg.missingReason || 'Chưa cấu hình thư mục Google Drive hợp lệ cho sổ này.'} Vui lòng bỏ chọn tệp để tiếp tục cấp số hoặc liên hệ Quản trị viên.`,
-        });
-      }
+    const attachmentExt: '.doc' | '.docx' | null = getWordFileExtension(String(attachmentName || ''));
+    if (!attachmentExt) {
+      return res.status(400).json({
+        error: 'Định dạng tệp đính kèm không hợp lệ. Chỉ chấp nhận tệp Word (.doc hoặc .docx).',
+      });
+    }
+    const sizeNum = Number(attachmentSize);
+    if (!Number.isFinite(sizeNum) || sizeNum <= 0) {
+      return res.status(400).json({
+        error: 'Tệp Word đính kèm không hợp lệ hoặc bị rỗng.',
+      });
+    }
+    if (sizeNum > getMaxWordFileSizeBytes()) {
+      return res.status(400).json({
+        error: `Dung lượng tệp vượt quá giới hạn tối đa ${getMaxWordFileSizeMB()} MB.`,
+      });
+    }
+    const driveCfg = resolveDriveForBook(targetBook);
+    if (!driveCfg.isConfigured) {
+      return res.status(400).json({
+        error: `${driveCfg.missingReason || 'Chưa cấu hình thư mục Google Drive hợp lệ cho sổ này.'} Vui lòng cấu hình Google Drive trong Cài đặt trước khi cấp số (bắt buộc lưu tệp Word).`,
+      });
     }
 
     // 2. Tính toán năm và ngày theo giờ Việt Nam (Asia/Ho_Chi_Minh)
@@ -7076,8 +7120,6 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
         }
       }
       resolvedDriveFileName = targetFileName;
-    } else if (selectedTemplateForPost) {
-      resolvedDriveFileName = buildStandardDriveFileName(fullDocNumber, validDocName, '.docx');
     }
 
     const docId = `doc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -7110,15 +7152,12 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
       auditLogs: [],
       syncStatus: getGoogleSheetsTargets(targetBook).length > 0 ? 'pending' : 'not_configured',
       idempotencyKey,
-      driveStatus: hasAttachment || selectedTemplateForPost ? 'uploading' : 'none',
-      driveUploadStartedAt:
-        hasAttachment || selectedTemplateForPost ? new Date().toISOString() : undefined,
+      driveStatus: 'uploading',
+      driveUploadStartedAt: new Date().toISOString(),
       driveFileName: resolvedDriveFileName,
-      driveOriginalFileName: hasAttachment ? String(attachmentName || '') : undefined,
-      driveFileSize: hasAttachment ? Number(attachmentSize) : undefined,
+      driveOriginalFileName: String(attachmentName || ''),
+      driveFileSize: Number(attachmentSize),
       fileSha256: typeof fileSha256 === 'string' && fileSha256.trim() ? fileSha256.trim() : undefined,
-      templateId: selectedTemplateForPost?.id,
-      wordGenerationStatus: selectedTemplateForPost ? 'none' : undefined,
     };
 
     recordDocumentHistoryEntry({
@@ -7150,8 +7189,6 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
     );
 
     issuedDocForPostActions = newDocument;
-    issuedBookForPostActions = targetBook;
-    issuedActorForPostActions = latestActor;
     issuedNextPreview = nextPreview;
   } catch (err: any) {
     // Roll back uncommitted in-memory document mutation if persistence failed
@@ -7175,70 +7212,14 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
     releaseLock();
   }
 
-  if (issuedDocForPostActions && issuedBookForPostActions && issuedActorForPostActions) {
+  if (issuedDocForPostActions) {
     const issueMs = Date.now() - issueStartMs;
-    const issuedDoc = issuedDocForPostActions;
-    const issuedBook = issuedBookForPostActions;
-    const issuedActor = issuedActorForPostActions;
+    const finalIssuedDoc = issuedDocForPostActions;
 
     broadcastSSE('document_issued', {
-      document: issuedDoc,
+      document: finalIssuedDoc,
       nextPreview: issuedNextPreview,
     });
-
-    // Tách hoàn toàn bước tạo tệp Word từ mẫu + lưu Google Drive ra khỏi phản hồi cấp số (trên serverless đợi hoàn tất để không bỏ rơi trạng thái 'uploading')
-    let finalIssuedDoc = issuedDoc;
-    if (selectedTemplateForPost && !hasAttachment) {
-      const tplForBg = selectedTemplateForPost;
-      const runTemplateBg = async (): Promise<DocumentRecord> => {
-        try {
-          const genRes = await generateAndUploadWordFromTemplate({
-            doc: issuedDoc,
-            book: issuedBook,
-            template: tplForBg,
-            actor: issuedActor,
-            customValues: templateCustomValues,
-            isRetry: false,
-          });
-          const latest = genRes.document || db.documents.find((d) => d.id === issuedDoc.id) || issuedDoc;
-          broadcastSSE('document_updated', { document: latest });
-          if (genRes.ok) {
-            void syncToGoogleSheets(latest, 'update').catch(() => {});
-          }
-          return latest;
-        } catch (tplErr: any) {
-          const errMsg = tplErr?.message || 'Không thể tạo văn bản từ mẫu Word đã chọn.';
-          const updated = await mutateDocumentInDb(
-            issuedDoc.id,
-            (liveDoc) => {
-              if (liveDoc.driveStatus === 'saved' && liveDoc.driveFileId && liveDoc.driveFileUrl) {
-                return false;
-              }
-              liveDoc.wordGenerationStatus = 'failed';
-              liveDoc.wordGenerationError = errMsg;
-              liveDoc.driveStatus = 'failed';
-              liveDoc.driveError = errMsg;
-              delete liveDoc.driveUploadStartedAt;
-              return true;
-            },
-            { verifyWrite: true }
-          ).catch(() => null);
-          const latest = updated || issuedDoc;
-          broadcastSSE('document_updated', { document: latest });
-          return latest;
-        }
-      };
-
-      const bgPromise = runTemplateBg().finally(() => {
-        if (inFlightDocUploads.get(issuedDoc.id) === bgPromise) {
-          inFlightDocUploads.delete(issuedDoc.id);
-        }
-      });
-      inFlightDocUploads.set(issuedDoc.id, bgPromise);
-      if (IS_SERVERLESS) {
-        finalIssuedDoc = await bgPromise;
-      }
-    }
 
     if (!res.headersSent) {
       res.json({

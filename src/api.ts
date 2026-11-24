@@ -548,10 +548,21 @@ export const api = {
     });
   },
 
-  approveNumberRequest: async (id: string): Promise<{ document: DocumentRecord; request: NumberRequest; success: boolean }> => {
+  approveNumberRequest: async (
+    id: string,
+    payload: {
+      hasAttachment: true;
+      attachmentName: string;
+      attachmentSize: number;
+      fileSha256?: string;
+    }
+  ): Promise<{ document: DocumentRecord; request: NumberRequest; success: boolean }> => {
     return request<{ document: DocumentRecord; request: NumberRequest; success: boolean }>(
       `/api/number-requests/${encodeURIComponent(id)}/issue`,
-      { method: 'POST' }
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
     );
   },
 
