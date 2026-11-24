@@ -33,6 +33,7 @@ import type {
   PersistenceStatus,
   PreIssueCheckResult,
   PreviewNumberResponse,
+  ReconciliationIssueType,
   ReconciliationReport,
   RegistryBook,
   SignerConfig,
@@ -1646,6 +1647,43 @@ export const api = {
     const qs = sp.toString();
     return request<{ history: DriveReconciliationHistoryEntry[] }>(
       `/api/admin/drive-reconcile/history${qs ? `?${qs}` : ''}`
+    );
+  },
+
+  deleteAdminDriveReconcileHistoryItem: async (
+    id: string
+  ): Promise<{ success: boolean; deletedId: string; remainingCount: number }> => {
+    return request<{ success: boolean; deletedId: string; remainingCount: number }>(
+      `/api/admin/drive-reconcile/history/${encodeURIComponent(id)}`,
+      {
+        method: 'DELETE',
+      }
+    );
+  },
+
+  clearAdminDriveReconcileHistory: async (
+    bookId?: string
+  ): Promise<{ success: boolean; deletedCount: number; remainingCount: number }> => {
+    const sp = new URLSearchParams();
+    if (bookId && bookId !== 'all') sp.append('bookId', bookId);
+    const qs = sp.toString();
+    return request<{ success: boolean; deletedCount: number; remainingCount: number }>(
+      `/api/admin/drive-reconcile/history${qs ? `?${qs}` : ''}`,
+      {
+        method: 'DELETE',
+      }
+    );
+  },
+
+  dismissReconciliationItems: async (
+    items: Array<{ docId: string; issueType: ReconciliationIssueType }>
+  ): Promise<{ success: boolean; dismissedCount: number }> => {
+    return request<{ success: boolean; dismissedCount: number }>(
+      '/api/reconciliation/dismiss-items',
+      {
+        method: 'POST',
+        body: JSON.stringify({ items }),
+      }
     );
   },
 

@@ -42,6 +42,7 @@ import type {
   PdfContentSearchMatch,
   PdfPageContent,
   PreIssueCheckResult,
+  ReconciliationIssueType,
   ReconciliationItem,
   ReconciliationReport,
   SystemSettings,
@@ -12989,8 +12990,10 @@ app.get('/api/reconciliation', requireAuth, async (req, res) => {
 
   for (const d of scopedDocs) {
     const book = getBookById(getDocBookId(d));
+    const dismissed = d.reconciliationDismissedIssues || {};
     const sheetsConfigured = getGoogleSheetsTargets(book).length > 0;
     const sheetsUnsynced =
+      !dismissed.sheets_unsynced &&
       sheetsConfigured &&
       (d.status === 'deleted'
         ? !d.deletedListArchived && d.excelDeleteSyncStatus !== 'synced'
@@ -13022,30 +13025,32 @@ app.get('/api/reconciliation', requireAuth, async (req, res) => {
       }
 
       if (d.driveStatus === 'failed') {
-        driveFailedCount++;
-        items.push({
-          id: `rec-drivefail-${d.id}`,
-          issueType: 'drive_failed',
-          severity: 'error',
-          bookId: book.id,
-          bookCode: book.code,
-          bookName: book.name,
-          year: d.year,
-          docId: d.id,
-          fullDocNumber: d.fullDocNumber,
-          docName: d.docName || d.title,
-          status: d.status,
-          driveState,
-          driveStateLabel,
-          driveFileId: d.driveFileId,
-          driveFileUrl: d.driveFileUrl,
-          driveError: d.driveError,
-          sheetsSyncState: d.syncStatus,
-          sheetsSyncError: d.syncError,
-          detailMessage: d.driveError || 'Tệp văn bản chưa lưu thành công lên Google Drive.',
-          canRetry: Boolean(d.templateId),
-          retryKind: d.templateId ? 'word_drive' : undefined,
-        });
+        if (!dismissed.drive_failed) {
+          driveFailedCount++;
+          items.push({
+            id: `rec-drivefail-${d.id}`,
+            issueType: 'drive_failed',
+            severity: 'error',
+            bookId: book.id,
+            bookCode: book.code,
+            bookName: book.name,
+            year: d.year,
+            docId: d.id,
+            fullDocNumber: d.fullDocNumber,
+            docName: d.docName || d.title,
+            status: d.status,
+            driveState,
+            driveStateLabel,
+            driveFileId: d.driveFileId,
+            driveFileUrl: d.driveFileUrl,
+            driveError: d.driveError,
+            sheetsSyncState: d.syncStatus,
+            sheetsSyncError: d.syncError,
+            detailMessage: d.driveError || 'Tệp văn bản chưa lưu thành công lên Google Drive.',
+            canRetry: Boolean(d.templateId),
+            retryKind: d.templateId ? 'word_drive' : undefined,
+          });
+        }
       } else if (
         driveState === 'unsaved' ||
         driveState === 'no_attachment' ||
@@ -13053,34 +13058,36 @@ app.get('/api/reconciliation', requireAuth, async (req, res) => {
         driveState === 'access_denied' ||
         driveState === 'unverified'
       ) {
-        driveLinkIssueCount++;
-        items.push({
-          id: `rec-drivelink-${d.id}`,
-          issueType: 'drive_link_issue',
-          severity:
-            driveState === 'not_found' || driveState === 'access_denied' ? 'error' : 'warning',
-          bookId: book.id,
-          bookCode: book.code,
-          bookName: book.name,
-          year: d.year,
-          docId: d.id,
-          fullDocNumber: d.fullDocNumber,
-          docName: d.docName || d.title,
-          status: d.status,
-          driveState,
-          driveStateLabel,
-          driveFileId: d.driveFileId,
-          driveFileUrl: d.driveFileUrl,
-          driveError: driveStatusCache.get(d.id)?.error || d.driveError,
-          sheetsSyncState: d.syncStatus,
-          sheetsSyncError: d.syncError,
-          detailMessage:
-            driveStatusCache.get(d.id)?.error ||
-            (driveState === 'no_attachment'
-              ? 'Hồ sơ chưa đính kèm tệp trên Google Drive.'
-              : 'Liên kết tệp trên Google Drive cần kiểm tra lại.'),
-          canRetry: false,
-        });
+        if (!dismissed.drive_link_issue) {
+          driveLinkIssueCount++;
+          items.push({
+            id: `rec-drivelink-${d.id}`,
+            issueType: 'drive_link_issue',
+            severity:
+              driveState === 'not_found' || driveState === 'access_denied' ? 'error' : 'warning',
+            bookId: book.id,
+            bookCode: book.code,
+            bookName: book.name,
+            year: d.year,
+            docId: d.id,
+            fullDocNumber: d.fullDocNumber,
+            docName: d.docName || d.title,
+            status: d.status,
+            driveState,
+            driveStateLabel,
+            driveFileId: d.driveFileId,
+            driveFileUrl: d.driveFileUrl,
+            driveError: driveStatusCache.get(d.id)?.error || d.driveError,
+            sheetsSyncState: d.syncStatus,
+            sheetsSyncError: d.syncError,
+            detailMessage:
+              driveStatusCache.get(d.id)?.error ||
+              (driveState === 'no_attachment'
+                ? 'Hồ sơ chưa đính kèm tệp trên Google Drive.'
+                : 'Liên kết tệp trên Google Drive cần kiểm tra lại.'),
+            canRetry: false,
+          });
+        }
       }
     }
 
@@ -13112,7 +13119,7 @@ app.get('/api/reconciliation', requireAuth, async (req, res) => {
     }
 
     const dupIds = duplicateDocMap.get(d.id);
-    if (dupIds && dupIds.length > 0) {
+    if (dupIds && dupIds.length > 0 && !dismissed.duplicate_number) {
       duplicateNumberCount++;
       items.push({
         id: `rec-dup-${d.id}`,
@@ -13323,6 +13330,199 @@ app.get('/api/admin/drive-reconcile/history', requireAuth, async (req, res) => {
   });
 
   res.json({ history: filtered.slice(0, 30) });
+});
+
+app.delete('/api/admin/drive-reconcile/history/:id', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const entryId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+  if (!entryId || entryId.length > 120) {
+    return res.status(400).json({ error: 'Mã lịch sử đối soát không hợp lệ.' });
+  }
+
+  const release = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const historyList = Array.isArray(db.driveReconcileHistory) ? db.driveReconcileHistory : [];
+    const targetIdx = historyList.findIndex((h) => h.id === entryId);
+    if (targetIdx === -1) {
+      return res.status(404).json({ error: 'Không tìm thấy bản ghi lịch sử đối soát này.' });
+    }
+
+    const target = historyList[targetIdx];
+    const allowed =
+      isSystemAdmin(currentUser) ||
+      (target.bookId !== 'all' && hasBookPermission(currentUser, target.bookId, 'manage_book'));
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Bạn không có quyền xóa bản ghi lịch sử đối soát này.',
+      });
+    }
+
+    historyList.splice(targetIdx, 1);
+    db.driveReconcileHistory = historyList;
+
+    appendSystemAuditLog({
+      actorUserId: currentUser.id,
+      actorName: currentUser.displayName?.trim() || currentUser.fullName,
+      action: 'drive_reconcile',
+      bookId: target.bookId !== 'all' ? target.bookId : undefined,
+      details: `Xóa 1 bản ghi lịch sử đối soát Google Drive (${target.bookName}, ${target.completedAtVietnam || target.completedAt}).`,
+    });
+    await saveDatabasePersistent(db, { verifyWrite: true });
+
+    return res.json({
+      success: true,
+      deletedId: entryId,
+      remainingCount: db.driveReconcileHistory.length,
+    });
+  } finally {
+    release();
+  }
+});
+
+app.delete('/api/admin/drive-reconcile/history', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const bookId = typeof req.query.bookId === 'string' && req.query.bookId.trim() ? req.query.bookId.trim() : 'all';
+
+  const release = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const manageableBookIds = new Set(
+      db.books
+        .filter((b) => isSystemAdmin(currentUser) || hasBookPermission(currentUser, b.id, 'manage_book'))
+        .map((b) => b.id)
+    );
+    if (manageableBookIds.size === 0) {
+      return res.status(403).json({ error: 'Bạn cần quyền Quản trị sổ để xóa lịch sử đối soát Google Drive.' });
+    }
+    if (bookId !== 'all' && !isSystemAdmin(currentUser) && !manageableBookIds.has(bookId)) {
+      return res.status(403).json({ error: 'Bạn không có quyền xóa lịch sử đối soát của sổ văn bản này.' });
+    }
+
+    const beforeList = Array.isArray(db.driveReconcileHistory) ? db.driveReconcileHistory : [];
+    const kept: DriveReconciliationHistoryEntry[] = [];
+    let deletedCount = 0;
+
+    for (const h of beforeList) {
+      const inRequestedScope = bookId === 'all' || h.bookId === bookId;
+      const canDeleteEntry =
+        isSystemAdmin(currentUser) || (h.bookId !== 'all' && manageableBookIds.has(h.bookId));
+      if (inRequestedScope && canDeleteEntry) {
+        deletedCount++;
+      } else {
+        kept.push(h);
+      }
+    }
+
+    if (deletedCount > 0) {
+      db.driveReconcileHistory = kept;
+      const scopeLabel =
+        bookId === 'all' ? 'tất cả sổ được quản trị' : getBookById(bookId).name;
+      appendSystemAuditLog({
+        actorUserId: currentUser.id,
+        actorName: currentUser.displayName?.trim() || currentUser.fullName,
+        action: 'drive_reconcile',
+        bookId: bookId !== 'all' ? bookId : undefined,
+        details: `Xóa ${deletedCount} bản ghi lịch sử đối soát Google Drive (phạm vi: ${scopeLabel}).`,
+      });
+      await saveDatabasePersistent(db, { verifyWrite: true });
+    }
+
+    return res.json({
+      success: true,
+      deletedCount,
+      remainingCount: kept.length,
+    });
+  } finally {
+    release();
+  }
+});
+
+app.post('/api/reconciliation/dismiss-items', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const rawItems = req.body?.items;
+  if (!Array.isArray(rawItems) || rawItems.length === 0 || rawItems.length > 500) {
+    return res.status(400).json({ error: 'Danh sách mục cần xóa khỏi đối soát không hợp lệ.' });
+  }
+
+  const VALID_ISSUE_TYPES = new Set<ReconciliationIssueType>([
+    'drive_failed',
+    'drive_link_issue',
+    'sheets_unsynced',
+    'duplicate_number',
+  ]);
+
+  const normalizedItems: Array<{ docId: string; issueType: ReconciliationIssueType }> = [];
+  for (const entry of rawItems) {
+    const docId = typeof entry?.docId === 'string' ? entry.docId.trim() : '';
+    const issueType = entry?.issueType as ReconciliationIssueType;
+    if (!docId || !VALID_ISSUE_TYPES.has(issueType)) {
+      return res.status(400).json({ error: 'Thông tin mục đối soát không hợp lệ.' });
+    }
+    normalizedItems.push({ docId, issueType });
+  }
+
+  const release = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const hasAnyManagePerm =
+      isSystemAdmin(currentUser) ||
+      db.books.some((b) => hasBookPermission(currentUser, b.id, 'manage_book'));
+    if (!hasAnyManagePerm) {
+      return res.status(403).json({
+        error: 'Bạn cần quyền Quản trị sổ để xóa mục khỏi danh sách đối soát.',
+      });
+    }
+    const docById = new Map<string, DocumentRecord>();
+    for (const d of db.documents) {
+      docById.set(d.id, d);
+    }
+
+    // Kiểm tra quyền quản trị sổ trên toàn bộ hồ sơ trước khi thay đổi dữ liệu
+    for (const item of normalizedItems) {
+      const doc = docById.get(item.docId);
+      if (!doc) continue;
+      const bId = getDocBookId(doc);
+      if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, bId, 'manage_book')) {
+        return res.status(403).json({
+          error: 'Bạn không có quyền quản trị một số hồ sơ trong danh sách cần xóa.',
+        });
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    let dismissedCount = 0;
+    const touchedBookIds = new Set<string>();
+
+    for (const item of normalizedItems) {
+      const doc = docById.get(item.docId);
+      if (!doc) continue;
+      const existing = doc.reconciliationDismissedIssues || {};
+      if (!existing[item.issueType]) {
+        doc.reconciliationDismissedIssues = {
+          ...existing,
+          [item.issueType]: nowIso,
+        };
+        dismissedCount++;
+        touchedBookIds.add(getDocBookId(doc));
+      }
+    }
+
+    if (dismissedCount > 0) {
+      appendSystemAuditLog({
+        actorUserId: currentUser.id,
+        actorName: currentUser.displayName?.trim() || currentUser.fullName,
+        action: 'drive_reconcile',
+        bookId: touchedBookIds.size === 1 ? Array.from(touchedBookIds)[0] : undefined,
+        details: `Xóa ${dismissedCount} mục tồn đọng khỏi danh sách Đối soát dữ liệu Sổ · Drive · Trang tính (không làm thay đổi hồ sơ gốc trong sổ).`,
+      });
+      await saveDatabasePersistent(db, { verifyWrite: true });
+    }
+
+    return res.json({ success: true, dismissedCount });
+  } finally {
+    release();
+  }
 });
 
 app.post('/api/reconciliation/retry-item', requireAuth, async (req, res) => {

@@ -11,8 +11,11 @@ import {
   FileWarning,
   Filter,
   History,
+  Loader2,
   RefreshCw,
   ShieldCheck,
+  Trash2,
+  X,
 } from 'lucide-react';
 import { api } from '../api';
 import { useAutoDismiss } from '../hooks/useAutoDismiss';
@@ -100,8 +103,10 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
   const [actionBanner, setActionBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   useAutoDismiss(actionBanner, () => setActionBanner(null));
   const [retryingItemId, setRetryingItemId] = useState<string | null>(null);
-  const [selectedDocIds, setSelectedDocIds] = useState<string[]>([]);
+  const [selectedItemIds, setSelectedItemIds] = useState<string[]>([]);
   const [bulkSyncing, setBulkSyncing] = useState<boolean>(false);
+  const [deletingItemId, setDeletingItemId] = useState<string | null>(null);
+  const [bulkDeletingItems, setBulkDeletingItems] = useState<boolean>(false);
 
   // Admin Tool: Đối soát trạng thái Google Drive
   const [runningDriveReconcile, setRunningDriveReconcile] = useState<boolean>(false);
@@ -109,6 +114,13 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
   const [driveReconcileResult, setDriveReconcileResult] = useState<DriveReconciliationHistoryEntry | null>(null);
   const [driveReconcileHistory, setDriveReconcileHistory] = useState<DriveReconciliationHistoryEntry[]>([]);
   const [showDriveHistory, setShowDriveHistory] = useState<boolean>(false);
+  const [deletingHistoryId, setDeletingHistoryId] = useState<string | null>(null);
+  const [clearingHistory, setClearingHistory] = useState<boolean>(false);
+  const [confirmModal, setConfirmModal] = useState<
+    | { kind: 'clear_history'; count: number }
+    | { kind: 'delete_items'; items: ReconciliationItem[]; label: string }
+    | null
+  >(null);
 
   const fetchDriveHistory = useCallback(async () => {
     try {
@@ -134,7 +146,7 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
           verifyDrive,
         });
         setReport(res);
-        setSelectedDocIds([]);
+        setSelectedItemIds([]);
       } catch (err: any) {
         setError(err?.message || 'Không thể tải báo cáo đối soát dữ liệu.');
       } finally {
@@ -190,6 +202,18 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
     return report.items.filter((i) => i.issueType === issueFilter);
   }, [report, issueFilter]);
 
+  const selectedItems = useMemo(
+    () => filteredItems.filter((i) => selectedItemIds.includes(i.id)),
+    [filteredItems, selectedItemIds]
+  );
+
+  const selectedSheetsDocIds = useMemo(() => {
+    const ids = selectedItems
+      .filter((i) => i.issueType === 'sheets_unsynced' && i.canRetry)
+      .map((i) => i.docId);
+    return Array.from(new Set(ids));
+  }, [selectedItems]);
+
   const retryableSheetsDocIds = useMemo(() => {
     const ids = filteredItems
       .filter((i) => i.issueType === 'sheets_unsynced' && i.canRetry)
@@ -197,17 +221,113 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
     return Array.from(new Set(ids));
   }, [filteredItems]);
 
-  const handleToggleSelectDoc = (docId: string) => {
-    setSelectedDocIds((prev) =>
-      prev.includes(docId) ? prev.filter((id) => id !== docId) : [...prev, docId]
+  const handleToggleSelectItem = (itemId: string) => {
+    setSelectedItemIds((prev) =>
+      prev.includes(itemId) ? prev.filter((id) => id !== itemId) : [...prev, itemId]
     );
   };
 
-  const handleSelectAllSheets = (checked: boolean) => {
+  const handleSelectAllFiltered = (checked: boolean) => {
     if (checked) {
-      setSelectedDocIds(retryableSheetsDocIds);
+      setSelectedItemIds(filteredItems.map((i) => i.id));
     } else {
-      setSelectedDocIds([]);
+      setSelectedItemIds([]);
+    }
+  };
+
+  const handleDeleteHistoryItem = async (entry: DriveReconciliationHistoryEntry) => {
+    if (deletingHistoryId || clearingHistory) return;
+    setDeletingHistoryId(entry.id);
+    setActionBanner(null);
+    try {
+      await api.deleteAdminDriveReconcileHistoryItem(entry.id);
+      setDriveReconcileHistory((prev) => prev.filter((h) => h.id !== entry.id));
+      if (driveReconcileResult?.id === entry.id) {
+        setDriveReconcileResult(null);
+      }
+      setActionBanner({
+        type: 'success',
+        text: 'Đã xóa bản ghi lịch sử đối soát Google Drive.',
+      });
+    } catch (err: any) {
+      setActionBanner({
+        type: 'error',
+        text: err?.message || 'Không thể xóa bản ghi lịch sử đối soát này.',
+      });
+    } finally {
+      setDeletingHistoryId(null);
+    }
+  };
+
+  const handleConfirmClearHistory = async () => {
+    if (clearingHistory) return;
+    setClearingHistory(true);
+    setActionBanner(null);
+    try {
+      const res = await api.clearAdminDriveReconcileHistory(selectedBookId);
+      setDriveReconcileResult(null);
+      setConfirmModal(null);
+      await fetchDriveHistory();
+      setActionBanner({
+        type: 'success',
+        text: `Đã xóa ${res.deletedCount} bản ghi lịch sử đối soát Google Drive.`,
+      });
+    } catch (err: any) {
+      setActionBanner({
+        type: 'error',
+        text: err?.message || 'Không thể xóa lịch sử đối soát Google Drive.',
+      });
+    } finally {
+      setClearingHistory(false);
+    }
+  };
+
+  const handleDeleteSingleItem = async (item: ReconciliationItem) => {
+    if (deletingItemId || bulkDeletingItems) return;
+    setDeletingItemId(item.id);
+    setActionBanner(null);
+    try {
+      await api.dismissReconciliationItems([{ docId: item.docId, issueType: item.issueType }]);
+      setSelectedItemIds((prev) => prev.filter((id) => id !== item.id));
+      setActionBanner({
+        type: 'success',
+        text: `Đã xóa mục tồn đọng (${item.fullDocNumber}) khỏi danh sách đối soát.`,
+      });
+      await fetchReport(Boolean(report?.driveChecked));
+    } catch (err: any) {
+      setActionBanner({
+        type: 'error',
+        text: err?.message || `Không thể xóa mục ${item.fullDocNumber} khỏi danh sách đối soát.`,
+      });
+    } finally {
+      setDeletingItemId(null);
+    }
+  };
+
+  const handleConfirmDeleteItems = async (itemsToDelete: ReconciliationItem[]) => {
+    if (itemsToDelete.length === 0 || bulkDeletingItems) return;
+    setBulkDeletingItems(true);
+    setActionBanner(null);
+    try {
+      const payload = itemsToDelete.map((it) => ({
+        docId: it.docId,
+        issueType: it.issueType,
+      }));
+      const res = await api.dismissReconciliationItems(payload);
+      setConfirmModal(null);
+      setSelectedItemIds([]);
+      setActionBanner({
+        type: 'success',
+        text: `Đã xóa ${res.dismissedCount} mục tồn đọng khỏi danh sách đối soát.`,
+      });
+      await fetchReport(Boolean(report?.driveChecked));
+    } catch (err: any) {
+      setActionBanner({
+        type: 'error',
+        text: err?.message || 'Không thể xóa các mục tồn đọng khỏi danh sách đối soát.',
+      });
+    } finally {
+      setBulkDeletingItems(false);
     }
   };
 
@@ -237,7 +357,7 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
   };
 
   const handleBulkSync = async (targetIds?: string[]) => {
-    const ids = targetIds && targetIds.length > 0 ? targetIds : selectedDocIds;
+    const ids = targetIds && targetIds.length > 0 ? targetIds : selectedSheetsDocIds;
     if (ids.length === 0 || bulkSyncing) return;
     setBulkSyncing(true);
     setActionBanner(null);
@@ -361,10 +481,21 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
               <span className="font-semibold text-slate-800">
                 Kết quả đợt đối soát gần nhất ({driveReconcileResult.totalScanned} hồ sơ đã kiểm tra)
               </span>
-              <span className="inline-flex items-center gap-1 font-mono text-[11px] text-slate-500">
-                <Clock className="w-3.5 h-3.5" />
-                {driveReconcileResult.completedAtVietnam || formatDateTimeVn(driveReconcileResult.completedAt)}
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center gap-1 font-mono text-[11px] text-slate-500">
+                  <Clock className="w-3.5 h-3.5" />
+                  {driveReconcileResult.completedAtVietnam || formatDateTimeVn(driveReconcileResult.completedAt)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setDriveReconcileResult(null)}
+                  aria-label="Đóng kết quả đối soát"
+                  title="Đóng"
+                  className="p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
@@ -465,10 +596,28 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
         {/* Persistent History of Drive Reconciliations */}
         {showDriveHistory && (
           <div className="pt-3 border-t border-slate-100 space-y-2">
-            <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wide flex items-center gap-1.5">
-              <History className="w-3.5 h-3.5 text-slate-500" />
-              <span>Lịch sử các lần đối soát Google Drive</span>
-            </h3>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wide flex items-center gap-1.5">
+                <History className="w-3.5 h-3.5 text-slate-500" />
+                <span>Lịch sử các lần đối soát Google Drive</span>
+              </h3>
+              {driveReconcileHistory.length > 0 && (
+                <button
+                  type="button"
+                  disabled={clearingHistory || Boolean(deletingHistoryId)}
+                  onClick={() =>
+                    setConfirmModal({
+                      kind: 'clear_history',
+                      count: driveReconcileHistory.length,
+                    })
+                  }
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg disabled:opacity-50"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Xóa tất cả lịch sử</span>
+                </button>
+              )}
+            </div>
             {driveReconcileHistory.length === 0 ? (
               <p className="text-xs text-slate-500 italic">Chưa có lịch sử đối soát Google Drive nào.</p>
             ) : (
@@ -483,10 +632,11 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                       <th className="py-2 px-3 text-center">Đã lưu Drive</th>
                       <th className="py-2 px-3 text-center">Thất bại</th>
                       <th className="py-2 px-3 text-center">Cần đối soát</th>
+                      <th className="py-2 px-3 text-right">Thao tác</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {driveReconcileHistory.slice(0, 15).map((entry) => (
+                    {driveReconcileHistory.map((entry) => (
                       <tr key={entry.id} className="hover:bg-slate-50/70">
                         <td className="py-2 px-3 font-mono text-[11px] whitespace-nowrap text-slate-700">
                           {entry.completedAtVietnam || formatDateTimeVn(entry.completedAt)}
@@ -505,6 +655,21 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                         </td>
                         <td className="py-2 px-3 text-center font-mono tabular-nums font-semibold text-amber-800">
                           {entry.needsReconcileCount}
+                        </td>
+                        <td className="py-2 px-3 text-right whitespace-nowrap">
+                          <button
+                            type="button"
+                            disabled={deletingHistoryId === entry.id || clearingHistory}
+                            onClick={() => handleDeleteHistoryItem(entry)}
+                            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-rose-700 hover:bg-rose-50 border border-rose-200 rounded-md disabled:opacity-50"
+                          >
+                            {deletingHistoryId === entry.id ? (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            ) : (
+                              <Trash2 className="w-3 h-3" />
+                            )}
+                            <span>Xóa</span>
+                          </button>
                         </td>
                       </tr>
                     ))}
@@ -602,34 +767,70 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
           </div>
         </div>
 
-        {retryableSheetsDocIds.length > 0 && (
+        {filteredItems.length > 0 && (
           <div className="flex flex-wrap items-center gap-2">
             <label className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-700 px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer">
               <input
                 type="checkbox"
                 checked={
-                  retryableSheetsDocIds.length > 0 &&
-                  retryableSheetsDocIds.every((id) => selectedDocIds.includes(id))
+                  filteredItems.length > 0 &&
+                  filteredItems.every((i) => selectedItemIds.includes(i.id))
                 }
-                onChange={(e) => handleSelectAllSheets(e.target.checked)}
+                onChange={(e) => handleSelectAllFiltered(e.target.checked)}
                 className="rounded border-slate-300 text-sky-700"
               />
-              <span>Chọn tất cả chờ Trang tính ({retryableSheetsDocIds.length})</span>
+              <span>Chọn tất cả ({filteredItems.length})</span>
             </label>
 
-            <button
-              type="button"
-              disabled={bulkSyncing || selectedDocIds.length === 0}
-              onClick={() => handleBulkSync()}
-              className="inline-flex items-center gap-1.5 min-h-[38px] px-3.5 py-1.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${bulkSyncing ? 'animate-spin' : ''}`} />
-              <span>
-                {bulkSyncing
-                  ? 'Đang đồng bộ...'
-                  : `Đồng bộ lại Trang tính (${selectedDocIds.length})`}
-              </span>
-            </button>
+            {retryableSheetsDocIds.length > 0 && (
+              <button
+                type="button"
+                disabled={bulkSyncing || selectedSheetsDocIds.length === 0}
+                onClick={() => handleBulkSync()}
+                className="inline-flex items-center gap-1.5 min-h-[38px] px-3.5 py-1.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${bulkSyncing ? 'animate-spin' : ''}`} />
+                <span>
+                  {bulkSyncing
+                    ? 'Đang đồng bộ...'
+                    : `Đồng bộ lại Trang tính (${selectedSheetsDocIds.length})`}
+                </span>
+              </button>
+            )}
+
+            {selectedItems.length > 0 ? (
+              <button
+                type="button"
+                disabled={bulkDeletingItems}
+                onClick={() =>
+                  setConfirmModal({
+                    kind: 'delete_items',
+                    items: selectedItems,
+                    label: `${selectedItems.length} mục đã chọn`,
+                  })
+                }
+                className="inline-flex items-center gap-1.5 min-h-[38px] px-3.5 py-1.5 text-xs font-semibold bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white rounded-lg"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Xóa đã chọn ({selectedItems.length})</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={bulkDeletingItems}
+                onClick={() =>
+                  setConfirmModal({
+                    kind: 'delete_items',
+                    items: filteredItems,
+                    label: `tất cả ${filteredItems.length} mục đang lọc`,
+                  })
+                }
+                className="inline-flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 disabled:opacity-50 rounded-lg"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Xóa tất cả ({filteredItems.length})</span>
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -686,7 +887,6 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
       ) : (
         <div className="space-y-3">
           {filteredItems.map((item) => {
-            const isSheets = item.issueType === 'sheets_unsynced';
             const badgeStyle =
               item.severity === 'error'
                 ? 'bg-rose-50 text-rose-900 border-rose-200'
@@ -698,15 +898,13 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                 className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3"
               >
                 <div className="flex items-start gap-3 min-w-0 flex-1">
-                  {isSheets && item.canRetry && (
-                    <input
-                      type="checkbox"
-                      aria-label={`Chọn đồng bộ ${item.fullDocNumber}`}
-                      checked={selectedDocIds.includes(item.docId)}
-                      onChange={() => handleToggleSelectDoc(item.docId)}
-                      className="mt-1 rounded border-slate-300 text-sky-700 shrink-0"
-                    />
-                  )}
+                  <input
+                    type="checkbox"
+                    aria-label={`Chọn mục ${item.fullDocNumber}`}
+                    checked={selectedItemIds.includes(item.id)}
+                    onChange={() => handleToggleSelectItem(item.id)}
+                    className="mt-1 rounded border-slate-300 text-sky-700 shrink-0"
+                  />
 
                   <div className="space-y-1 min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
@@ -740,7 +938,7 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                   {item.canRetry && (
                     <button
                       type="button"
-                      disabled={retryingItemId === item.id}
+                      disabled={retryingItemId === item.id || deletingItemId === item.id}
                       onClick={() => handleRetrySingle(item)}
                       className="inline-flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 text-xs font-semibold bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white rounded-lg"
                     >
@@ -759,10 +957,85 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                     <span>Mở hồ sơ</span>
                     <ExternalLink className="w-3.5 h-3.5 text-slate-500" />
                   </button>
+
+                  <button
+                    type="button"
+                    disabled={deletingItemId === item.id || bulkDeletingItems}
+                    onClick={() => handleDeleteSingleItem(item)}
+                    title="Xóa khỏi danh sách đối soát"
+                    className="inline-flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 disabled:opacity-50 rounded-lg"
+                  >
+                    {deletingItemId === item.id ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="w-3.5 h-3.5" />
+                    )}
+                    <span>Xóa</span>
+                  </button>
                 </div>
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Compact Confirmation Modal for Bulk Delete / Clear History */}
+      {confirmModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-3">
+          <div className="bg-white rounded-xl max-w-md w-full p-5 shadow-xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <h3 className="text-sm font-bold text-rose-700 flex items-center gap-2">
+                <Trash2 className="w-4 h-4 text-rose-600 shrink-0" />
+                <span>
+                  {confirmModal.kind === 'clear_history'
+                    ? 'Xóa lịch sử đối soát'
+                    : 'Xóa mục tồn đọng khỏi đối soát'}
+                </span>
+              </h3>
+              <button
+                type="button"
+                disabled={clearingHistory || bulkDeletingItems}
+                onClick={() => setConfirmModal(null)}
+                className="text-slate-400 hover:text-slate-700 p-1"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-700">
+              {confirmModal.kind === 'clear_history'
+                ? `Xác nhận xóa toàn bộ ${confirmModal.count} bản ghi lịch sử đối soát Google Drive trong phạm vi đang chọn?`
+                : `Xác nhận xóa ${confirmModal.label} khỏi danh sách Đối soát? (Không xóa hồ sơ gốc trong sổ văn bản)`}
+            </p>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                disabled={clearingHistory || bulkDeletingItems}
+                onClick={() => setConfirmModal(null)}
+                className="min-h-[38px] px-3.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
+              >
+                Hủy bỏ
+              </button>
+              <button
+                type="button"
+                disabled={clearingHistory || bulkDeletingItems}
+                onClick={() => {
+                  if (confirmModal.kind === 'clear_history') {
+                    void handleConfirmClearHistory();
+                  } else {
+                    void handleConfirmDeleteItems(confirmModal.items);
+                  }
+                }}
+                className="min-h-[38px] px-4 py-1.5 text-xs font-semibold bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white rounded-lg inline-flex items-center gap-1.5"
+              >
+                {(clearingHistory || bulkDeletingItems) && (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                )}
+                <span>Xác nhận xóa</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

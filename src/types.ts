@@ -582,6 +582,8 @@ export interface DocumentRecord {
   pdfTextStatus?: 'indexed' | 'no_text';
   pdfIndexedPagesCount?: number;
   pdfTaskSuggestions?: PdfTaskSuggestion[];
+  // Các cảnh báo đối soát đã được quản trị viên xóa/bỏ qua khỏi danh sách Đối soát
+  reconciliationDismissedIssues?: Partial<Record<ReconciliationIssueType, string>>;
 }
 
 export type NumberRequestStatus = 'pending' | 'issued' | 'rejected';
